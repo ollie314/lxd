@@ -1,4 +1,12 @@
 *.swp
+po/*.mo
+po/*.po~
+lxd-*.tar.gz
+.vagrant
+test/deps/devlxd-client
+*~
+tags
 
-lxd/lxd
-lxc/lxc
+# For Atom ctags
+.tags
+.tags1

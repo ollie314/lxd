@@ -2,37 +2,53 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
 	"path"
+	"strconv"
 
 	"github.com/gorilla/mux"
-	"github.com/lxc/lxd"
 	"gopkg.in/lxc/go-lxc.v2"
+
+	"github.com/lxc/lxd/shared"
 )
 
-const (
-	SYS_CLASS_NET = "/sys/class/net"
-)
+func networksGet(d *Daemon, r *http.Request) Response {
+	recursionStr := r.FormValue("recursion")
+	recursion, err := strconv.Atoi(recursionStr)
+	if err != nil {
+		recursion = 0
+	}
 
-func networksGet(d *Daemon, w http.ResponseWriter, r *http.Request) {
 	ifs, err := net.Interfaces()
 	if err != nil {
-		InternalError(w, err)
-		return
+		return InternalError(err)
 	}
 
-	result := make([]string, 0)
+	resultString := []string{}
+	resultMap := []network{}
 	for _, iface := range ifs {
-		result = append(result, fmt.Sprintf("/%s/networks/%s", lxd.APIVersion, iface.Name))
+		if recursion == 0 {
+			resultString = append(resultString, fmt.Sprintf("/%s/networks/%s", shared.APIVersion, iface.Name))
+		} else {
+			net, err := doNetworkGet(d, iface.Name)
+			if err != nil {
+				continue
+			}
+			resultMap = append(resultMap, net)
+
+		}
 	}
 
-	SyncResponse(true, result, w)
+	if recursion == 0 {
+		return SyncResponse(true, resultString)
+	}
+
+	return SyncResponse(true, resultMap)
 }
 
-var networksCmd = Command{"networks", false, networksGet, nil, nil, nil}
+var networksCmd = Command{name: "networks", get: networksGet}
 
 type network struct {
 	Name    string   `json:"name"`
@@ -40,31 +56,22 @@ type network struct {
 	Members []string `json:"members"`
 }
 
-func isBridge(iface string) bool {
-	p := path.Join(SYS_CLASS_NET, iface, "bridge")
+func children(iface string) []string {
+	p := path.Join("/sys/class/net", iface, "brif")
+
+	ret, _ := shared.ReadDir(p)
+
+	return ret
+}
+
+func isBridge(iface *net.Interface) bool {
+	p := path.Join("/sys/class/net", iface.Name, "bridge")
 	stat, err := os.Stat(p)
 	if err != nil {
 		return false
 	}
 
 	return stat.IsDir()
-}
-
-func children(iface string) []string {
-	p := path.Join(SYS_CLASS_NET, iface, "brif")
-
-	ret := make([]string, 0)
-
-	ents, err := ioutil.ReadDir(p)
-	if err != nil {
-		return ret
-	}
-
-	for _, ent := range ents {
-		ret = append(ret, ent.Name())
-	}
-
-	return ret
 }
 
 func isOnBridge(c *lxc.Container, bridge string) bool {
@@ -84,31 +91,38 @@ func isOnBridge(c *lxc.Container, bridge string) bool {
 	return false
 }
 
-func networkGet(d *Daemon, w http.ResponseWriter, r *http.Request) {
+func networkGet(d *Daemon, r *http.Request) Response {
 	name := mux.Vars(r)["name"]
 
+	n, err := doNetworkGet(d, name)
+	if err != nil {
+		return InternalError(err)
+	}
+
+	return SyncResponse(true, &n)
+}
+
+func doNetworkGet(d *Daemon, name string) (network, error) {
 	iface, err := net.InterfaceByName(name)
 	if err != nil {
-		InternalError(w, err)
-		return
+		return network{}, err
 	}
 
 	n := network{}
 	n.Name = iface.Name
 	n.Members = make([]string, 0)
 
-	if int(iface.Flags&net.FlagLoopback) > 0 {
+	if shared.IsLoopback(iface) {
 		n.Type = "loopback"
-	} else if isBridge(n.Name) {
+	} else if isBridge(iface) {
 		n.Type = "bridge"
 		for _, ct := range lxc.ActiveContainerNames(d.lxcpath) {
-			c, err := lxc.NewContainer(ct, d.lxcpath)
+			c, err := containerLXDLoad(d, ct)
 			if err != nil {
-				InternalError(w, err)
-				return
+				return network{}, err
 			}
 
-			if isOnBridge(c, n.Name) {
+			if isOnBridge(c.LXContainerGet(), n.Name) {
 				n.Members = append(n.Members, ct)
 			}
 		}
@@ -116,7 +130,7 @@ func networkGet(d *Daemon, w http.ResponseWriter, r *http.Request) {
 		n.Type = "unknown"
 	}
 
-	SyncResponse(true, &n, w)
+	return n, nil
 }
 
-var networkCmd = Command{"networks/{name}", false, networkGet, nil, nil, nil}
+var networkCmd = Command{name: "networks/{name}", get: networkGet}

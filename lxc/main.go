@@ -2,80 +2,165 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"net"
+	"net/url"
 	"os"
 	"strings"
+	"syscall"
+
+	"github.com/chai2010/gettext-go/gettext"
 
 	"github.com/lxc/lxd"
-	"github.com/lxc/lxd/internal/gnuflag"
+	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/gnuflag"
 )
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		// The action we take depends on the error we get.
+		msg := fmt.Sprintf(gettext.Gettext("error: %v"), err)
+		switch t := err.(type) {
+		case *url.Error:
+			switch u := t.Err.(type) {
+			case *net.OpError:
+				if u.Op == "dial" && u.Net == "unix" {
+					switch errno := u.Err.(type) {
+					case syscall.Errno:
+						switch errno {
+						case syscall.ENOENT:
+							msg = gettext.Gettext("LXD socket not found; is LXD running?")
+						case syscall.ECONNREFUSED:
+							msg = gettext.Gettext("Connection refused; is LXD running?")
+						case syscall.EACCES:
+							msg = gettext.Gettext("Permisson denied, are you in the lxd group?")
+						default:
+							msg = fmt.Sprintf("%d %s", uintptr(errno), errno.Error())
+						}
+					}
+				}
+			}
+		}
+
+		fmt.Fprintln(os.Stderr, fmt.Sprintf("%s", msg))
 		os.Exit(1)
 	}
 }
 
-var verbose = gnuflag.Bool("v", false, "Enables verbose mode.")
-var debug = gnuflag.Bool("debug", false, "Enables debug mode.")
-var configPath = gnuflag.String("config", "", "Alternate config path.")
-
 func run() error {
-	if len(os.Args) == 2 && (os.Args[1] == "-h" || os.Args[1] == "--help") {
+	gettext.BindTextdomain("lxd", "", nil)
+	gettext.Textdomain("lxd")
+
+	verbose := gnuflag.Bool("verbose", false, gettext.Gettext("Enables verbose mode."))
+	debug := gnuflag.Bool("debug", false, gettext.Gettext("Enables debug mode."))
+	forceLocal := gnuflag.Bool("force-local", false, gettext.Gettext("Force using the local unix socket."))
+
+	gnuflag.StringVar(&lxd.ConfigDir, "config", lxd.ConfigDir, gettext.Gettext("Alternate config directory."))
+
+	if len(os.Args) >= 3 && os.Args[1] == "config" && os.Args[2] == "profile" {
+		fmt.Fprintf(os.Stderr, gettext.Gettext("`lxc config profile` is deprecated, please use `lxc profile`")+"\n")
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+	}
+
+	if len(os.Args) >= 2 && (os.Args[1] == "-h" || os.Args[1] == "--help") {
 		os.Args[1] = "help"
 	}
-	if len(os.Args) < 2 || os.Args[1] == "" || os.Args[1][0] == '-' {
-		return fmt.Errorf("missing subcommand")
+
+	if len(os.Args) >= 2 && (os.Args[1] == "--all") {
+		os.Args[1] = "help"
+		os.Args = append(os.Args, "--all")
+	}
+
+	if len(os.Args) == 2 && os.Args[1] == "--version" {
+		os.Args[1] = "version"
+	}
+
+	if len(os.Args) < 2 {
+		commands["help"].run(nil, nil)
+		os.Exit(1)
 	}
 	name := os.Args[1]
 	cmd, ok := commands[name]
 	if !ok {
-		return fmt.Errorf("unknown command: %s", name)
+		fmt.Fprintf(os.Stderr, gettext.Gettext("error: unknown command: %s")+"\n", name)
+		commands["help"].run(nil, nil)
+		os.Exit(1)
 	}
 	cmd.flags()
 	gnuflag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s\n\nOptions:\n\n", strings.TrimSpace(cmd.usage()))
+		fmt.Fprintf(os.Stderr, gettext.Gettext("Usage: %s")+"\n\n"+gettext.Gettext("Options:")+"\n\n", strings.TrimSpace(cmd.usage()))
 		gnuflag.PrintDefaults()
 	}
 
 	os.Args = os.Args[1:]
 	gnuflag.Parse(true)
 
-	if *verbose || *debug {
-		lxd.SetLogger(log.New(os.Stderr, "", log.LstdFlags))
-		lxd.SetDebug(*debug)
+	shared.SetLogger("", "", *verbose, *debug)
+
+	var config *lxd.Config
+	var err error
+
+	if *forceLocal {
+		config = &lxd.DefaultConfig
+	} else {
+		config, err = lxd.LoadConfig()
+		if err != nil {
+			return err
+		}
 	}
 
-	config, err := lxd.LoadConfig(*configPath)
-	if err != nil {
-		return err
+	certf := lxd.ConfigPath("client.crt")
+	keyf := lxd.ConfigPath("client.key")
+
+	if !*forceLocal && os.Args[0] != "help" && os.Args[0] != "version" && (!shared.PathExists(certf) || !shared.PathExists(keyf)) {
+		fmt.Fprintf(os.Stderr, gettext.Gettext("Generating a client certificate. This may take a minute...")+"\n")
+
+		err = shared.FindOrGenCert(certf, keyf)
+		if err != nil {
+			return err
+		}
+
+		fmt.Fprintf(os.Stderr, gettext.Gettext("If this is your first run, you will need to import images using the 'lxd-images' script.")+"\n")
+		fmt.Fprintf(os.Stderr, gettext.Gettext("For example: 'lxd-images import ubuntu --alias ubuntu'.")+"\n")
 	}
 
-	return cmd.run(config, gnuflag.Args())
+	err = cmd.run(config, gnuflag.Args())
+	if err == errArgs {
+		fmt.Fprintf(os.Stderr, gettext.Gettext("error: %v")+"\n%s\n", err, cmd.usage())
+		os.Exit(1)
+	}
+	return err
 }
 
 type command interface {
 	usage() string
 	flags()
+	showByDefault() bool
 	run(config *lxd.Config, args []string) error
 }
 
 var commands = map[string]command{
-	"version":  &versionCmd{},
-	"help":     &helpCmd{},
-	"finger":   &fingerCmd{},
 	"config":   &configCmd{},
-	"create":   &createCmd{},
-	"list":     &listCmd{},
-	"shell":    &shellCmd{},
-	"remote":   &remoteCmd{},
-	"stop":     &actionCmd{lxd.Stop},
-	"start":    &actionCmd{lxd.Start},
-	"restart":  &actionCmd{lxd.Restart},
-	"freeze":   &actionCmd{lxd.Freeze},
-	"unfreeze": &actionCmd{lxd.Unfreeze},
+	"copy":     &copyCmd{},
 	"delete":   &deleteCmd{},
+	"exec":     &execCmd{},
+	"file":     &fileCmd{},
+	"finger":   &fingerCmd{},
+	"help":     &helpCmd{},
+	"image":    &imageCmd{},
+	"info":     &infoCmd{},
+	"init":     &initCmd{},
+	"launch":   &launchCmd{},
+	"list":     &listCmd{},
+	"move":     &moveCmd{},
+	"profile":  &profileCmd{},
+	"publish":  &publishCmd{},
+	"remote":   &remoteCmd{},
+	"restart":  &actionCmd{shared.Restart, true},
+	"restore":  &restoreCmd{},
+	"snapshot": &snapshotCmd{},
+	"start":    &actionCmd{shared.Start, false},
+	"stop":     &actionCmd{shared.Stop, true},
+	"version":  &versionCmd{},
 }
 
-var errArgs = fmt.Errorf("too many subcommand arguments")
+var errArgs = fmt.Errorf(gettext.Gettext("wrong number of subcommand arguments"))

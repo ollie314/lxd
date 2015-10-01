@@ -1,231 +1,324 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"net/http"
+	"os"
+	"runtime"
+	"sort"
+	"strconv"
+	"sync"
 	"time"
 
-	"github.com/gorilla/mux"
-	"github.com/lxc/lxd"
+	"github.com/gorilla/websocket"
 	"gopkg.in/lxc/go-lxc.v2"
+
+	"github.com/lxc/lxd/shared"
+
+	log "gopkg.in/inconshreveable/log15.v2"
 )
 
-func containersPost(d *Daemon, w http.ResponseWriter, r *http.Request) {
-	lxd.Debugf("responding to create")
+type execWs struct {
+	command          []string
+	container        *lxc.Container
+	rootUid          int
+	rootGid          int
+	options          lxc.AttachOptions
+	conns            map[int]*websocket.Conn
+	allConnected     chan bool
+	controlConnected chan bool
+	interactive      bool
+	done             chan shared.OperationResult
+	fds              map[int]string
+}
 
-	if d.id_map == nil {
-		BadRequest(w, fmt.Errorf("lxd's user has no subuids"))
-		return
-	}
+type commandPostContent struct {
+	Command     []string          `json:"command"`
+	WaitForWS   bool              `json:"wait-for-websocket"`
+	Interactive bool              `json:"interactive"`
+	Environment map[string]string `json:"environment"`
+}
 
-	raw := lxd.Jmap{}
-	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
-		BadRequest(w, err)
-		return
-	}
+type containerConfigReq struct {
+	Profiles []string          `json:"profiles"`
+	Config   map[string]string `json:"config"`
+	Devices  shared.Devices    `json:"devices"`
+	Restore  string            `json:"restore"`
+}
 
-	name, err := raw.GetString("name")
+type containerStatePutReq struct {
+	Action  string `json:"action"`
+	Timeout int    `json:"timeout"`
+	Force   bool   `json:"force"`
+}
+
+type containerPostBody struct {
+	Migration bool   `json:"migration"`
+	Name      string `json:"name"`
+}
+
+type containerPostReq struct {
+	Name      string               `json:"name"`
+	Source    containerImageSource `json:"source"`
+	Config    map[string]string    `json:"config"`
+	Profiles  []string             `json:"profiles"`
+	Ephemeral bool                 `json:"ephemeral"`
+}
+
+type containerImageSource struct {
+	Type string `json:"type"`
+
+	/* for "image" type */
+	Alias       string `json:"alias"`
+	Fingerprint string `json:"fingerprint"`
+	Server      string `json:"server"`
+	Secret      string `json:"secret"`
+
+	/*
+	 * for "migration" and "copy" types, as an optimization users can
+	 * provide an image hash to extract before the filesystem is rsync'd,
+	 * potentially cutting down filesystem transfer time. LXD will not go
+	 * and fetch this image, it will simply use it if it exists in the
+	 * image store.
+	 */
+	BaseImage string `json:"base-image"`
+
+	/* for "migration" type */
+	Mode       string            `json:"mode"`
+	Operation  string            `json:"operation"`
+	Websockets map[string]string `json:"secrets"`
+
+	/* for "copy" type */
+	Source string `json:"source"`
+}
+
+var containersCmd = Command{
+	name: "containers",
+	get:  containersGet,
+	post: containersPost,
+}
+
+var containerCmd = Command{
+	name:   "containers/{name}",
+	get:    containerGet,
+	put:    containerPut,
+	delete: containerDelete,
+	post:   containerPost,
+}
+
+var containerStateCmd = Command{
+	name: "containers/{name}/state",
+	get:  containerStateGet,
+	put:  containerStatePut,
+}
+
+var containerFileCmd = Command{
+	name: "containers/{name}/files",
+	get:  containerFileHandler,
+	post: containerFileHandler,
+}
+
+var containerSnapshotsCmd = Command{
+	name: "containers/{name}/snapshots",
+	get:  containerSnapshotsGet,
+	post: containerSnapshotsPost,
+}
+
+var containerSnapshotCmd = Command{
+	name:   "containers/{name}/snapshots/{snapshotName}",
+	get:    snapshotHandler,
+	post:   snapshotHandler,
+	delete: snapshotHandler,
+}
+
+var containerExecCmd = Command{
+	name: "containers/{name}/exec",
+	post: containerExecPost,
+}
+
+func containerWatchEphemeral(d *Daemon, c container) {
+	go func() {
+		lxContainer := c.LXContainerGet()
+
+		lxContainer.Wait(lxc.STOPPED, -1*time.Second)
+		lxContainer.Wait(lxc.RUNNING, 1*time.Second)
+		lxContainer.Wait(lxc.STOPPED, -1*time.Second)
+
+		_, err := dbContainerIDGet(d.db, c.NameGet())
+		if err != nil {
+			return
+		}
+
+		c.Delete()
+	}()
+}
+
+func containersWatch(d *Daemon) error {
+	q := fmt.Sprintf("SELECT name FROM containers WHERE type=?")
+	inargs := []interface{}{cTypeRegular}
+	var name string
+	outfmt := []interface{}{name}
+
+	result, err := dbQueryScan(d.db, q, inargs, outfmt)
 	if err != nil {
-		/* TODO: namegen code here */
-		name = "foo"
+		return err
 	}
 
-	source, err := raw.GetMap("source")
-	if err != nil {
-		BadRequest(w, err)
-		return
-	}
+	for _, r := range result {
+		container, err := containerLXDLoad(d, string(r[0].(string)))
+		if err != nil {
+			return err
+		}
 
-	type_, err := source.GetString("type")
-	if err != nil {
-		BadRequest(w, err)
-		return
-	}
-
-	url, err := source.GetString("url")
-	if err != nil {
-		BadRequest(w, err)
-		return
-	}
-
-	imageName, err := source.GetString("name")
-	if err != nil {
-		BadRequest(w, err)
-		return
-	}
-
-	/* TODO: support other options here */
-	if type_ != "remote" {
-		NotImplemented(w)
-		return
-	}
-
-	if url != "https+lxc-images://images.linuxcontainers.org" {
-		NotImplemented(w)
-		return
-	}
-
-	if imageName != "lxc-images/ubuntu/trusty/amd64" {
-		NotImplemented(w)
-		return
-	}
-
-	opts := lxc.TemplateOptions{
-		Template: "download",
-		Distro:   "ubuntu",
-		Release:  "trusty",
-		Arch:     "amd64",
-	}
-
-	c, err := lxc.NewContainer(name, d.lxcpath)
-	if err != nil {
-		return
+		if container.IsEphemeral() && container.IsRunning() {
+			containerWatchEphemeral(d, container)
+		}
 	}
 
 	/*
-	 * Set the id mapping. This may not be how we want to do it, but it's a
-	 * start.  First, we remove any id_map lines in the config which might
-	 * have come from ~/.config/lxc/default.conf.  Then add id mapping based
-	 * on Domain.id_map
+	 * force collect the containers we created above; see comment in
+	 * daemon.go:createCmd.
 	 */
-	if d.id_map != nil {
-		lxd.Debugf("setting custom idmap")
-		err = c.SetConfigItem("lxc.id_map", "")
+	runtime.GC()
+
+	return nil
+}
+
+func containersRestart(d *Daemon) error {
+	containers, err := doContainersGet(d, true)
+
+	if err != nil {
+		return err
+	}
+
+	containerInfo := containers.(shared.ContainerInfoList)
+	sort.Sort(containerInfo)
+
+	for _, container := range containerInfo {
+		lastState := container.State.Config["volatile.last_state.power"]
+
+		autoStart := container.State.ExpandedConfig["boot.autostart"]
+		autoStartDelay := container.State.ExpandedConfig["boot.autostart.delay"]
+
+		if lastState == "RUNNING" || autoStart == "true" {
+			c, err := containerLXDLoad(d, container.State.Name)
+			if err != nil {
+				return err
+			}
+
+			if c.IsRunning() {
+				continue
+			}
+
+			c.Start()
+
+			autoStartDelayInt, err := strconv.Atoi(autoStartDelay)
+			if err == nil {
+				time.Sleep(time.Duration(autoStartDelayInt) * time.Second)
+			}
+		}
+	}
+
+	_, err = dbExec(d.db, "DELETE FROM containers_config WHERE key='volatile.last_state.power'")
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func containersShutdown(d *Daemon) error {
+	results, err := dbContainersList(d.db, cTypeRegular)
+	if err != nil {
+		return err
+	}
+
+	var wg sync.WaitGroup
+
+	for _, r := range results {
+		c, err := containerLXDLoad(d, r)
 		if err != nil {
-			fmt.Fprintf(w, "Failed to clear id mapping, continuing")
+			return err
 		}
-		uidstr := fmt.Sprintf("u 0 %d %d\n", d.id_map.Uidmin, d.id_map.Uidrange)
-		lxd.Debugf("uidstr is %s\n", uidstr)
-		err = c.SetConfigItem("lxc.id_map", uidstr)
+
+		err = c.ConfigKeySet("volatile.last_state.power", c.StateGet())
+
 		if err != nil {
-			fmt.Fprintf(w, "Failed to set uid mapping")
-			return
+			return err
 		}
-		gidstr := fmt.Sprintf("g 0 %d %d\n", d.id_map.Gidmin, d.id_map.Gidrange)
-		err = c.SetConfigItem("lxc.id_map", gidstr)
+
+		if c.IsRunning() {
+			wg.Add(1)
+			go func() {
+				c.Shutdown(time.Second * 30)
+				c.Stop()
+				wg.Done()
+			}()
+		}
+		wg.Wait()
+	}
+
+	return nil
+}
+
+func containerDeleteSnapshots(d *Daemon, cname string) error {
+	shared.Log.Debug("containerDeleteSnapshots",
+		log.Ctx{"container": cname})
+
+	results, err := dbContainerGetSnapshots(d.db, cname)
+	if err != nil {
+		return err
+	}
+
+	for _, sname := range results {
+		sc, err := containerLXDLoad(d, sname)
 		if err != nil {
-			fmt.Fprintf(w, "Failed to set gid mapping")
-			return
+			shared.Log.Error(
+				"containerDeleteSnapshots: Failed to load the snapshotcontainer",
+				log.Ctx{"container": cname, "snapshot": sname})
+
+			continue
 		}
-		c.SaveConfigFile("/tmp/c")
-	}
 
-	/*
-	 * Actually create the container
-	 */
-	AsyncResponse(func() error { return c.Create(opts) }, nil, w)
-}
-
-var containersCmd = Command{"containers", false, nil, nil, containersPost, nil}
-
-func containerGet(d *Daemon, w http.ResponseWriter, r *http.Request) {
-	name := mux.Vars(r)["name"]
-	c, err := lxc.NewContainer(name, d.lxcpath)
-	if err != nil {
-		InternalError(w, err)
-		return
-	}
-
-	if !c.Defined() {
-		NotFound(w)
-		return
-	}
-
-	SyncResponse(true, lxd.CtoD(c), w)
-}
-
-func containerDelete(d *Daemon, w http.ResponseWriter, r *http.Request) {
-	name := mux.Vars(r)["name"]
-	c, err := lxc.NewContainer(name, d.lxcpath)
-	if err != nil {
-		InternalError(w, err)
-		return
-	}
-
-	if !c.Defined() {
-		NotFound(w)
-		return
-	}
-
-	AsyncResponse(c.Destroy, nil, w)
-}
-
-var containerCmd = Command{"containers/{name}", false, containerGet, nil, nil, containerDelete}
-
-func containerStateGet(d *Daemon, w http.ResponseWriter, r *http.Request) {
-	name := mux.Vars(r)["name"]
-	c, err := lxc.NewContainer(name, d.lxcpath)
-	if err != nil {
-		InternalError(w, err)
-		return
-	}
-
-	if !c.Defined() {
-		NotFound(w)
-		return
-	}
-
-	SyncResponse(true, lxd.CtoD(c).Status, w)
-}
-
-func containerStatePut(d *Daemon, w http.ResponseWriter, r *http.Request) {
-	name := mux.Vars(r)["name"]
-
-	raw := lxd.Jmap{}
-	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
-		BadRequest(w, err)
-		return
-	}
-
-	action, err := raw.GetString("action")
-	if err != nil {
-		BadRequest(w, err)
-		return
-	}
-
-	timeout, err := raw.GetInt("timeout")
-	if err != nil {
-		timeout = -1
-	}
-
-	force, err := raw.GetBool("force")
-	if err != nil {
-		force = false
-	}
-
-	c, err := lxc.NewContainer(name, d.lxcpath)
-	if err != nil {
-		InternalError(w, err)
-		return
-	}
-
-	if !c.Defined() {
-		NotFound(w)
-		return
-	}
-
-	var do func() error
-	switch action {
-	case string(lxd.Start):
-		do = c.Start
-	case string(lxd.Stop):
-		if timeout == 0 || force {
-			do = c.Stop
-		} else {
-			do = func() error { return c.Shutdown(time.Duration(timeout)) }
+		if err := sc.Delete(); err != nil {
+			shared.Log.Error(
+				"containerDeleteSnapshots: Failed to delete a snapshotcontainer",
+				log.Ctx{"container": cname, "snapshot": sname, "err": err})
 		}
-	case string(lxd.Restart):
-		do = c.Reboot
-	case string(lxd.Freeze):
-		do = c.Freeze
-	case string(lxd.Unfreeze):
-		do = c.Unfreeze
-	default:
-		BadRequest(w, fmt.Errorf("unknown action %s", action))
 	}
 
-	AsyncResponse(do, nil, w)
+	return nil
 }
 
-var containerStateCmd = Command{"containers/{name}/state", false, containerStateGet, containerStatePut, nil, nil}
+/*
+ * This is called by lxd when called as "lxd forkstart <container>"
+ * 'forkstart' is used instead of just 'start' in the hopes that people
+ * do not accidentally type 'lxd start' instead of 'lxc start'
+ *
+ * We expect to read the lxcconfig over fd 3.
+ */
+func startContainer(args []string) error {
+	if len(args) != 4 {
+		return fmt.Errorf("Bad arguments: %q\n", args)
+	}
+	name := args[1]
+	lxcpath := args[2]
+	configPath := args[3]
+
+	c, err := lxc.NewContainer(name, lxcpath)
+	if err != nil {
+		return fmt.Errorf("Error initializing container for start: %q", err)
+	}
+	err = c.LoadConfigFile(configPath)
+	if err != nil {
+		return fmt.Errorf("Error opening startup config file: %q", err)
+	}
+
+	err = c.Start()
+	if err != nil {
+		os.Remove(configPath)
+	} else {
+		shared.FileMove(configPath, shared.LogPath(name, "lxc.conf"))
+	}
+
+	return err
+}

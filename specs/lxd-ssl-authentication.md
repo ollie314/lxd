@@ -2,7 +2,7 @@
 Local communications over the UNIX socket happen over a cleartext HTTP
 socket and access is restricted by socket ownership and mode.
 
-Remote communications with the lxd daemon happen using JSON over HTTPS.
+Remote communications with the LXD daemon happen using JSON over HTTPS.
 The supported protocol must be TLS1.2 or better.
 All communications must use perfect forward secrecy and ciphers must be
 limited to strong elliptic curve ones (such as ECDHE-RSA or
@@ -15,8 +15,8 @@ Since we control both client and server, there is no reason to support
 any backward compatibility to broken protocol or ciphers.
 
 Both the client and the server will generate a keypair the first time
-they're launched. The server will use that for all connections to the
-https+lxd socket and the client will use its certificate as a client
+they're launched. The server will use that for all https connections to
+the LXD socket and the client will use its certificate as a client
 certificate for any client-server communication.
 
 # Adding a remote with a default setup
@@ -46,15 +46,15 @@ record.
 # Adding a remote with a PKI based setup
 In the PKI setup, a system administrator is managing a central PKI, that
 PKI then issues client certificates for all the lxc clients and server
-certificates for all the lxd daemons.
+certificates for all the LXD daemons.
 
 Those certificates and keys are manually put in place on the various
 machines, replacing the automatically generated ones.
 
-The CA certificate is also added to all lxc clients and lxd daemons.
+The CA certificate is also added to all lxc clients and LXD daemons.
 A CRL may also accompany the CA certificate.
 
-In that mode, any connection to a lxd daemon will be done using the
+In that mode, any connection to a LXD daemon will be done using the
 preseeded CA certificate. If the server certificate isn't signed by the
 CA, or if it has been revoked, the connection will simply fail with no
 way obvious way for the user to bypass this.
@@ -72,15 +72,15 @@ To establish a new trust relationship, a password must be set on the
 server and send by the client when adding itself.
 
 A remote add operation should therefore go like this:
- 1. Call GET /1.0/finger
+ 1. Call GET /1.0
  2. If we're not in a PKI setup with a ca.crt, ask the user to confirm the fingerprint.
  3. Look at the dict we received back from the server. If "auth" is
-    "untrusted", ask the user for the server's password and do a PUT to
-    /1.0/trust, then call /1.0/finger again to check that we're indeed
+    "untrusted", ask the user for the server's password and do a POST to
+    /1.0/certificates, then call /1.0 again to check that we're indeed
     trusted.
  4. Remote is now ready
 
-# Failure scenari
+# Failure scenarios
 ## Server certificate changes
 This will typically happen in two cases:
 
