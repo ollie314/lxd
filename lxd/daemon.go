@@ -25,6 +25,7 @@ import (
 	"github.com/gorilla/mux"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stgraber/lxd-go-systemd/activation"
+	"github.com/syndtr/gocapability/capability"
 	"gopkg.in/tomb.v2"
 
 	"github.com/lxc/lxd"
@@ -414,26 +415,92 @@ func (d *Daemon) ListenAddresses() ([]string, error) {
 			}
 		}
 	} else {
-		ip := net.ParseIP(localHost)
-		if ip != nil && ip.IsGlobalUnicast() {
-			addresses = append(addresses, value)
-		}
+		addresses = append(addresses, value)
 	}
 
 	return addresses, nil
 }
 
+func bytesZero(x []byte) bool {
+	for _, b := range x {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func bytesEqual(x, y []byte) bool {
+	if len(x) != len(y) {
+		return false
+	}
+	for i, b := range x {
+		if y[i] != b {
+			return false
+		}
+	}
+	return true
+}
+
+func isZeroIP(x []byte) bool {
+	if x == nil {
+		return false
+	}
+
+	if bytesZero(x) {
+		return true
+	}
+
+	if len(x) != net.IPv6len {
+		return false
+	}
+
+	var v4InV6Prefix = []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff}
+	return bytesEqual(x[0:12], v4InV6Prefix) && bytesZero(x[12:])
+}
+
+func IpsEqual(ip1 net.IP, ip2 net.IP) bool {
+	if ip1.Equal(ip2) {
+		return true
+	}
+
+	/* the go std library Equal doesn't recognize [::] == 0.0.0.0, since it
+	 * tests for the ipv4 prefix, which isn't present in [::]. However,
+	 * they are in fact equal. Let's test for this case too.
+	 */
+	return isZeroIP(ip1) && isZeroIP(ip2)
+}
+
 func (d *Daemon) UpdateHTTPsPort(oldAddress string, newAddress string) error {
 	var sockets []Socket
 
+	if oldAddress == newAddress {
+		return nil
+	}
+
 	if oldAddress != "" {
-		_, _, err := net.SplitHostPort(oldAddress)
+		oldHost, oldPort, err := net.SplitHostPort(oldAddress)
 		if err != nil {
-			oldAddress = fmt.Sprintf("%s:%s", oldAddress, shared.DefaultPort)
+			oldHost = oldAddress
+			oldPort = shared.DefaultPort
 		}
 
+		// Strip brackets around IPv6 once we've gotten rid of the port
+		oldHost = strings.TrimLeft(oldHost, "[")
+		oldHost = strings.TrimRight(oldHost, "]")
+
 		for _, socket := range d.Sockets {
-			if socket.Socket.Addr().String() == oldAddress {
+			host, port, err := net.SplitHostPort(socket.Socket.Addr().String())
+			if err != nil {
+				host = socket.Socket.Addr().String()
+				port = shared.DefaultPort
+			}
+
+			// Strip brackets around IPv6 once we've gotten rid of the port
+			host = strings.TrimLeft(host, "[")
+			host = strings.TrimRight(host, "]")
+
+			if !shared.PathExists(host) && IpsEqual(net.ParseIP(host), net.ParseIP(oldHost)) && port == oldPort {
 				socket.Socket.Close()
 			} else {
 				sockets = append(sockets, socket)
@@ -446,7 +513,12 @@ func (d *Daemon) UpdateHTTPsPort(oldAddress string, newAddress string) error {
 	if newAddress != "" {
 		_, _, err := net.SplitHostPort(newAddress)
 		if err != nil {
-			newAddress = fmt.Sprintf("%s:%s", newAddress, shared.DefaultPort)
+			ip := net.ParseIP(newAddress)
+			if ip != nil && ip.To4() == nil {
+				newAddress = fmt.Sprintf("[%s]:%s", newAddress, shared.DefaultPort)
+			} else {
+				newAddress = fmt.Sprintf("%s:%s", newAddress, shared.DefaultPort)
+			}
 		}
 
 		tlsConfig, err := shared.GetTLSConfig(d.certf, d.keyf)
@@ -511,6 +583,17 @@ func startDaemon() (*Daemon, error) {
 	return d, nil
 }
 
+func haveMacAdmin() bool {
+	c, err := capability.NewPid(0)
+	if err != nil {
+		return false
+	}
+	if c.Get(capability.EFFECTIVE, capability.CAP_MAC_ADMIN) {
+		return true
+	}
+	return false
+}
+
 func (d *Daemon) Init() error {
 	/* Setup logging */
 	if shared.Log == nil {
@@ -537,6 +620,11 @@ func (d *Daemon) Init() error {
 	if aaEnabled && !shared.IsDir("/sys/kernel/security/apparmor") {
 		aaEnabled = false
 		shared.Log.Warn("Per-container AppArmor profiles disabled because of lack of kernel support")
+	}
+
+	if aaEnabled && !haveMacAdmin() {
+		shared.Log.Warn("Per-container AppArmor profiles are disabled because mac_admin capability is missing.")
+		aaEnabled = false
 	}
 
 	_, err := exec.LookPath("apparmor_parser")

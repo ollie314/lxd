@@ -54,7 +54,10 @@ func run() error {
 	debug := gnuflag.Bool("debug", false, gettext.Gettext("Enables debug mode."))
 	forceLocal := gnuflag.Bool("force-local", false, gettext.Gettext("Force using the local unix socket."))
 
-	gnuflag.StringVar(&lxd.ConfigDir, "config", lxd.ConfigDir, gettext.Gettext("Alternate config directory."))
+	configDir := os.Getenv("LXD_CONF")
+	if configDir != "" {
+		lxd.ConfigDir = configDir
+	}
 
 	if len(os.Args) >= 3 && os.Args[1] == "config" && os.Args[2] == "profile" {
 		fmt.Fprintf(os.Stderr, gettext.Gettext("`lxc config profile` is deprecated, please use `lxc profile`")+"\n")
@@ -106,6 +109,16 @@ func run() error {
 		if err != nil {
 			return err
 		}
+
+		// One time migration from old config
+		if config.DefaultRemote == "" {
+			_, ok := config.Remotes["local"]
+			if !ok {
+				config.Remotes["local"] = lxd.LocalRemote
+			}
+			config.DefaultRemote = "local"
+			lxd.SaveConfig(config)
+		}
 	}
 
 	certf := lxd.ConfigPath("client.crt")
@@ -152,14 +165,15 @@ var commands = map[string]command{
 	"launch":   &launchCmd{},
 	"list":     &listCmd{},
 	"move":     &moveCmd{},
+	"pause":    &actionCmd{shared.Freeze, false, false, "pause"},
 	"profile":  &profileCmd{},
 	"publish":  &publishCmd{},
 	"remote":   &remoteCmd{},
-	"restart":  &actionCmd{shared.Restart, true},
+	"restart":  &actionCmd{shared.Restart, true, true, "restart"},
 	"restore":  &restoreCmd{},
 	"snapshot": &snapshotCmd{},
-	"start":    &actionCmd{shared.Start, false},
-	"stop":     &actionCmd{shared.Stop, true},
+	"start":    &actionCmd{shared.Start, false, true, "start"},
+	"stop":     &actionCmd{shared.Stop, true, true, "stop"},
 	"version":  &versionCmd{},
 }
 

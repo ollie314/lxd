@@ -36,11 +36,11 @@ var imageEditHelp string = gettext.Gettext(
 
 func (c *imageCmd) usage() string {
 	return gettext.Gettext(
-		`Manipulate container images
+		`Manipulate container images.
 
 lxc image import <tarball> [rootfs tarball] [target] [--public] [--created-at=ISO-8601] [--expires-at=ISO-8601] [--fingerprint=FINGERPRINT] [prop=value]
 
-lxc image copy [remote:]<image> <remote>: [--alias=ALIAS].. [--copy-alias] [--public]
+lxc image copy [remote:]<image> <remote>: [--alias=ALIAS].. [--copy-aliases] [--public]
 lxc image delete [remote:]<image>
 lxc image edit [remote:]<image>
 lxc image export [remote:]<image>
@@ -268,6 +268,10 @@ func (c *imageCmd) run(config *lxd.Config, args []string) error {
 			}
 		}
 
+		if remote == "" {
+			remote = config.DefaultRemote
+		}
+
 		if imageFile == "" {
 			return errArgs
 		}
@@ -407,6 +411,7 @@ func (c *imageCmd) run(config *lxd.Config, args []string) error {
 		if inName == "" {
 			return errArgs
 		}
+
 		d, err := lxd.NewClient(config, remote)
 		if err != nil {
 			return err

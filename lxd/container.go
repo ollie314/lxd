@@ -157,6 +157,7 @@ type container interface {
 
 	IsPrivileged() bool
 	IsRunning() bool
+	IsFrozen() bool
 	IsEphemeral() bool
 	IsSnapshot() bool
 
@@ -279,7 +280,7 @@ func containerLXDCreateAsSnapshot(d *Daemon, name string,
 		// TODO - shouldn't we freeze for the duration of rootfs snapshot below?
 		if !sourceContainer.IsRunning() {
 			c.Delete()
-			return nil, fmt.Errorf("Container not running\n")
+			return nil, fmt.Errorf("Container not running")
 		}
 		opts := lxc.CheckpointOptions{Directory: stateDir, Stop: true, Verbose: true}
 		err = sourceContainer.Checkpoint(opts)
@@ -324,12 +325,6 @@ func containerLXDCreateInternal(
 
 	path := containerPathGet(name, args.Ctype == cTypeSnapshot)
 	if shared.PathExists(path) {
-		shared.Log.Error(
-			"The container already exists on disk",
-			log.Ctx{
-				"container": name,
-				"path":      path})
-
 		return nil, fmt.Errorf(
 			"The container already exists on disk, container: '%s', path: '%s'",
 			name,
@@ -455,7 +450,7 @@ func containerLXDLoad(d *Daemon, name string) (container, error) {
 		baseConfig:   baseConfig,
 		baseDevices:  baseDevices}
 
-	s, err := storageForFilename(d, c.PathGet(""))
+	s, err := storageForFilename(d, shared.VarPath("containers", strings.Split(name, "/")[0]))
 	if err != nil {
 		shared.Log.Warn("Couldn't detect storage.", log.Ctx{"container": c.NameGet()})
 		c.Storage = d.Storage
@@ -640,7 +635,6 @@ func (c *containerLXD) RenderState() (*shared.ContainerState, error) {
 		Profiles:        c.profiles,
 		Config:          c.baseConfig,
 		ExpandedConfig:  c.config,
-		Userdata:        []byte{},
 		Status:          status,
 		Devices:         c.baseDevices,
 		ExpandedDevices: c.devices,
@@ -801,6 +795,10 @@ func (c *containerLXD) IsPrivileged() bool {
 
 func (c *containerLXD) IsRunning() bool {
 	return c.c.Running()
+}
+
+func (c *containerLXD) IsFrozen() bool {
+	return c.StateGet() == "FROZEN"
 }
 
 func (c *containerLXD) Shutdown(timeout time.Duration) error {
@@ -1458,12 +1456,12 @@ func (c *containerLXD) AttachMount(m shared.Device) error {
 			// since we'd need to deal with partitions i think not.
 			// We also might want to support file bind mounting, but
 			// this doesn't do that.
-			return fmt.Errorf("non-block device file not supported\n")
+			return fmt.Errorf("non-block device file not supported")
 		}
 
 		fstype, err = shared.BlockFsDetect(source)
 		if err != nil {
-			return fmt.Errorf("Unable to detect fstype for %s: %s\n", source, err)
+			return fmt.Errorf("Unable to detect fstype for %s: %s", source, err)
 		}
 	}
 
@@ -1528,7 +1526,7 @@ func (c *containerLXD) applyConfig(config map[string]string) error {
 				return err
 			}
 			if count != 1 || vint < 0 || vint > 65000 {
-				return fmt.Errorf("Bad cpu limit: %s\n", v)
+				return fmt.Errorf("Bad cpu limit: %s", v)
 			}
 			cpuset := fmt.Sprintf("0-%d", vint-1)
 			err = setConfigItem(c, "lxc.cgroup.cpuset.cpus", cpuset)
@@ -1782,12 +1780,12 @@ func (c *containerLXD) applyDevices() error {
 
 		configs, err := deviceToLxc(d)
 		if err != nil {
-			return fmt.Errorf("Failed configuring device %s: %s\n", name, err)
+			return fmt.Errorf("Failed configuring device %s: %s", name, err)
 		}
 		for _, line := range configs {
 			err := setConfigItem(c, line[0], line[1])
 			if err != nil {
-				return fmt.Errorf("Failed configuring device %s: %s\n", name, err)
+				return fmt.Errorf("Failed configuring device %s: %s", name, err)
 			}
 		}
 	}
@@ -1861,7 +1859,7 @@ func (c *containerLXD) tarStoreFile(linkmap map[uint64]string, offset int, tw *t
 
 	hdr.Uid, hdr.Gid, major, minor, ino, nlink, err = shared.GetFileStat(path)
 	if err != nil {
-		return fmt.Errorf("error getting file info: %s\n", err)
+		return fmt.Errorf("error getting file info: %s", err)
 	}
 
 	// unshift the id under /rootfs/ for unpriv containers
@@ -1890,17 +1888,17 @@ func (c *containerLXD) tarStoreFile(linkmap map[uint64]string, offset int, tw *t
 	// todo - handle xattrs
 
 	if err := tw.WriteHeader(hdr); err != nil {
-		return fmt.Errorf("error writing header: %s\n", err)
+		return fmt.Errorf("error writing header: %s", err)
 	}
 
 	if hdr.Typeflag == tar.TypeReg {
 		f, err := os.Open(path)
 		if err != nil {
-			return fmt.Errorf("tarStoreFile: error opening file: %s\n", err)
+			return fmt.Errorf("tarStoreFile: error opening file: %s", err)
 		}
 		defer f.Close()
 		if _, err := io.Copy(tw, f); err != nil {
-			return fmt.Errorf("error copying file %s\n", err)
+			return fmt.Errorf("error copying file %s", err)
 		}
 	}
 	return nil

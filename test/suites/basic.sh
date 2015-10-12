@@ -75,6 +75,14 @@ test_basic_usage() {
   curl -k -s --cert ${LXD_CONF}/client3.crt --key ${LXD_CONF}/client3.key -X GET https://${LXD_ADDR}/1.0/images | grep "/1.0/images/"
   lxc image delete foo-image2
 
+  # Test invalid container names
+  ! lxc init testimage -abc
+  ! lxc init testimage abc-
+  ! lxc init testimage 1234
+  ! lxc init testimage 12test
+  ! lxc init testimage a_b_c
+  ! lxc init testimage aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
   # Test snapshot publish
   lxc snapshot bar
   lxc publish bar/snap0 --alias foo
@@ -123,11 +131,6 @@ test_basic_usage() {
   )
   kill_lxd ${LXD_ACTIVATION_DIR}
 
-  # Anything below this will not get run inside Travis-CI
-  if [ -n "${TRAVIS_PULL_REQUEST:-}" ]; then
-    return
-  fi
-
   # Create and start a container
   lxc launch testimage foo
   lxc list | grep foo | grep RUNNING
@@ -174,6 +177,10 @@ test_basic_usage() {
   # This is why we can't have nice things.
   content=$(cat "${LXD_DIR}/containers/foo/rootfs/tmp/foo")
   [ "${content}" = "foo" ]
+
+  lxc launch testimage deleterunning
+  my_curl -X DELETE https://${LXD_ADDR}/1.0/containers/deleterunning | grep "container is running"
+  lxc delete deleterunning
 
   # cleanup
   lxc delete foo

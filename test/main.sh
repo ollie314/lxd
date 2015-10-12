@@ -51,7 +51,6 @@ spawn_lxd() {
   alive=0
   while [ ${alive} -eq 0 ]; do
     [ -e "${lxddir}/unix.socket" ] && LXD_DIR=${lxddir} lxc finger && alive=1
-    sleep 1s
   done
 
   echo "==> Binding to network"
@@ -74,7 +73,7 @@ lxc() {
   for arg in $@; do
     if [ "${arg}" = "--" ]; then
       injected=1
-      cmd="${cmd} \"--config\" \"${LXD_CONF}\" ${DEBUG:-}"
+      cmd="${cmd} ${DEBUG:-}"
       cmd="${cmd} --"
     else
       cmd="${cmd} \"${arg}\""
@@ -82,7 +81,7 @@ lxc() {
   done
 
   if [ "${injected}" = "0" ]; then
-    cmd="${cmd} \"--config\" \"${LXD_CONF}\" ${DEBUG-}"
+    cmd="${cmd} ${DEBUG-}"
   fi
   if [ -n "${LXD_DEBUG:-}" ]; then
     set -x
@@ -145,8 +144,6 @@ kill_lxd() {
   done
 
   # Kill the daemon
-  kill -15 ${daemon_pid} 2>/dev/null || true
-  sleep 2
   kill -9 ${daemon_pid} 2>/dev/null || true
 
   # Cleanup shmounts
@@ -169,7 +166,7 @@ cleanup() {
       echo "failed test: ${TEST_CURRENT}"
     fi
 
-    echo "To poke around, use:\n LXD_DIR=${LXD_DIR} sudo -E ${GOPATH:-}/bin/lxc COMMAND --config ${LXD_CONF}"
+    echo "To poke around, use:\n LXD_DIR=${LXD_DIR} LXD_CONF=${LXD_CONF} sudo -E ${GOPATH:-}/bin/lxc COMMAND"
     read -p "Tests Completed (${TEST_RESULT}): hit enter to continue" x
   fi
 
@@ -225,7 +222,7 @@ if [ -n "${LXD_TMPFS:-}" ]; then
   mount -t tmpfs tmpfs ${TEST_DIR} -o mode=0751
 fi
 
-LXD_CONF=$(mktemp -d -p ${TEST_DIR} XXX)
+export LXD_CONF=$(mktemp -d -p ${TEST_DIR} XXX)
 
 # Setup the first LXD
 export LXD_DIR=$(mktemp -d -p ${TEST_DIR} XXX)
@@ -331,13 +328,9 @@ echo "==> TEST: migration"
 TEST_CURRENT=test_migration
 test_migration
 
-if [ -n "${TRAVIS_PULL_REQUEST:-}" ]; then
-  echo "===> SKIP: lvm backing (no loop device on Travis)"
-else
-  echo "==> TEST: lvm backing"
-  TEST_CURRENT=test_lvm
-  test_lvm
-fi
+echo "==> TEST: lvm backing"
+TEST_CURRENT=test_lvm
+test_lvm
 
 curversion=`dpkg -s lxc | awk '/^Version/ { print $2 }'`
 if dpkg --compare-versions "${curversion}" gt 1.1.2-0ubuntu3; then
