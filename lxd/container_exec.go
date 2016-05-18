@@ -12,23 +12,34 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
+
 	"github.com/lxc/lxd/shared"
-	"gopkg.in/lxc/go-lxc.v2"
 )
 
-func runCommand(container *lxc.Container, command []string, options lxc.AttachOptions) shared.OperationResult {
-	status, err := container.RunCommandStatus(command, options)
-	if err != nil {
-		shared.Debugf("Failed running command: %q", err.Error())
-		return shared.OperationError(err)
-	}
+type commandPostContent struct {
+	Command     []string          `json:"command"`
+	WaitForWS   bool              `json:"wait-for-websocket"`
+	Interactive bool              `json:"interactive"`
+	Environment map[string]string `json:"environment"`
+	Width       int               `json:"width"`
+	Height      int               `json:"height"`
+}
 
-	metadata, err := json.Marshal(shared.Jmap{"return": status})
-	if err != nil {
-		return shared.OperationError(err)
-	}
+type execWs struct {
+	command   []string
+	container container
+	env       map[string]string
 
-	return shared.OperationResult{Metadata: metadata, Error: nil}
+	rootUid          int
+	rootGid          int
+	conns            map[int]*websocket.Conn
+	connsLock        sync.Mutex
+	allConnected     chan bool
+	controlConnected chan bool
+	interactive      bool
+	fds              map[int]string
+	width            int
+	height           int
 }
 
 func (s *execWs) Metadata() interface{} {
@@ -44,7 +55,12 @@ func (s *execWs) Metadata() interface{} {
 	return shared.Jmap{"fds": fds}
 }
 
-func (s *execWs) Connect(secret string, r *http.Request, w http.ResponseWriter) error {
+func (s *execWs) Connect(op *operation, r *http.Request, w http.ResponseWriter) error {
+	secret := r.FormValue("secret")
+	if secret == "" {
+		return fmt.Errorf("missing secret")
+	}
+
 	for fd, fdSecret := range s.fds {
 		if secret == fdSecret {
 			conn, err := shared.WebsocketUpgrader.Upgrade(w, r, nil)
@@ -52,7 +68,9 @@ func (s *execWs) Connect(secret string, r *http.Request, w http.ResponseWriter) 
 				return err
 			}
 
+			s.connsLock.Lock()
 			s.conns[fd] = conn
+			s.connsLock.Unlock()
 
 			if fd == -1 {
 				s.controlConnected <- true
@@ -74,32 +92,42 @@ func (s *execWs) Connect(secret string, r *http.Request, w http.ResponseWriter) 
 	return os.ErrPermission
 }
 
-func (s *execWs) Do() shared.OperationResult {
+func (s *execWs) Do(op *operation) error {
 	<-s.allConnected
 
 	var err error
 	var ttys []*os.File
 	var ptys []*os.File
 
+	var stdin *os.File
+	var stdout *os.File
+	var stderr *os.File
+
 	if s.interactive {
 		ttys = make([]*os.File, 1)
 		ptys = make([]*os.File, 1)
 		ptys[0], ttys[0], err = shared.OpenPty(s.rootUid, s.rootGid)
-		s.options.StdinFd = ttys[0].Fd()
-		s.options.StdoutFd = ttys[0].Fd()
-		s.options.StderrFd = ttys[0].Fd()
+
+		stdin = ttys[0]
+		stdout = ttys[0]
+		stderr = ttys[0]
+
+		if s.width > 0 && s.height > 0 {
+			shared.SetSize(int(ptys[0].Fd()), s.width, s.height)
+		}
 	} else {
 		ttys = make([]*os.File, 3)
 		ptys = make([]*os.File, 3)
 		for i := 0; i < len(ttys); i++ {
 			ptys[i], ttys[i], err = shared.Pipe()
 			if err != nil {
-				return shared.OperationError(err)
+				return err
 			}
 		}
-		s.options.StdinFd = ptys[0].Fd()
-		s.options.StdoutFd = ttys[1].Fd()
-		s.options.StderrFd = ttys[2].Fd()
+
+		stdin = ptys[0]
+		stdout = ttys[1]
+		stderr = ttys[2]
 	}
 
 	controlExit := make(chan bool)
@@ -159,15 +187,13 @@ func (s *execWs) Do() shared.OperationResult {
 						continue
 					}
 				}
-
-				if err != nil {
-					shared.Debugf("Got error writing to writer %s", err)
-					break
-				}
 			}
 		}()
 		go func() {
-			<-shared.WebsocketMirror(s.conns[0], ptys[0], ptys[0])
+			readDone, writeDone := shared.WebsocketMirror(s.conns[0], ptys[0], ptys[0])
+			<-readDone
+			<-writeDone
+			s.conns[0].Close()
 			wgEOF.Done()
 		}()
 	} else {
@@ -186,18 +212,18 @@ func (s *execWs) Do() shared.OperationResult {
 		}
 	}
 
-	result := runCommand(
-		s.container,
-		s.command,
-		s.options,
-	)
+	cmdResult, cmdErr := s.container.Exec(s.command, s.env, stdin, stdout, stderr)
 
 	for _, tty := range ttys {
 		tty.Close()
 	}
 
-	if s.interactive && s.conns[-1] == nil {
-		controlExit <- true
+	if s.conns[-1] == nil {
+		if s.interactive {
+			controlExit <- true
+		}
+	} else {
+		s.conns[-1].Close()
 	}
 
 	wgEOF.Wait()
@@ -206,12 +232,18 @@ func (s *execWs) Do() shared.OperationResult {
 		pty.Close()
 	}
 
-	return result
+	metadata := shared.Jmap{"return": cmdResult}
+	err = op.UpdateMetadata(metadata)
+	if err != nil {
+		return err
+	}
+
+	return cmdErr
 }
 
 func containerExecPost(d *Daemon, r *http.Request) Response {
 	name := mux.Vars(r)["name"]
-	c, err := containerLXDLoad(d, name)
+	c, err := containerLoadByName(d, name)
 	if err != nil {
 		return SmartError(err)
 	}
@@ -234,29 +266,24 @@ func containerExecPost(d *Daemon, r *http.Request) Response {
 		return BadRequest(err)
 	}
 
-	opts := lxc.DefaultAttachOptions
-	opts.ClearEnv = true
-	opts.Env = []string{}
+	env := map[string]string{}
 
-	for k, v := range c.ConfigGet() {
+	for k, v := range c.ExpandedConfig() {
 		if strings.HasPrefix(k, "environment.") {
-			opts.Env = append(opts.Env, fmt.Sprintf("%s=%s", strings.TrimPrefix(k, "environment."), v))
+			env[strings.TrimPrefix(k, "environment.")] = v
 		}
 	}
 
 	if post.Environment != nil {
 		for k, v := range post.Environment {
-			if k == "HOME" {
-				opts.Cwd = v
-			}
-			opts.Env = append(opts.Env, fmt.Sprintf("%s=%s", k, v))
+			env[k] = v
 		}
 	}
 
 	if post.WaitForWS {
 		ws := &execWs{}
 		ws.fds = map[int]string{}
-		idmapset := c.IdmapSetGet()
+		idmapset := c.IdmapSet()
 		if idmapset != nil {
 			ws.rootUid, ws.rootGid = idmapset.ShiftIntoNs(0, 0)
 		}
@@ -270,8 +297,6 @@ func containerExecPost(d *Daemon, r *http.Request) Response {
 		ws.allConnected = make(chan bool, 1)
 		ws.controlConnected = make(chan bool, 1)
 		ws.interactive = post.Interactive
-		ws.done = make(chan shared.OperationResult, 1)
-		ws.options = opts
 		for i := -1; i < len(ws.conns)-1; i++ {
 			ws.fds[i], err = shared.RandomCryptoString()
 			if err != nil {
@@ -280,26 +305,41 @@ func containerExecPost(d *Daemon, r *http.Request) Response {
 		}
 
 		ws.command = post.Command
-		ws.container = c.LXContainerGet()
+		ws.container = c
+		ws.env = env
 
-		return AsyncResponseWithWs(ws, nil)
+		ws.width = post.Width
+		ws.height = post.Height
+
+		resources := map[string][]string{}
+		resources["containers"] = []string{ws.container.Name()}
+
+		op, err := operationCreate(operationClassWebsocket, resources, ws.Metadata(), ws.Do, nil, ws.Connect)
+		if err != nil {
+			return InternalError(err)
+		}
+
+		return OperationResponse(op)
 	}
 
-	run := func() shared.OperationResult {
-
+	run := func(op *operation) error {
 		nullDev, err := os.OpenFile(os.DevNull, os.O_RDWR, 0666)
 		if err != nil {
-			return shared.OperationError(err)
+			return err
 		}
 		defer nullDev.Close()
-		nullfd := nullDev.Fd()
 
-		opts.StdinFd = nullfd
-		opts.StdoutFd = nullfd
-		opts.StderrFd = nullfd
-
-		return runCommand(c.LXContainerGet(), post.Command, opts)
+		_, cmdErr := c.Exec(post.Command, env, nil, nil, nil)
+		return cmdErr
 	}
 
-	return AsyncResponse(run, nil)
+	resources := map[string][]string{}
+	resources["containers"] = []string{name}
+
+	op, err := operationCreate(operationClassTask, resources, nil, run, nil, nil)
+	if err != nil {
+		return InternalError(err)
+	}
+
+	return OperationResponse(op)
 }

@@ -1,28 +1,252 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/satori/go.uuid"
+	"github.com/pborman/uuid"
 
 	"github.com/lxc/lxd/shared"
 )
 
-var lock sync.Mutex
-var operations map[string]*shared.Operation = make(map[string]*shared.Operation)
+var operationsLock sync.Mutex
+var operations map[string]*operation = make(map[string]*operation)
 
-func createOperation(metadata shared.Jmap, resources map[string][]string, run func() shared.OperationResult, cancel func() error, ws shared.OperationWebsocket) (string, error) {
-	id := uuid.NewV4().String()
-	op := shared.Operation{}
-	op.CreatedAt = time.Now()
-	op.UpdatedAt = op.CreatedAt
-	op.SetStatus(shared.Pending)
+type operationClass int
 
+const (
+	operationClassTask      operationClass = 1
+	operationClassWebsocket operationClass = 2
+	operationClassToken     operationClass = 3
+)
+
+func (t operationClass) String() string {
+	return map[operationClass]string{
+		operationClassTask:      "task",
+		operationClassWebsocket: "websocket",
+		operationClassToken:     "token",
+	}[t]
+}
+
+type operation struct {
+	id        string
+	class     operationClass
+	createdAt time.Time
+	updatedAt time.Time
+	status    shared.StatusCode
+	url       string
+	resources map[string][]string
+	metadata  map[string]interface{}
+	err       string
+	readonly  bool
+
+	// Those functions are called at various points in the operation lifecycle
+	onRun     func(*operation) error
+	onCancel  func(*operation) error
+	onConnect func(*operation, *http.Request, http.ResponseWriter) error
+
+	// Channels used for error reporting and state tracking of background actions
+	chanDone chan error
+
+	// Locking for concurent access to the operation
+	lock sync.Mutex
+}
+
+func (op *operation) done() {
+	if op.readonly {
+		return
+	}
+
+	op.lock.Lock()
+	op.readonly = true
+	op.onRun = nil
+	op.onCancel = nil
+	op.onConnect = nil
+	close(op.chanDone)
+	op.lock.Unlock()
+
+	time.AfterFunc(time.Second*5, func() {
+		operationsLock.Lock()
+		_, ok := operations[op.id]
+		if !ok {
+			operationsLock.Unlock()
+			return
+		}
+
+		delete(operations, op.id)
+		operationsLock.Unlock()
+
+		/*
+		 * When we create a new lxc.Container, it adds a finalizer (via
+		 * SetFinalizer) that frees the struct. However, it sometimes
+		 * takes the go GC a while to actually free the struct,
+		 * presumably since it is a small amount of memory.
+		 * Unfortunately, the struct also keeps the log fd open, so if
+		 * we leave too many of these around, we end up running out of
+		 * fds. So, let's explicitly do a GC to collect these at the
+		 * end of each request.
+		 */
+		runtime.GC()
+	})
+}
+
+func (op *operation) Run() (chan error, error) {
+	if op.status != shared.Pending {
+		return nil, fmt.Errorf("Only pending operations can be started")
+	}
+
+	chanRun := make(chan error, 1)
+
+	op.lock.Lock()
+	op.status = shared.Running
+
+	if op.onRun != nil {
+		go func(op *operation, chanRun chan error) {
+			err := op.onRun(op)
+			if err != nil {
+				op.lock.Lock()
+				op.status = shared.Failure
+				op.err = SmartError(err).String()
+				op.lock.Unlock()
+				op.done()
+				chanRun <- err
+
+				shared.Debugf("Failure for %s operation: %s: %s", op.class.String(), op.id, err)
+
+				_, md, _ := op.Render()
+				eventSend("operation", md)
+				return
+			}
+
+			op.lock.Lock()
+			op.status = shared.Success
+			op.lock.Unlock()
+			op.done()
+			chanRun <- nil
+
+			op.lock.Lock()
+			shared.Debugf("Success for %s operation: %s", op.class.String(), op.id)
+			_, md, _ := op.Render()
+			eventSend("operation", md)
+			op.lock.Unlock()
+		}(op, chanRun)
+	}
+	op.lock.Unlock()
+
+	shared.Debugf("Started %s operation: %s", op.class.String(), op.id)
+	_, md, _ := op.Render()
+	eventSend("operation", md)
+
+	return chanRun, nil
+}
+
+func (op *operation) Cancel() (chan error, error) {
+	if op.status != shared.Running {
+		return nil, fmt.Errorf("Only running operations can be cancelled")
+	}
+
+	if !op.mayCancel() {
+		return nil, fmt.Errorf("This operation can't be cancelled")
+	}
+
+	chanCancel := make(chan error, 1)
+
+	op.lock.Lock()
+	oldStatus := op.status
+	op.status = shared.Cancelling
+	op.lock.Unlock()
+
+	if op.onCancel != nil {
+		go func(op *operation, oldStatus shared.StatusCode, chanCancel chan error) {
+			err := op.onCancel(op)
+			if err != nil {
+				op.lock.Lock()
+				op.status = oldStatus
+				op.lock.Unlock()
+				chanCancel <- err
+
+				shared.Debugf("Failed to cancel %s operation: %s: %s", op.class.String(), op.id, err)
+				_, md, _ := op.Render()
+				eventSend("operation", md)
+				return
+			}
+
+			op.lock.Lock()
+			op.status = shared.Cancelled
+			op.lock.Unlock()
+			op.done()
+			chanCancel <- nil
+
+			shared.Debugf("Cancelled %s operation: %s", op.class.String(), op.id)
+			_, md, _ := op.Render()
+			eventSend("operation", md)
+		}(op, oldStatus, chanCancel)
+	}
+
+	shared.Debugf("Cancelling %s operation: %s", op.class.String(), op.id)
+	_, md, _ := op.Render()
+	eventSend("operation", md)
+
+	if op.onCancel == nil {
+		op.lock.Lock()
+		op.status = shared.Cancelled
+		op.lock.Unlock()
+		op.done()
+		chanCancel <- nil
+	}
+
+	shared.Debugf("Cancelled %s operation: %s", op.class.String(), op.id)
+	_, md, _ = op.Render()
+	eventSend("operation", md)
+
+	return chanCancel, nil
+}
+
+func (op *operation) Connect(r *http.Request, w http.ResponseWriter) (chan error, error) {
+	if op.class != operationClassWebsocket {
+		return nil, fmt.Errorf("Only websocket operations can be connected")
+	}
+
+	if op.status != shared.Running {
+		return nil, fmt.Errorf("Only running operations can be connected")
+	}
+
+	chanConnect := make(chan error, 1)
+
+	op.lock.Lock()
+
+	go func(op *operation, chanConnect chan error) {
+		err := op.onConnect(op, r, w)
+		if err != nil {
+			chanConnect <- err
+
+			shared.Debugf("Failed to handle %s operation: %s: %s", op.class.String(), op.id, err)
+			return
+		}
+
+		chanConnect <- nil
+
+		shared.Debugf("Handled %s operation: %s", op.class.String(), op.id)
+	}(op, chanConnect)
+	op.lock.Unlock()
+
+	shared.Debugf("Connected %s operation: %s", op.class.String(), op.id)
+
+	return chanConnect, nil
+}
+
+func (op *operation) mayCancel() bool {
+	return op.onCancel != nil || op.class == operationClassToken
+}
+
+func (op *operation) Render() (string, *shared.Operation, error) {
+	// Setup the resource URLs
+	resources := op.resources
 	if resources != nil {
 		tmpResources := make(map[string][]string)
 		for key, value := range resources {
@@ -32,209 +256,304 @@ func createOperation(metadata shared.Jmap, resources map[string][]string, run fu
 			}
 			tmpResources[key] = values
 		}
-		op.Resources = tmpResources
+		resources = tmpResources
 	}
 
-	md, err := json.Marshal(metadata)
-	if err != nil {
-		return "", err
-	}
-	op.Metadata = md
+	md := shared.Jmap(op.metadata)
 
-	op.MayCancel = ((run == nil && cancel == nil) || cancel != nil)
-
-	op.Run = run
-	op.Cancel = cancel
-	op.Chan = make(chan bool, 1)
-	op.Websocket = ws
-
-	url := shared.OperationsURL(id)
-
-	lock.Lock()
-	operations[url] = &op
-	lock.Unlock()
-	return url, nil
+	return op.url, &shared.Operation{
+		Id:         op.id,
+		Class:      op.class.String(),
+		CreatedAt:  op.createdAt,
+		UpdatedAt:  op.updatedAt,
+		Status:     op.status.String(),
+		StatusCode: op.status,
+		Resources:  resources,
+		Metadata:   &md,
+		MayCancel:  op.mayCancel(),
+		Err:        op.err,
+	}, nil
 }
 
-func startOperation(id string) error {
-	lock.Lock()
-	op, ok := operations[id]
-	if !ok {
-		lock.Unlock()
-		return fmt.Errorf("operation %s doesn't exist", id)
+func (op *operation) WaitFinal(timeout int) (bool, error) {
+	// Check current state
+	if op.status.IsFinal() {
+		return true, nil
 	}
 
-	if op.Run != nil {
-		go func(op *shared.Operation) {
-			result := op.Run()
-
-			shared.Debugf("Operation %s finished: %s", op.Run, result)
-
-			lock.Lock()
-			op.SetResult(result)
-			lock.Unlock()
-		}(op)
+	// Wait indefinitely
+	if timeout == -1 {
+		for {
+			<-op.chanDone
+			return true, nil
+		}
 	}
 
-	op.SetStatus(shared.Running)
-	lock.Unlock()
+	// Wait until timeout
+	if timeout > 0 {
+		timer := time.NewTimer(time.Duration(timeout) * time.Second)
+		for {
+			select {
+			case <-op.chanDone:
+				return false, nil
+
+			case <-timer.C:
+				return false, nil
+			}
+		}
+	}
+
+	return false, nil
+}
+
+func (op *operation) UpdateResources(opResources map[string][]string) error {
+	if op.status != shared.Pending && op.status != shared.Running {
+		return fmt.Errorf("Only pending or running operations can be updated")
+	}
+
+	if op.readonly {
+		return fmt.Errorf("Read-only operations can't be updated")
+	}
+
+	op.lock.Lock()
+	op.updatedAt = time.Now()
+	op.resources = opResources
+	op.lock.Unlock()
+
+	shared.Debugf("Updated resources for %s operation: %s", op.class.String(), op.id)
+	_, md, _ := op.Render()
+	eventSend("operation", md)
 
 	return nil
 }
 
-func operationsGet(d *Daemon, r *http.Request) Response {
-	ops := shared.Jmap{"pending": make([]string, 0, 0), "running": make([]string, 0, 0)}
-
-	lock.Lock()
-	for k, v := range operations {
-		switch v.StatusCode {
-		case shared.Pending:
-			ops["pending"] = append(ops["pending"].([]string), k)
-		case shared.Running:
-			ops["running"] = append(ops["running"].([]string), k)
-		}
+func (op *operation) UpdateMetadata(opMetadata interface{}) error {
+	if op.status != shared.Pending && op.status != shared.Running {
+		return fmt.Errorf("Only pending or running operations can be updated")
 	}
-	lock.Unlock()
 
-	return SyncResponse(true, ops)
+	if op.readonly {
+		return fmt.Errorf("Read-only operations can't be updated")
+	}
+
+	newMetadata, err := shared.ParseMetadata(opMetadata)
+	if err != nil {
+		return err
+	}
+
+	op.lock.Lock()
+	op.updatedAt = time.Now()
+	op.metadata = newMetadata
+	op.lock.Unlock()
+
+	shared.Debugf("Updated metadata for %s operation: %s", op.class.String(), op.id)
+	_, md, _ := op.Render()
+	eventSend("operation", md)
+
+	return nil
 }
 
-var operationsCmd = Command{name: "operations", get: operationsGet}
+func operationCreate(opClass operationClass, opResources map[string][]string, opMetadata interface{},
+	onRun func(*operation) error,
+	onCancel func(*operation) error,
+	onConnect func(*operation, *http.Request, http.ResponseWriter) error) (*operation, error) {
 
-func operationGet(d *Daemon, r *http.Request) Response {
-	id := shared.OperationsURL(mux.Vars(r)["id"])
+	// Main attributes
+	op := operation{}
+	op.id = uuid.NewRandom().String()
+	op.class = opClass
+	op.createdAt = time.Now()
+	op.updatedAt = op.createdAt
+	op.status = shared.Pending
+	op.url = fmt.Sprintf("/%s/operations/%s", shared.APIVersion, op.id)
+	op.resources = opResources
+	op.chanDone = make(chan error)
 
-	lock.Lock()
-	defer lock.Unlock()
+	newMetadata, err := shared.ParseMetadata(opMetadata)
+	if err != nil {
+		return nil, err
+	}
+	op.metadata = newMetadata
+
+	// Callback functions
+	op.onRun = onRun
+	op.onCancel = onCancel
+	op.onConnect = onConnect
+
+	// Sanity check
+	if op.class != operationClassWebsocket && op.onConnect != nil {
+		return nil, fmt.Errorf("Only websocket operations can have a Connect hook")
+	}
+
+	if op.class == operationClassWebsocket && op.onConnect == nil {
+		return nil, fmt.Errorf("Websocket operations must have a Connect hook")
+	}
+
+	if op.class == operationClassToken && op.onRun != nil {
+		return nil, fmt.Errorf("Token operations can't have a Run hook")
+	}
+
+	if op.class == operationClassToken && op.onCancel != nil {
+		return nil, fmt.Errorf("Token operations can't have a Cancel hook")
+	}
+
+	operationsLock.Lock()
+	operations[op.id] = &op
+	operationsLock.Unlock()
+
+	shared.Debugf("New %s operation: %s", op.class.String(), op.id)
+	_, md, _ := op.Render()
+	eventSend("operation", md)
+
+	return &op, nil
+}
+
+func operationGet(id string) (*operation, error) {
+	operationsLock.Lock()
 	op, ok := operations[id]
+	operationsLock.Unlock()
+
 	if !ok {
+		return nil, fmt.Errorf("Operation '%s' doesn't exist", id)
+	}
+
+	return op, nil
+}
+
+// API functions
+func operationAPIGet(d *Daemon, r *http.Request) Response {
+	id := mux.Vars(r)["id"]
+
+	op, err := operationGet(id)
+	if err != nil {
 		return NotFound
 	}
 
-	return SyncResponse(true, op)
+	_, body, err := op.Render()
+	if err != nil {
+		return InternalError(err)
+	}
+
+	return SyncResponse(true, body)
 }
 
-func operationDelete(d *Daemon, r *http.Request) Response {
-	lock.Lock()
-	id := shared.OperationsURL(mux.Vars(r)["id"])
-	op, ok := operations[id]
-	if !ok {
-		lock.Unlock()
+func operationAPIDelete(d *Daemon, r *http.Request) Response {
+	id := mux.Vars(r)["id"]
+
+	op, err := operationGet(id)
+	if err != nil {
 		return NotFound
 	}
 
-	if op.Cancel == nil && op.Run != nil {
-		lock.Unlock()
-		return BadRequest(fmt.Errorf("Can't cancel %s!", id))
-	}
-
-	if op.StatusCode == shared.Cancelling || op.StatusCode.IsFinal() {
-		/* the user has already requested a cancel, or the status is
-		 * in a final state. */
-		lock.Unlock()
-		return EmptySyncResponse
-	}
-
-	if op.Cancel != nil {
-		cancel := op.Cancel
-		op.SetStatus(shared.Cancelling)
-		lock.Unlock()
-
-		err := cancel()
-
-		lock.Lock()
-		op.SetStatusByErr(err)
-		lock.Unlock()
-
-		if err != nil {
-			return InternalError(err)
-		}
-	} else {
-		op.SetStatus(shared.Cancelled)
-		lock.Unlock()
+	_, err = op.Cancel()
+	if err != nil {
+		return BadRequest(err)
 	}
 
 	return EmptySyncResponse
 }
 
-var operationCmd = Command{name: "operations/{id}", get: operationGet, delete: operationDelete}
+var operationCmd = Command{name: "operations/{id}", get: operationAPIGet, delete: operationAPIDelete}
 
-func operationWaitGet(d *Daemon, r *http.Request) Response {
-	targetStatus, err := shared.AtoiEmptyDefault(r.FormValue("status_code"), int(shared.Success))
-	if err != nil {
-		return InternalError(err)
+func operationsAPIGet(d *Daemon, r *http.Request) Response {
+	var md shared.Jmap
+
+	recursion := d.isRecursionRequest(r)
+
+	md = shared.Jmap{}
+
+	operationsLock.Lock()
+	ops := operations
+	operationsLock.Unlock()
+
+	for _, v := range ops {
+		status := strings.ToLower(v.status.String())
+		_, ok := md[status]
+		if !ok {
+			if recursion {
+				md[status] = make([]*shared.Operation, 0)
+			} else {
+				md[status] = make([]string, 0)
+			}
+		}
+
+		if !recursion {
+			md[status] = append(md[status].([]string), v.url)
+			continue
+		}
+
+		_, body, err := v.Render()
+		if err != nil {
+			continue
+		}
+
+		md[status] = append(md[status].([]*shared.Operation), body)
 	}
 
+	return SyncResponse(true, md)
+}
+
+var operationsCmd = Command{name: "operations", get: operationsAPIGet}
+
+func operationAPIWaitGet(d *Daemon, r *http.Request) Response {
 	timeout, err := shared.AtoiEmptyDefault(r.FormValue("timeout"), -1)
 	if err != nil {
 		return InternalError(err)
 	}
 
-	lock.Lock()
-	id := shared.OperationsURL(mux.Vars(r)["id"])
-	op, ok := operations[id]
-	if !ok {
-		lock.Unlock()
+	id := mux.Vars(r)["id"]
+	op, err := operationGet(id)
+	if err != nil {
 		return NotFound
 	}
 
-	status := op.StatusCode
-	lock.Unlock()
-
-	if int(status) != targetStatus && (status == shared.Pending || status == shared.Running) {
-
-		if timeout >= 0 {
-			select {
-			case <-op.Chan:
-				break
-			case <-time.After(time.Duration(timeout) * time.Second):
-				break
-			}
-		} else {
-			<-op.Chan
-		}
+	_, err = op.WaitFinal(timeout)
+	if err != nil {
+		return InternalError(err)
 	}
 
-	lock.Lock()
-	defer lock.Unlock()
-	return SyncResponse(true, op)
+	_, body, err := op.Render()
+	if err != nil {
+		return InternalError(err)
+	}
+
+	return SyncResponse(true, body)
 }
 
-var operationWait = Command{name: "operations/{id}/wait", get: operationWaitGet}
+var operationWait = Command{name: "operations/{id}/wait", get: operationAPIWaitGet}
 
-type websocketServe struct {
-	req    *http.Request
-	secret string
-	op     *shared.Operation
+type operationWebSocket struct {
+	req *http.Request
+	op  *operation
 }
 
-func (r *websocketServe) Render(w http.ResponseWriter) error {
-	return r.op.Websocket.Connect(r.secret, r.req, w)
+func (r *operationWebSocket) Render(w http.ResponseWriter) error {
+	chanErr, err := r.op.Connect(r.req, w)
+	if err != nil {
+		return err
+	}
+
+	err = <-chanErr
+	return err
 }
 
-func operationWebsocketGet(d *Daemon, r *http.Request) Response {
-	lock.Lock()
-	defer lock.Unlock()
-	id := shared.OperationsURL(mux.Vars(r)["id"])
-	op, ok := operations[id]
-	if !ok {
+func (r *operationWebSocket) String() string {
+	_, md, err := r.op.Render()
+	if err != nil {
+		return fmt.Sprintf("error: %s", err)
+	}
+
+	return md.Id
+}
+
+func operationAPIWebsocketGet(d *Daemon, r *http.Request) Response {
+	id := mux.Vars(r)["id"]
+	op, err := operationGet(id)
+	if err != nil {
 		return NotFound
 	}
 
-	if op.Websocket == nil {
-		return BadRequest(fmt.Errorf("operation has no websocket protocol"))
-	}
-
-	secret := r.FormValue("secret")
-	if secret == "" {
-		return BadRequest(fmt.Errorf("missing secret"))
-	}
-
-	if op.StatusCode.IsFinal() {
-		return BadRequest(fmt.Errorf("status is %s, can't connect", op.Status))
-	}
-
-	return &websocketServe{r, secret, op}
+	return &operationWebSocket{r, op}
 }
 
-var operationWebsocket = Command{name: "operations/{id}/websocket", untrustedGet: true, get: operationWebsocketGet}
+var operationWebsocket = Command{name: "operations/{id}/websocket", untrustedGet: true, get: operationAPIWebsocketGet}

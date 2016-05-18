@@ -6,12 +6,16 @@ import (
 	"net/http"
 
 	"github.com/gorilla/mux"
-	"github.com/lxc/lxd/shared"
 )
+
+type containerPostBody struct {
+	Migration bool   `json:"migration"`
+	Name      string `json:"name"`
+}
 
 func containerPost(d *Daemon, r *http.Request) Response {
 	name := mux.Vars(r)["name"]
-	c, err := containerLXDLoad(d, name)
+	c, err := containerLoadByName(d, name)
 	if err != nil {
 		return SmartError(err)
 	}
@@ -32,12 +36,28 @@ func containerPost(d *Daemon, r *http.Request) Response {
 			return InternalError(err)
 		}
 
-		return AsyncResponseWithWs(ws, nil)
+		resources := map[string][]string{}
+		resources["containers"] = []string{name}
+
+		op, err := operationCreate(operationClassWebsocket, resources, ws.Metadata(), ws.Do, nil, ws.Connect)
+		if err != nil {
+			return InternalError(err)
+		}
+
+		return OperationResponse(op)
 	}
 
-	run := func() error {
+	run := func(*operation) error {
 		return c.Rename(body.Name)
 	}
 
-	return AsyncResponse(shared.OperationWrap(run), nil)
+	resources := map[string][]string{}
+	resources["containers"] = []string{name}
+
+	op, err := operationCreate(operationClassTask, resources, nil, run, nil, nil)
+	if err != nil {
+		return InternalError(err)
+	}
+
+	return OperationResponse(op)
 }

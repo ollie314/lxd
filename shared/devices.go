@@ -10,118 +10,91 @@ func (list Devices) ContainsName(k string) bool {
 	return false
 }
 
-func nicEqual(d1 Device, d2 Device) bool {
-	if !nicSettingsEqual(d1, d2) {
-		return false
-	}
-	if d1.get("hwaddr") != d2.get("hwaddr") {
-		return false
-	}
-	return true
-}
-
-func nicSettingsEqual(d1 Device, d2 Device) bool {
-	if d1.get("nictype") != d2.get("nictype") {
-		return false
-	}
-	if d1.get("name") != d2.get("name") || d1.get("parent") != d2.get("parent") {
-		return false
-	}
-	if d1.get("mtu") != d2.get("mtu") {
-		return false
-	}
-	return true
-}
-
-func diskEqual(d1 Device, d2 Device) bool {
-	if d1.get("path") != d2.get("path") || d1.get("source") != d2.get("source") {
-		return false
-	}
-	if d1.get("optional") != d2.get("optional") || d1.get("readonly") != d2.get("readonly") {
-		return false
-	}
-	return true
-}
-
 func (d Device) get(key string) string {
 	return d[key]
 }
 
 func (list Devices) Contains(k string, d Device) bool {
+	// If it didn't exist, it's different
 	if list[k] == nil {
 		return false
 	}
-	ld := list[k]
-	if ld.get("type") != d.get("type") {
-		return false
-	}
-	switch ld.get("type") {
-	case "nic":
-		if !nicEqual(ld, d) {
+
+	old := list[k]
+
+	return deviceEquals(old, d)
+}
+
+func deviceEquals(old Device, d Device) bool {
+	// Check for any difference and addition/removal of properties
+	for k, _ := range d {
+		if d[k] != old[k] {
 			return false
 		}
-	case "disk":
-		if !diskEqual(ld, d) {
+	}
+
+	for k, _ := range old {
+		if d[k] != old[k] {
 			return false
 		}
 	}
+
 	return true
 }
 
-func liveUpdateable(devtype string) bool {
-	switch devtype {
-	case "nic":
-		return true
-	case "disk":
-		return true
-	case "unix-block":
-		return true
-	case "unix-char":
-		return true
-	default:
-		return false
-	}
-}
-
-func (old Devices) Update(newlist Devices) (map[string]Device, map[string]Device) {
+func (old Devices) Update(newlist Devices) (map[string]Device, map[string]Device, map[string]Device) {
 	rmlist := map[string]Device{}
 	addlist := map[string]Device{}
+	updatelist := map[string]Device{}
+
 	for key, d := range old {
-		switch {
-		case !liveUpdateable(d["type"]):
-			continue
-		case !newlist.Contains(key, d):
+		if !newlist.Contains(key, d) {
 			rmlist[key] = d
 		}
 	}
+
 	for key, d := range newlist {
-		switch {
-		case !liveUpdateable(d["type"]):
-			continue
-		case !old.Contains(key, d):
+		if !old.Contains(key, d) {
 			addlist[key] = d
 		}
 	}
-	return rmlist, addlist
+
+	for key, d := range addlist {
+		srcOldDevice := rmlist[key]
+		var oldDevice Device
+		err := DeepCopy(&srcOldDevice, &oldDevice)
+		if err != nil {
+			continue
+		}
+
+		srcNewDevice := newlist[key]
+		var newDevice Device
+		err = DeepCopy(&srcNewDevice, &newDevice)
+		if err != nil {
+			continue
+		}
+
+		for _, k := range []string{"limits.max", "limits.read", "limits.write", "limits.egress", "limits.ingress"} {
+			delete(oldDevice, k)
+			delete(newDevice, k)
+		}
+
+		if deviceEquals(oldDevice, newDevice) {
+			delete(rmlist, key)
+			delete(addlist, key)
+			updatelist[key] = d
+		}
+	}
+
+	return rmlist, addlist, updatelist
 }
 
 func (newBaseDevices Devices) ExtendFromProfile(currentFullDevices Devices, newDevicesFromProfile Devices) error {
+	// For any entry which exists in a profile and doesn't in the container config, add it
 
-	// Add devices from profile to a list of new devices. If a nic
-	// is already in currentFullDevices and only differs by
-	// hwaddr, keep the existing one instead of overwriting it
-	// with the one from the profile
 	for name, newDev := range newDevicesFromProfile {
-		if newDev["type"] == "nic" {
-			if curDev, ok := currentFullDevices[name]; ok {
-				if nicSettingsEqual(newDev, curDev) {
-					newBaseDevices[name] = curDev
-				} else {
-					newBaseDevices[name] = newDev
-				}
-			} else {
-				newBaseDevices[name] = newDev
-			}
+		if curDev, ok := currentFullDevices[name]; ok {
+			newBaseDevices[name] = curDev
 		} else {
 			newBaseDevices[name] = newDev
 		}

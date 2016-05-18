@@ -1,10 +1,8 @@
 package main
 
 import (
-	"github.com/chai2010/gettext-go/gettext"
-
 	"github.com/lxc/lxd"
-	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/i18n"
 )
 
 type moveCmd struct {
@@ -16,10 +14,15 @@ func (c *moveCmd) showByDefault() bool {
 }
 
 func (c *moveCmd) usage() string {
-	return gettext.Gettext(
+	return i18n.G(
 		`Move containers within or in between lxd instances.
 
-lxc move [remote:]<source container> [remote:]<destination container>`)
+lxc move [remote:]<source container> [remote:]<destination container>
+    Move a container between two hosts, renaming it if destination name differs.
+
+lxc move <old name> <new name>
+    Rename a local container.
+`)
 }
 
 func (c *moveCmd) flags() {}
@@ -43,29 +46,19 @@ func (c *moveCmd) run(config *lxd.Config, args []string) error {
 			return err
 		}
 
-		canRename := false
-		if shared.IsSnapshot(sourceName) {
-			canRename = true
-		} else {
-			status, err := source.ContainerStatus(sourceName)
-			if err != nil {
-				return err
-			}
-			canRename = status.Status.StatusCode != shared.Running
+		rename, err := source.Rename(sourceName, destName)
+		if err != nil {
+			return err
 		}
 
-		if canRename {
-			rename, err := source.Rename(sourceName, destName)
-			if err != nil {
-				return err
-			}
-			return source.WaitForSuccess(rename.Operation)
-		}
+		return source.WaitForSuccess(rename.Operation)
 	}
+
+	cpy := copyCmd{}
 
 	// A move is just a copy followed by a delete; however, we want to
 	// keep the volatile entries around since we are moving the container.
-	if err := copyContainer(config, args[0], args[1], true, -1); err != nil {
+	if err := cpy.copyContainer(config, args[0], args[1], true, -1); err != nil {
 		return err
 	}
 

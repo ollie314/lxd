@@ -12,10 +12,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
-	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang/protobuf/proto"
@@ -31,6 +32,7 @@ type migrationFields struct {
 
 	controlSecret string
 	controlConn   *websocket.Conn
+	controlLock   sync.Mutex
 
 	criuSecret string
 	criuConn   *websocket.Conn
@@ -42,6 +44,19 @@ type migrationFields struct {
 }
 
 func (c *migrationFields) send(m proto.Message) error {
+	/* gorilla websocket doesn't allow concurrent writes, and
+	 * panic()s if it sees them (which is reasonable). If e.g. we
+	 * happen to fail, get scheduled, start our write, then get
+	 * unscheduled before the write is bit to a new thread which is
+	 * receiving an error from the other side (due to our previous
+	 * close), we can engage in these concurrent writes, which
+	 * casuses the whole daemon to panic.
+	 *
+	 * Instead, let's lock sends to the controlConn so that we only ever
+	 * write one message at the time.
+	 */
+	c.controlLock.Lock()
+	defer c.controlLock.Unlock()
 	w, err := c.controlConn.NextWriter(websocket.BinaryMessage)
 	if err != nil {
 		return err
@@ -54,6 +69,15 @@ func (c *migrationFields) send(m proto.Message) error {
 	}
 
 	return shared.WriteAll(w, data)
+}
+
+func findCriu(host string) error {
+	_, err := exec.LookPath("criu")
+	if err != nil {
+		return fmt.Errorf("CRIU is required for live migration but its binary couldn't be found on the %s server. Is it installed in LXD's path?", host)
+	}
+
+	return nil
 }
 
 func (c *migrationFields) recv(m proto.Message) error {
@@ -76,16 +100,28 @@ func (c *migrationFields) recv(m proto.Message) error {
 
 func (c *migrationFields) disconnect() {
 	closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
+
+	c.controlLock.Lock()
 	if c.controlConn != nil {
 		c.controlConn.WriteMessage(websocket.CloseMessage, closeMsg)
+		c.controlConn = nil /* don't close twice */
 	}
+	c.controlLock.Unlock()
 
+	/* Below we just Close(), which doesn't actually write to the
+	 * websocket, it just closes the underlying connection. If e.g. there
+	 * is still a filesystem transfer going on, but the other side has run
+	 * out of disk space, writing an actual CloseMessage here will cause
+	 * gorilla websocket to panic. Instead, we just force close this
+	 * connection, since we report the error over the control channel
+	 * anyway.
+	 */
 	if c.fsConn != nil {
-		c.fsConn.WriteMessage(websocket.CloseMessage, closeMsg)
+		c.fsConn.Close()
 	}
 
 	if c.criuConn != nil {
-		c.criuConn.WriteMessage(websocket.CloseMessage, closeMsg)
+		c.criuConn.Close()
 	}
 }
 
@@ -124,14 +160,14 @@ func (c *migrationFields) controlChannel() <-chan MigrationControl {
 
 func CollectCRIULogFile(c container, imagesDir string, function string, method string) error {
 	t := time.Now().Format(time.RFC3339)
-	newPath := shared.LogPath(c.NameGet(), fmt.Sprintf("%s_%s_%s.log", function, method, t))
+	newPath := shared.LogPath(c.Name(), fmt.Sprintf("%s_%s_%s.log", function, method, t))
 	return shared.FileCopy(filepath.Join(imagesDir, fmt.Sprintf("%s.log", method)), newPath)
 }
 
-func GetCRIULogErrors(imagesDir string, method string) string {
+func GetCRIULogErrors(imagesDir string, method string) (string, error) {
 	f, err := os.Open(path.Join(imagesDir, fmt.Sprintf("%s.log", method)))
 	if err != nil {
-		return fmt.Sprintf("Problem accessing CRIU log: %s", err)
+		return "", err
 	}
 
 	defer f.Close()
@@ -145,7 +181,7 @@ func GetCRIULogErrors(imagesDir string, method string) string {
 		}
 	}
 
-	return strings.Join(ret, "\n")
+	return strings.Join(ret, "\n"), nil
 }
 
 type migrationSourceWs struct {
@@ -154,7 +190,7 @@ type migrationSourceWs struct {
 	allConnected chan bool
 }
 
-func NewMigrationSource(c container) (shared.OperationWebsocket, error) {
+func NewMigrationSource(c container) (*migrationSourceWs, error) {
 	ret := migrationSourceWs{migrationFields{container: c}, make(chan bool, 1)}
 
 	var err error
@@ -169,13 +205,15 @@ func NewMigrationSource(c container) (shared.OperationWebsocket, error) {
 	}
 
 	if c.IsRunning() {
+		if err := findCriu("source"); err != nil {
+			return nil, err
+		}
+
 		ret.live = true
 		ret.criuSecret, err = shared.RandomCryptoString()
 		if err != nil {
 			return nil, err
 		}
-	} else {
-		c.StorageStart()
 	}
 
 	return &ret, nil
@@ -194,7 +232,12 @@ func (s *migrationSourceWs) Metadata() interface{} {
 	return secrets
 }
 
-func (s *migrationSourceWs) Connect(secret string, r *http.Request, w http.ResponseWriter) error {
+func (s *migrationSourceWs) Connect(op *operation, r *http.Request, w http.ResponseWriter) error {
+	secret := r.FormValue("secret")
+	if secret == "" {
+		return fmt.Errorf("missing secret")
+	}
+
 	var conn **websocket.Conn
 
 	switch secret {
@@ -224,18 +267,24 @@ func (s *migrationSourceWs) Connect(secret string, r *http.Request, w http.Respo
 	return nil
 }
 
-func (s *migrationSourceWs) Do() shared.OperationResult {
+func (s *migrationSourceWs) Do(op *operation) error {
 	<-s.allConnected
 
 	criuType := CRIUType_CRIU_RSYNC.Enum()
 	if !s.live {
 		criuType = nil
+
+		err := s.container.StorageStart()
+		if err != nil {
+			return err
+		}
+
 		defer s.container.StorageStop()
 	}
 
 	idmaps := make([]*IDMapType, 0)
 
-	idmapset := s.container.IdmapSetGet()
+	idmapset := s.container.IdmapSet()
 	if idmapset != nil {
 		for _, ctnIdmap := range idmapset.Idmap {
 			idmap := IDMapType{
@@ -250,43 +299,72 @@ func (s *migrationSourceWs) Do() shared.OperationResult {
 		}
 	}
 
+	driver, fsErr := s.container.Storage().MigrationSource(s.container)
+	/* the protocol says we have to send a header no matter what, so let's
+	 * do that, but then immediately send an error.
+	 */
+	snapshots := []string{}
+	if fsErr == nil {
+		fullSnaps := driver.Snapshots()
+		for _, snap := range fullSnaps {
+			snapshots = append(snapshots, shared.ExtractSnapshotName(snap.Name()))
+		}
+	}
+
+	myType := s.container.Storage().MigrationType()
 	header := MigrationHeader{
-		Fs:    MigrationFSType_RSYNC.Enum(),
-		Criu:  criuType,
-		Idmap: idmaps,
+		Fs:        &myType,
+		Criu:      criuType,
+		Idmap:     idmaps,
+		Snapshots: snapshots,
 	}
 
 	if err := s.send(&header); err != nil {
 		s.sendControl(err)
-		return shared.OperationError(err)
+		return err
+	}
+
+	if fsErr != nil {
+		s.sendControl(fsErr)
+		return fsErr
 	}
 
 	if err := s.recv(&header); err != nil {
 		s.sendControl(err)
-		return shared.OperationError(err)
+		return err
 	}
 
-	if *header.Fs != MigrationFSType_RSYNC {
-		err := fmt.Errorf("Formats other than rsync not understood")
+	if *header.Fs != myType {
+		myType = MigrationFSType_RSYNC
+		header.Fs = &myType
+
+		driver, _ = rsyncMigrationSource(s.container)
+	}
+
+	if err := driver.SendWhileRunning(s.fsConn); err != nil {
+		driver.Cleanup()
 		s.sendControl(err)
-		return shared.OperationError(err)
+		return err
 	}
 
 	if s.live {
 		if header.Criu == nil {
+			driver.Cleanup()
 			err := fmt.Errorf("Got no CRIU socket type for live migration")
 			s.sendControl(err)
-			return shared.OperationError(err)
+			return err
 		} else if *header.Criu != CRIUType_CRIU_RSYNC {
+			driver.Cleanup()
 			err := fmt.Errorf("Formats other than criu rsync not understood")
 			s.sendControl(err)
-			return shared.OperationError(err)
+			return err
 		}
 
-		checkpointDir, err := ioutil.TempDir("", "lxd_migration_")
+		checkpointDir, err := ioutil.TempDir("", "lxd_checkpoint_")
 		if err != nil {
+			driver.Cleanup()
 			s.sendControl(err)
-			return shared.OperationError(err)
+			return err
 		}
 		defer os.RemoveAll(checkpointDir)
 
@@ -298,11 +376,19 @@ func (s *migrationSourceWs) Do() shared.OperationResult {
 		}
 
 		if err != nil {
-			log := GetCRIULogErrors(checkpointDir, "dump")
+			driver.Cleanup()
+			log, err2 := GetCRIULogErrors(checkpointDir, "dump")
+
+			/* couldn't find the CRIU log file which means we
+			 * didn't even get that far; give back the liblxc
+			 * error. */
+			if err2 != nil {
+				log = err.Error()
+			}
 
 			err = fmt.Errorf("checkpoint failed:\n%s", log)
 			s.sendControl(err)
-			return shared.OperationError(err)
+			return err
 		}
 
 		/*
@@ -313,30 +399,33 @@ func (s *migrationSourceWs) Do() shared.OperationResult {
 		 * p.haul's protocol, it will make sense to do these in parallel.
 		 */
 		if err := RsyncSend(shared.AddSlash(checkpointDir), s.criuConn); err != nil {
+			driver.Cleanup()
 			s.sendControl(err)
-			return shared.OperationError(err)
+			return err
+		}
+
+		if err := driver.SendAfterCheckpoint(s.fsConn); err != nil {
+			driver.Cleanup()
+			s.sendControl(err)
+			return err
 		}
 	}
 
-	fsDir := s.container.RootfsPathGet()
-	if err := RsyncSend(shared.AddSlash(fsDir), s.fsConn); err != nil {
-		s.sendControl(err)
-		return shared.OperationError(err)
-	}
+	driver.Cleanup()
 
 	msg := MigrationControl{}
 	if err := s.recv(&msg); err != nil {
 		s.disconnect()
-		return shared.OperationError(err)
+		return err
 	}
 
 	// TODO: should we add some config here about automatically restarting
 	// the container migrate failure? What about the failures above?
 	if !*msg.Success {
-		return shared.OperationError(fmt.Errorf(*msg.Message))
+		return fmt.Errorf(*msg.Message)
 	}
 
-	return shared.OperationSuccess
+	return nil
 }
 
 type migrationSink struct {
@@ -374,16 +463,20 @@ func NewMigrationSink(args *MigrationSinkArgs) (func() error, error) {
 	sink.criuSecret, ok = args.Secrets["criu"]
 	sink.live = ok
 
+	if err := findCriu("destination"); sink.live && err != nil {
+		return nil, err
+	}
+
 	return sink.do, nil
 }
 
 func (c *migrationSink) connectWithSecret(secret string) (*websocket.Conn, error) {
 	query := url.Values{"secret": []string{secret}}
 
-	// TODO: we shouldn't assume this is a HTTP URL
-	url := c.url + "?" + query.Encode()
+	// The URL is a https URL to the operation, mangle to be a wss URL to the secret
+	wsUrl := fmt.Sprintf("wss://%s/websocket?%s", strings.TrimPrefix(c.url, "https://"), query.Encode())
 
-	return lxd.WebsocketDial(c.dialer, url)
+	return lxd.WebsocketDial(c.dialer, wsUrl)
 }
 
 func (c *migrationSink) do() error {
@@ -408,8 +501,6 @@ func (c *migrationSink) do() error {
 		}
 	}
 
-	// For now, we just ignore whatever the server sends us. We only
-	// support RSYNC, so that's what we respond with.
 	header := MigrationHeader{}
 	if err := c.recv(&header); err != nil {
 		c.sendControl(err)
@@ -421,7 +512,21 @@ func (c *migrationSink) do() error {
 		criuType = nil
 	}
 
-	resp := MigrationHeader{Fs: MigrationFSType_RSYNC.Enum(), Criu: criuType}
+	mySink := c.container.Storage().MigrationSink
+	myType := c.container.Storage().MigrationType()
+	resp := MigrationHeader{
+		Fs:   &myType,
+		Criu: criuType,
+	}
+
+	// If the storage type the source has doesn't match what we have, then
+	// we have to use rsync.
+	if *header.Fs != *resp.Fs {
+		mySink = rsyncMigrationSink
+		myType = MigrationFSType_RSYNC
+		resp.Fs = &myType
+	}
+
 	if err := c.send(&resp); err != nil {
 		c.sendControl(err)
 		return err
@@ -431,17 +536,69 @@ func (c *migrationSink) do() error {
 	go func(c *migrationSink) {
 		imagesDir := ""
 		srcIdmap := new(shared.IdmapSet)
-		dstIdmap := c.container.IdmapSetGet()
-		if dstIdmap == nil {
-			dstIdmap = new(shared.IdmapSet)
+
+		snapshots := []container{}
+		for _, snap := range header.Snapshots {
+			// TODO: we need to propagate snapshot configurations
+			// as well. Right now the container configuration is
+			// done through the initial migration post. Should we
+			// post the snapshots and their configs as well, or do
+			// it some other way?
+			name := c.container.Name() + shared.SnapshotDelimiter + snap
+			args := containerArgs{
+				Ctype:        cTypeSnapshot,
+				Config:       c.container.LocalConfig(),
+				Profiles:     c.container.Profiles(),
+				Ephemeral:    c.container.IsEphemeral(),
+				Architecture: c.container.Architecture(),
+				Devices:      c.container.LocalDevices(),
+				Name:         name,
+			}
+
+			ct, err := containerCreateEmptySnapshot(c.container.Daemon(), args)
+			if err != nil {
+				restore <- err
+				return
+			}
+			snapshots = append(snapshots, ct)
 		}
+
+		for _, idmap := range header.Idmap {
+			e := shared.IdmapEntry{
+				Isuid:    *idmap.Isuid,
+				Isgid:    *idmap.Isgid,
+				Nsid:     int(*idmap.Nsid),
+				Hostid:   int(*idmap.Hostid),
+				Maprange: int(*idmap.Maprange)}
+			srcIdmap.Idmap = shared.Extend(srcIdmap.Idmap, e)
+		}
+
+		/* We do the fs receive in parallel so we don't have to reason
+		 * about when to receive what. The sending side is smart enough
+		 * to send the filesystem bits that it can before it seizes the
+		 * container to start checkpointing, so the total transfer time
+		 * will be minimized even if we're dumb here.
+		 */
+		fsTransfer := make(chan error)
+		go func() {
+			if err := mySink(c.live, c.container, snapshots, c.fsConn); err != nil {
+				fsTransfer <- err
+				return
+			}
+
+			if err := ShiftIfNecessary(c.container, srcIdmap); err != nil {
+				fsTransfer <- err
+				return
+			}
+
+			fsTransfer <- nil
+		}()
 
 		if c.live {
 			var err error
-			imagesDir, err = ioutil.TempDir("", "lxd_migration_")
+			imagesDir, err = ioutil.TempDir("", "lxd_restore_")
 			if err != nil {
 				os.RemoveAll(imagesDir)
-				c.sendControl(err)
 				return
 			}
 
@@ -460,8 +617,6 @@ func (c *migrationSink) do() error {
 
 			if err := RsyncRecv(shared.AddSlash(imagesDir), c.criuConn); err != nil {
 				restore <- err
-				os.RemoveAll(imagesDir)
-				c.sendControl(err)
 				return
 			}
 
@@ -471,58 +626,44 @@ func (c *migrationSink) do() error {
 			 * opened by the process after it is in its user
 			 * namespace.
 			 */
-			if dstIdmap != nil {
-				if err := dstIdmap.ShiftRootfs(imagesDir); err != nil {
+			if !c.container.IsPrivileged() {
+				if err := c.container.IdmapSet().ShiftRootfs(imagesDir); err != nil {
 					restore <- err
-					os.RemoveAll(imagesDir)
-					c.sendControl(err)
 					return
 				}
 			}
 		}
 
-		fsDir := c.container.RootfsPathGet()
-		if err := RsyncRecv(shared.AddSlash(fsDir), c.fsConn); err != nil {
+		err := <-fsTransfer
+		if err != nil {
 			restore <- err
-			c.sendControl(err)
 			return
-		}
-
-		for _, idmap := range header.Idmap {
-			e := shared.IdmapEntry{
-				Isuid:    *idmap.Isuid,
-				Isgid:    *idmap.Isgid,
-				Nsid:     int(*idmap.Nsid),
-				Hostid:   int(*idmap.Hostid),
-				Maprange: int(*idmap.Maprange)}
-			srcIdmap.Idmap = shared.Extend(srcIdmap.Idmap, e)
-		}
-
-		if !reflect.DeepEqual(srcIdmap, dstIdmap) {
-			if err := srcIdmap.UnshiftRootfs(shared.VarPath("containers", c.container.NameGet())); err != nil {
-				restore <- err
-				c.sendControl(err)
-				return
-			}
-
-			if err := dstIdmap.ShiftRootfs(shared.VarPath("containers", c.container.NameGet())); err != nil {
-				restore <- err
-				c.sendControl(err)
-				return
-			}
 		}
 
 		if c.live {
 			err := c.container.StartFromMigration(imagesDir)
 			if err != nil {
-				log := GetCRIULogErrors(imagesDir, "restore")
+				log, err2 := GetCRIULogErrors(imagesDir, "restore")
+				/* restore failed before CRIU was invoked, give
+				 * back the liblxc error */
+				if err2 != nil {
+					log = err.Error()
+				}
 				err = fmt.Errorf("restore failed:\n%s", log)
+				restore <- err
+				return
 			}
 
-			restore <- err
-		} else {
-			restore <- nil
 		}
+
+		for _, snap := range snapshots {
+			if err := ShiftIfNecessary(snap, srcIdmap); err != nil {
+				restore <- err
+				return
+			}
+		}
+
+		restore <- nil
 	}(c)
 
 	source := c.controlChannel()
@@ -571,8 +712,6 @@ func MigrateContainer(args []string) error {
 	configPath := args[3]
 	imagesDir := args[4]
 
-	defer os.Remove(configPath)
-
 	c, err := lxc.NewContainer(name, lxcpath)
 	if err != nil {
 		return err
@@ -581,6 +720,11 @@ func MigrateContainer(args []string) error {
 	if err := c.LoadConfigFile(configPath); err != nil {
 		return err
 	}
+
+	/* see https://github.com/golang/go/issues/13155, startContainer, and dc3a229 */
+	os.Stdin.Close()
+	os.Stdout.Close()
+	os.Stderr.Close()
 
 	return c.Restore(lxc.RestoreOptions{
 		Directory: imagesDir,

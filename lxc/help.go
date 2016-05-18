@@ -8,29 +8,28 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/chai2010/gettext-go/gettext"
-
 	"github.com/lxc/lxd"
 	"github.com/lxc/lxd/shared/gnuflag"
+	"github.com/lxc/lxd/shared/i18n"
 )
 
-type helpCmd struct{}
+type helpCmd struct {
+	showAll bool
+}
 
 func (c *helpCmd) showByDefault() bool {
 	return true
 }
 
 func (c *helpCmd) usage() string {
-	return gettext.Gettext(
+	return i18n.G(
 		`Presents details on how to use LXD.
 
 lxd help [--all]`)
 }
 
-var showAll bool
-
 func (c *helpCmd) flags() {
-	gnuflag.BoolVar(&showAll, "all", false, gettext.Gettext("Show all commands (not just interesting ones)"))
+	gnuflag.BoolVar(&c.showAll, "all", false, i18n.G("Show all commands (not just interesting ones)"))
 }
 
 func (c *helpCmd) run(_ *lxd.Config, args []string) error {
@@ -38,7 +37,7 @@ func (c *helpCmd) run(_ *lxd.Config, args []string) error {
 		for _, name := range args {
 			cmd, ok := commands[name]
 			if !ok {
-				fmt.Fprintf(os.Stderr, gettext.Gettext("error: unknown command: %s")+"\n", name)
+				fmt.Fprintf(os.Stderr, i18n.G("error: unknown command: %s")+"\n", name)
 			} else {
 				fmt.Fprintf(os.Stderr, cmd.usage()+"\n")
 			}
@@ -46,8 +45,8 @@ func (c *helpCmd) run(_ *lxd.Config, args []string) error {
 		return nil
 	}
 
-	fmt.Println(gettext.Gettext("Usage: lxc [subcommand] [options]"))
-	fmt.Println(gettext.Gettext("Available commands:"))
+	fmt.Println(i18n.G("Usage: lxc [subcommand] [options]"))
+	fmt.Println(i18n.G("Available commands:"))
 	var names []string
 	for name := range commands {
 		names = append(names, name)
@@ -55,20 +54,20 @@ func (c *helpCmd) run(_ *lxd.Config, args []string) error {
 	sort.Strings(names)
 	for _, name := range names {
 		cmd := commands[name]
-		if showAll || cmd.showByDefault() {
-			fmt.Printf("\t%-10s - %s\n", name, summaryLine(cmd.usage()))
+		if c.showAll || cmd.showByDefault() {
+			fmt.Printf("\t%-10s - %s\n", name, c.summaryLine(cmd.usage()))
 		}
 	}
-	if !showAll {
+	if !c.showAll {
 		fmt.Println()
-		fmt.Println(gettext.Gettext("Options:"))
-		fmt.Println("  --all              " + gettext.Gettext("Print less common commands."))
-		fmt.Println("  --debug            " + gettext.Gettext("Print debug information."))
-		fmt.Println("  --verbose          " + gettext.Gettext("Print verbose information."))
+		fmt.Println(i18n.G("Options:"))
+		fmt.Println("  --all              " + i18n.G("Print less common commands."))
+		fmt.Println("  --debug            " + i18n.G("Print debug information."))
+		fmt.Println("  --verbose          " + i18n.G("Print verbose information."))
 		fmt.Println()
-		fmt.Println(gettext.Gettext("Environment:"))
-		fmt.Println("  LXD_CONF           " + gettext.Gettext("Path to an alternate client configuration directory."))
-		fmt.Println("  LXD_DIR            " + gettext.Gettext("Path to an alternate server directory."))
+		fmt.Println(i18n.G("Environment:"))
+		fmt.Println("  LXD_CONF           " + i18n.G("Path to an alternate client configuration directory."))
+		fmt.Println("  LXD_DIR            " + i18n.G("Path to an alternate server directory."))
 	}
 	return nil
 }
@@ -76,7 +75,7 @@ func (c *helpCmd) run(_ *lxd.Config, args []string) error {
 // summaryLine returns the first line of the help text. Conventionally, this
 // should be a one-line command summary, potentially followed by a longer
 // explanation.
-func summaryLine(usage string) string {
+func (c *helpCmd) summaryLine(usage string) string {
 	usage = strings.TrimSpace(usage)
 	s := bufio.NewScanner(bytes.NewBufferString(usage))
 	if s.Scan() {
@@ -84,5 +83,5 @@ func summaryLine(usage string) string {
 			return s.Text()
 		}
 	}
-	return gettext.Gettext("Missing summary.")
+	return i18n.G("Missing summary.")
 }

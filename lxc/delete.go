@@ -1,22 +1,28 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
-
-	"github.com/chai2010/gettext-go/gettext"
+	"os"
+	"strings"
 
 	"github.com/lxc/lxd"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/gnuflag"
+	"github.com/lxc/lxd/shared/i18n"
 )
 
-type deleteCmd struct{}
+type deleteCmd struct {
+	force       bool
+	interactive bool
+}
 
 func (c *deleteCmd) showByDefault() bool {
 	return true
 }
 
 func (c *deleteCmd) usage() string {
-	return gettext.Gettext(
+	return i18n.G(
 		`Delete containers or container snapshots.
 
 lxc delete [remote:]<container>[/<snapshot>] [remote:][<container>[/<snapshot>]...]
@@ -24,9 +30,26 @@ lxc delete [remote:]<container>[/<snapshot>] [remote:][<container>[/<snapshot>].
 Destroy containers or snapshots with any attached data (configuration, snapshots, ...).`)
 }
 
-func (c *deleteCmd) flags() {}
+func (c *deleteCmd) flags() {
+	gnuflag.BoolVar(&c.force, "f", false, i18n.G("Force the removal of stopped containers."))
+	gnuflag.BoolVar(&c.force, "force", false, i18n.G("Force the removal of stopped containers."))
+	gnuflag.BoolVar(&c.interactive, "i", false, i18n.G("Require user confirmation."))
+	gnuflag.BoolVar(&c.interactive, "interactive", false, i18n.G("Require user confirmation."))
+}
 
-func doDelete(d *lxd.Client, name string) error {
+func (c *deleteCmd) promptDelete(name string) error {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Printf(i18n.G("Remove %s (yes/no): "), name)
+	input, _ := reader.ReadString('\n')
+	input = strings.TrimSuffix(input, "\n")
+	if !shared.StringInSlice(strings.ToLower(input), []string{i18n.G("yes")}) {
+		return fmt.Errorf(i18n.G("User aborted delete operation."))
+	}
+
+	return nil
+}
+
+func (c *deleteCmd) doDelete(d *lxd.Client, name string) error {
 	resp, err := d.Delete(name)
 	if err != nil {
 		return err
@@ -48,15 +71,28 @@ func (c *deleteCmd) run(config *lxd.Config, args []string) error {
 			return err
 		}
 
-		ct, err := d.ContainerStatus(name)
-
-		if err != nil {
-			// Could be a snapshot
-			return doDelete(d, name)
+		if c.interactive {
+			err := c.promptDelete(name)
+			if err != nil {
+				return err
+			}
 		}
 
-		if ct.Status.StatusCode != 0 && ct.Status.StatusCode != shared.Stopped {
-			resp, err := d.Action(name, shared.Stop, -1, true)
+		if shared.IsSnapshot(name) {
+			return c.doDelete(d, name)
+		}
+
+		ct, err := d.ContainerInfo(name)
+		if err != nil {
+			return err
+		}
+
+		if ct.StatusCode != 0 && ct.StatusCode != shared.Stopped {
+			if !c.force {
+				return fmt.Errorf(i18n.G("The container is currently running, stop it first or pass --force."))
+			}
+
+			resp, err := d.Action(name, shared.Stop, -1, true, false)
 			if err != nil {
 				return err
 			}
@@ -67,17 +103,17 @@ func (c *deleteCmd) run(config *lxd.Config, args []string) error {
 			}
 
 			if op.StatusCode == shared.Failure {
-				return fmt.Errorf(gettext.Gettext("Stopping container failed!"))
+				return fmt.Errorf(i18n.G("Stopping container failed!"))
 			}
 
 			if ct.Ephemeral == true {
 				return nil
 			}
 		}
-		if err := doDelete(d, name); err != nil {
+
+		if err := c.doDelete(d, name); err != nil {
 			return err
 		}
 	}
 	return nil
-
 }

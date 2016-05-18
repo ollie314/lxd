@@ -1,6 +1,9 @@
 #!/bin/sh -eu
 [ -n "${GOPATH:-}" ] && export "PATH=${GOPATH}/bin:${PATH}"
 
+# Don't translate lxc output for parsing in it in tests.
+export "LC_ALL=C"
+
 if [ -n "${LXD_DEBUG:-}" ]; then
   set -x
   DEBUG="--debug"
@@ -13,6 +16,11 @@ done
 
 if [ "${USER:-'root'}" != "root" ]; then
   echo "The testsuite must be run as root." >&2
+  exit 1
+fi
+
+if [ -n "${LXD_LOGS:-}" ] && [ ! -d "${LXD_LOGS}" ]; then
+  echo "Your LXD_LOGS path doesn't exist: ${LXD_LOGS}"
   exit 1
 fi
 
@@ -29,6 +37,15 @@ local_tcp_port() {
   done
 }
 
+# import all the backends
+for backend in backends/*.sh; do
+  . "${backend}"
+done
+
+if [ -z "${LXD_BACKEND:-}" ]; then
+  LXD_BACKEND=dir
+fi
+
 spawn_lxd() {
   set +x
   # LXD_DIR is local here because since $(lxc) is actually a function, it
@@ -42,32 +59,49 @@ spawn_lxd() {
   cp deps/server.crt "${lxddir}"
   cp deps/server.key "${lxddir}"
 
+  # setup storage
+  "$LXD_BACKEND"_setup "${lxddir}"
+
   echo "==> Spawning lxd in ${lxddir}"
   # shellcheck disable=SC2086
   LXD_DIR="${lxddir}" lxd --logfile "${lxddir}/lxd.log" ${DEBUG-} "$@" 2>&1 &
-  echo "$!" > "${lxddir}/lxd.pid"
+  LXD_PID=$!
+  echo "${LXD_PID}" > "${lxddir}/lxd.pid"
   echo "${lxddir}" >> "${TEST_DIR}/daemons"
+  echo "==> Spawned LXD (PID is ${LXD_PID})"
 
   echo "==> Confirming lxd is responsive"
-  alive=0
-  while [ "${alive}" -eq 0 ]; do
-    [ -e "${lxddir}/unix.socket" ] && LXD_DIR="${lxddir}" lxc finger && alive=1
-  done
+  LXD_DIR="${lxddir}" lxd waitready --timeout=300
 
   echo "==> Binding to network"
-  addr="127.0.0.1:$(local_tcp_port)"
-  LXD_DIR="${lxddir}" lxc config set core.https_address "${addr}"
-  echo "${addr}" > "${lxddir}/lxd.addr"
-  echo "==> Bound to ${addr}"
+  # shellcheck disable=SC2034
+  for i in $(seq 10); do
+    addr="127.0.0.1:$(local_tcp_port)"
+    LXD_DIR="${lxddir}" lxc config set core.https_address "${addr}" || continue
+    echo "${addr}" > "${lxddir}/lxd.addr"
+    echo "==> Bound to ${addr}"
+    break
+  done
 
   echo "==> Setting trust password"
   LXD_DIR="${lxddir}" lxc config set core.trust_password foo
   if [ -n "${LXD_DEBUG:-}" ]; then
     set -x
   fi
+
+  echo "==> Configuring storage backend"
+  "$LXD_BACKEND"_configure "${lxddir}"
 }
 
 lxc() {
+  LXC_LOCAL=1
+  lxc_remote "$@"
+  RET=$?
+  unset LXC_LOCAL
+  return ${RET}
+}
+
+lxc_remote() {
   set +x
   injected=0
   cmd=$(which lxc)
@@ -77,7 +111,10 @@ lxc() {
     if [ "${arg}" = "--" ]; then
       injected=1
       cmd="${cmd} ${DEBUG:-}"
+      [ -n "${LXC_LOCAL}" ] && cmd="${cmd} --force-local"
       cmd="${cmd} --"
+    elif [ "${arg}" = "--force-local" ]; then
+      continue
     else
       cmd="${cmd} \"${arg}\""
     fi
@@ -115,42 +152,94 @@ ensure_import_testimage() {
     if [ -e "${LXD_TEST_IMAGE:-}" ]; then
       lxc image import "${LXD_TEST_IMAGE}" --alias testimage
     else
-      ../scripts/lxd-images import busybox --alias testimage
+      deps/import-busybox --alias testimage
     fi
   fi
 }
 
+check_empty() {
+  if [ "$(find "${1}" 2> /dev/null | wc -l)" -gt "1" ]; then
+    echo "${1} is not empty, content:"
+    find "${1}"
+    false
+  fi
+}
+
+check_empty_table() {
+  if [ -n "$(sqlite3 "${1}" "SELECT * FROM ${2};")" ]; then
+    echo "DB table ${2} is not empty, content:"
+    sqlite3 "${1}" "SELECT * FROM ${2};"
+    false
+  fi
+}
+
 kill_lxd() {
+  # LXD_DIR is local here because since $(lxc) is actually a function, it
+  # overwrites the environment and we would lose LXD_DIR's value otherwise.
+  local LXD_DIR
   daemon_dir=${1}
-  daemon_addr=$(cat "${daemon_dir}/lxd.addr")
+  LXD_DIR=${daemon_dir}
   daemon_pid=$(cat "${daemon_dir}/lxd.pid")
   echo "==> Killing LXD at ${daemon_dir}"
 
-  [ -d "${daemon_dir}" ] || return
+  if [ -e "${daemon_dir}/unix.socket" ]; then
+    # Delete all containers
+    echo "==> Deleting all containers"
+    for container in $(lxc list --force-local | tail -n+3 | grep "^| " | cut -d' ' -f2); do
+      lxc delete "${container}" --force-local -f || true
+    done
 
-  # Delete all containers
-  echo "==> Deleting all containers"
-  my_curl "https://${daemon_addr}/1.0/containers" | jq -r .metadata[] 2>/dev/null | while read -r line; do
-    wait_for "${daemon_addr}" my_curl -X PUT "https://${daemon_addr}${line}/state" -d "{\"action\":\"stop\",\"force\":true}" >/dev/null
-    wait_for "${daemon_addr}" my_curl -X DELETE "https://${daemon_addr}${line}" >/dev/null
-  done
+    # Delete all images
+    echo "==> Deleting all images"
+    for image in $(lxc image list --force-local | tail -n+3 | grep "^| " | cut -d'|' -f3 | sed "s/^ //g"); do
+      lxc image delete "${image}" --force-local || true
+    done
 
-  # Delete all images
-  echo "==> Deleting all images"
-  my_curl "https://${daemon_addr}/1.0/images" | jq -r .metadata[] 2>/dev/null | while read -r line; do
-    wait_for "${daemon_addr}" my_curl -X DELETE "https://${daemon_addr}${line}" >/dev/null
-  done
+    echo "==> Checking for locked DB tables"
+    for table in $(echo .tables | sqlite3 "${daemon_dir}/lxd.db"); do
+      echo "SELECT * FROM ${table};" | sqlite3 "${daemon_dir}/lxd.db" >/dev/null
+    done
 
-  echo "==> Checking for locked DB tables"
-  for table in $(echo .tables | sqlite3 "${daemon_dir}/lxd.db"); do
-    echo "SELECT * FROM ${table};" | sqlite3 "${daemon_dir}/lxd.db" >/dev/null
-  done
+    # Kill the daemon
+    lxd shutdown || kill -9 "${daemon_pid}" 2>/dev/null || true
 
-  # Kill the daemon
-  kill -9 "${daemon_pid}" 2>/dev/null || true
+    # Cleanup shmounts (needed due to the forceful kill)
+    find "${daemon_dir}" -name shmounts -exec "umount" "-l" "{}" \; >/dev/null 2>&1 || true
+  fi
 
-  # Cleanup shmounts
-  find "${daemon_dir}" -name shmounts -exec "umount" "-l" "{}" \; || true
+  if [ -n "${LXD_LOGS:-}" ]; then
+    echo "==> Copying the logs"
+    mkdir -p "${LXD_LOGS}/${daemon_pid}"
+    cp -R "${daemon_dir}/logs/" "${LXD_LOGS}/${daemon_pid}/"
+    cp "${daemon_dir}/lxd.log" "${LXD_LOGS}/${daemon_pid}/"
+  fi
+
+  echo "==> Checking for leftover files"
+  rm -f "${daemon_dir}/containers/lxc-monitord.log"
+  rm -f "${daemon_dir}/security/apparmor/cache/.features"
+  check_empty "${daemon_dir}/containers/"
+  check_empty "${daemon_dir}/devices/"
+  check_empty "${daemon_dir}/images/"
+  # FIXME: Once container logging rework is done, uncomment
+  # check_empty "${daemon_dir}/logs/"
+  check_empty "${daemon_dir}/security/apparmor/cache/"
+  check_empty "${daemon_dir}/security/apparmor/profiles/"
+  check_empty "${daemon_dir}/security/seccomp/"
+  check_empty "${daemon_dir}/shmounts/"
+  check_empty "${daemon_dir}/snapshots/"
+
+  echo "==> Checking for leftover DB entries"
+  check_empty_table "${daemon_dir}/lxd.db" "containers"
+  check_empty_table "${daemon_dir}/lxd.db" "containers_config"
+  check_empty_table "${daemon_dir}/lxd.db" "containers_devices"
+  check_empty_table "${daemon_dir}/lxd.db" "containers_devices_config"
+  check_empty_table "${daemon_dir}/lxd.db" "containers_profiles"
+  check_empty_table "${daemon_dir}/lxd.db" "images"
+  check_empty_table "${daemon_dir}/lxd.db" "images_aliases"
+  check_empty_table "${daemon_dir}/lxd.db" "images_properties"
+
+  # teardown storage
+  "$LXD_BACKEND"_teardown "${daemon_dir}"
 
   # Wipe the daemon directory
   wipe "${daemon_dir}"
@@ -172,7 +261,9 @@ cleanup() {
     # shellcheck disable=SC2086
     printf "To poke around, use:\n LXD_DIR=%s LXD_CONF=%s sudo -E %s/bin/lxc COMMAND\n" "${LXD_DIR}" "${LXD_CONF}" ${GOPATH:-}
     echo "Tests Completed (${TEST_RESULT}): hit enter to continue"
-    read
+
+    # shellcheck disable=SC2034
+    read nothing
   fi
 
   echo "==> Cleaning up"
@@ -218,6 +309,10 @@ wipe() {
   rm -Rf "${1}"
 }
 
+# Must be set before cleanup()
+TEST_CURRENT=setup
+TEST_RESULT=failure
+
 trap cleanup EXIT HUP INT TERM
 
 # Import all the testsuites
@@ -251,19 +346,12 @@ spawn_lxd "${LXD2_DIR}"
 LXD2_ADDR=$(cat "${LXD2_DIR}/lxd.addr")
 export LXD2_ADDR
 
-TEST_CURRENT=setup
-TEST_RESULT=failure
-
 # allow for running a specific set of tests
 if [ "$#" -gt 0 ]; then
   "test_${1}"
   TEST_RESULT=success
   exit
 fi
-
-echo "==> TEST: commit sign-off"
-TEST_CURRENT=test_commits_signed_off
-test_commits_signed_off
 
 echo "==> TEST: doing static analysis of commits"
 TEST_CURRENT=test_static_analysis
@@ -342,10 +430,6 @@ fi
 echo "==> TEST: migration"
 TEST_CURRENT=test_migration
 test_migration
-
-echo "==> TEST: lvm backing"
-TEST_CURRENT=test_lvm
-test_lvm
 
 curversion=$(dpkg -s lxc | awk '/^Version/ { print $2 }')
 if dpkg --compare-versions "${curversion}" gt 1.1.2-0ubuntu3; then

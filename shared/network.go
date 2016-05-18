@@ -1,10 +1,14 @@
 package shared
 
 import (
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -20,13 +24,91 @@ func RFC3493Dialer(network, address string) (net.Conn, error) {
 		return nil, err
 	}
 	for _, a := range addrs {
-		c, err := net.Dial(network, net.JoinHostPort(a, port))
+		c, err := net.DialTimeout(network, net.JoinHostPort(a, port), 10*time.Second)
 		if err != nil {
 			continue
 		}
 		return c, err
 	}
 	return nil, fmt.Errorf("Unable to connect to: " + address)
+}
+
+func initTLSConfig() *tls.Config {
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		MaxVersion: tls.VersionTLS12,
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
+		PreferServerCipherSuites: true,
+	}
+}
+
+func finalizeTLSConfig(tlsConfig *tls.Config, tlsRemoteCert *x509.Certificate) {
+	// Trusted certificates
+	if tlsRemoteCert != nil {
+		caCertPool := x509.NewCertPool()
+
+		// Make it a valid RootCA
+		tlsRemoteCert.IsCA = true
+		tlsRemoteCert.KeyUsage = x509.KeyUsageCertSign
+
+		// Setup the pool
+		caCertPool.AddCert(tlsRemoteCert)
+		tlsConfig.RootCAs = caCertPool
+
+		// Set the ServerName
+		if tlsRemoteCert.DNSNames != nil {
+			tlsConfig.ServerName = tlsRemoteCert.DNSNames[0]
+		}
+	}
+
+	tlsConfig.BuildNameToCertificate()
+}
+
+func GetTLSConfig(tlsClientCertFile string, tlsClientKeyFile string, tlsRemoteCert *x509.Certificate) (*tls.Config, error) {
+	tlsConfig := initTLSConfig()
+
+	// Client authentication
+	if tlsClientCertFile != "" && tlsClientKeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(tlsClientCertFile, tlsClientKeyFile)
+		if err != nil {
+			return nil, err
+		}
+
+		tlsConfig.Certificates = []tls.Certificate{cert}
+	}
+
+	finalizeTLSConfig(tlsConfig, tlsRemoteCert)
+	return tlsConfig, nil
+}
+
+func GetTLSConfigMem(tlsClientCert string, tlsClientKey string, tlsRemoteCertPEM string) (*tls.Config, error) {
+	tlsConfig := initTLSConfig()
+
+	// Client authentication
+	if tlsClientCert != "" && tlsClientKey != "" {
+		cert, err := tls.X509KeyPair([]byte(tlsClientCert), []byte(tlsClientKey))
+		if err != nil {
+			return nil, err
+		}
+
+		tlsConfig.Certificates = []tls.Certificate{cert}
+	}
+
+	var tlsRemoteCert *x509.Certificate
+	if tlsRemoteCertPEM != "" {
+		// Ignore any content outside of the PEM bytes we care about
+		certBlock, _ := pem.Decode([]byte(tlsRemoteCertPEM))
+		var err error
+		tlsRemoteCert, err = x509.ParseCertificate(certBlock.Bytes)
+		if err != nil {
+			return nil, err
+		}
+	}
+	finalizeTLSConfig(tlsConfig, tlsRemoteCert)
+
+	return tlsConfig, nil
 }
 
 func IsLoopback(iface *net.Interface) bool {
@@ -62,8 +144,7 @@ func WebsocketSendStream(conn *websocket.Conn, r io.Reader) chan bool {
 				break
 			}
 		}
-		closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
-		conn.WriteMessage(websocket.CloseMessage, closeMsg)
+		conn.WriteMessage(websocket.TextMessage, []byte{})
 		ch <- true
 	}(conn, r)
 
@@ -78,6 +159,11 @@ func WebsocketRecvStream(w io.WriteCloser, conn *websocket.Conn) chan bool {
 			mt, r, err := conn.NextReader()
 			if mt == websocket.CloseMessage {
 				Debugf("Got close message for reader")
+				break
+			}
+
+			if mt == websocket.TextMessage {
+				Debugf("got message barrier")
 				break
 			}
 
@@ -113,21 +199,31 @@ func WebsocketRecvStream(w io.WriteCloser, conn *websocket.Conn) chan bool {
 }
 
 // WebsocketMirror allows mirroring a reader to a websocket and taking the
-// result and writing it to a writer.
-func WebsocketMirror(conn *websocket.Conn, w io.WriteCloser, r io.Reader) chan bool {
-	done := make(chan bool, 2)
+// result and writing it to a writer. This function allows for multiple
+// mirrorings and correctly negotiates stream endings. However, it means any
+// websocket.Conns passed to it are live when it returns, and must be closed
+// explicitly.
+func WebsocketMirror(conn *websocket.Conn, w io.WriteCloser, r io.ReadCloser) (chan bool, chan bool) {
+	readDone := make(chan bool, 1)
+	writeDone := make(chan bool, 1)
 	go func(conn *websocket.Conn, w io.WriteCloser) {
 		for {
 			mt, r, err := conn.NextReader()
+			if err != nil {
+				Debugf("Got error getting next reader %s, %s", err, w)
+				break
+			}
+
 			if mt == websocket.CloseMessage {
 				Debugf("Got close message for reader")
 				break
 			}
 
-			if err != nil {
-				Debugf("Got error getting next reader %s, %s", err, w)
+			if mt == websocket.TextMessage {
+				Debugf("Got message barrier, resetting stream")
 				break
 			}
+
 			buf, err := ioutil.ReadAll(r)
 			if err != nil {
 				Debugf("Got error writing to writer %s", err)
@@ -143,18 +239,19 @@ func WebsocketMirror(conn *websocket.Conn, w io.WriteCloser, r io.Reader) chan b
 				break
 			}
 		}
-		done <- true
+		writeDone <- true
 		w.Close()
 	}(conn, w)
 
-	go func(conn *websocket.Conn, r io.Reader) {
+	go func(conn *websocket.Conn, r io.ReadCloser) {
 		in := ReaderToChannel(r)
 		for {
 			buf, ok := <-in
 			if !ok {
-				done <- true
-				conn.WriteMessage(websocket.CloseMessage, []byte{})
-				conn.Close()
+				readDone <- true
+				r.Close()
+				Debugf("sending write barrier")
+				conn.WriteMessage(websocket.TextMessage, []byte{})
 				return
 			}
 			w, err := conn.NextWriter(websocket.BinaryMessage)
@@ -172,8 +269,9 @@ func WebsocketMirror(conn *websocket.Conn, w io.WriteCloser, r io.Reader) chan b
 		}
 		closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
 		conn.WriteMessage(websocket.CloseMessage, closeMsg)
-		done <- true
+		readDone <- true
+		r.Close()
 	}(conn, r)
 
-	return done
+	return readDone, writeDone
 }

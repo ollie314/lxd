@@ -1,63 +1,57 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
-	"os/exec"
+	"regexp"
 	"sort"
 	"strings"
 	"syscall"
-	"time"
 
-	"github.com/chai2010/gettext-go/gettext"
 	"github.com/olekukonko/tablewriter"
-	"golang.org/x/crypto/ssh/terminal"
 	"gopkg.in/yaml.v2"
 
 	"github.com/lxc/lxd"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/gnuflag"
+	"github.com/lxc/lxd/shared/i18n"
+	"github.com/lxc/lxd/shared/termios"
 )
 
-type imageCmd struct{}
+type SortImage [][]string
 
-func (c *imageCmd) showByDefault() bool {
-	return true
+func (a SortImage) Len() int {
+	return len(a)
 }
 
-var imageEditHelp string = gettext.Gettext(
-	`### This is a yaml representation of the image properties.
-### Any line starting with a '# will be ignored.
-###
-### Each property is represented by a single line:
-### An example would be:
-###  description: My custom image`)
+func (a SortImage) Swap(i, j int) {
+	a[i], a[j] = a[j], a[i]
+}
 
-func (c *imageCmd) usage() string {
-	return gettext.Gettext(
-		`Manipulate container images.
+func (a SortImage) Less(i, j int) bool {
+	if a[i][0] == a[j][0] {
+		if a[i][3] == "" {
+			return false
+		}
 
-lxc image import <tarball> [rootfs tarball] [target] [--public] [--created-at=ISO-8601] [--expires-at=ISO-8601] [--fingerprint=FINGERPRINT] [prop=value]
+		if a[j][3] == "" {
+			return true
+		}
 
-lxc image copy [remote:]<image> <remote>: [--alias=ALIAS].. [--copy-aliases] [--public]
-lxc image delete [remote:]<image>
-lxc image edit [remote:]<image>
-lxc image export [remote:]<image>
-lxc image info [remote:]<image>
-lxc image list [remote:] [filter]
-lxc image show [remote:]<image>
+		return a[i][3] < a[j][3]
+	}
 
-Lists the images at specified remote, or local images.
-Filters are not yet supported.
+	if a[i][0] == "" {
+		return false
+	}
 
-lxc image alias create <alias> <target>
-lxc image alias delete <alias>
-lxc image alias list [remote:]
+	if a[j][0] == "" {
+		return true
+	}
 
-Create, delete, list image aliases. Example:
-lxc remote add store2 images.linuxcontainers.org
-lxc image alias list store2:`)
+	return a[i][0] < a[j][0]
 }
 
 type aliasList []string
@@ -75,26 +69,121 @@ func (f *aliasList) Set(value string) error {
 	return nil
 }
 
-var addAliases aliasList
-var publicImage bool = false
-var copyAliases bool = false
-
-func (c *imageCmd) flags() {
-	gnuflag.BoolVar(&publicImage, "public", false, gettext.Gettext("Make image public"))
-	gnuflag.BoolVar(&copyAliases, "copy-aliases", false, gettext.Gettext("Copy aliases from source"))
-	gnuflag.Var(&addAliases, "alias", gettext.Gettext("New alias to define at target"))
+type imageCmd struct {
+	addAliases  aliasList
+	publicImage bool
+	copyAliases bool
+	autoUpdate  bool
+	format      string
 }
 
-func doImageAlias(config *lxd.Config, args []string) error {
+func (c *imageCmd) showByDefault() bool {
+	return true
+}
+
+func (c *imageCmd) imageEditHelp() string {
+	return i18n.G(
+		`### This is a yaml representation of the image properties.
+### Any line starting with a '# will be ignored.
+###
+### Each property is represented by a single line:
+### An example would be:
+###  description: My custom image`)
+}
+
+func (c *imageCmd) usage() string {
+	return i18n.G(
+		`Manipulate container images.
+
+In LXD containers are created from images. Those images were themselves
+either generated from an existing container or downloaded from an image
+server.
+
+When using remote images, LXD will automatically cache images for you
+and remove them upon expiration.
+
+The image unique identifier is the hash (sha-256) of its representation
+as a compressed tarball (or for split images, the concatenation of the
+metadata and rootfs tarballs).
+
+Images can be referenced by their full hash, shortest unique partial
+hash or alias name (if one is set).
+
+
+lxc image import <tarball> [rootfs tarball|URL] [remote:] [--public] [--created-at=ISO-8601] [--expires-at=ISO-8601] [--fingerprint=FINGERPRINT] [--alias=ALIAS].. [prop=value]
+    Import an image tarball (or tarballs) into the LXD image store.
+
+lxc image copy [remote:]<image> <remote>: [--alias=ALIAS].. [--copy-aliases] [--public] [--auto-update]
+    Copy an image from one LXD daemon to another over the network.
+
+    The auto-update flag instructs the server to keep this image up to
+    date. It requires the source to be an alias and for it to be public.
+
+lxc image delete [remote:]<image>
+    Delete an image from the LXD image store.
+
+lxc image export [remote:]<image>
+    Export an image from the LXD image store into a distributable tarball.
+
+lxc image info [remote:]<image>
+    Print everything LXD knows about a given image.
+
+lxc image list [remote:] [filter] [--format table|json]
+    List images in the LXD image store. Filters may be of the
+    <key>=<value> form for property based filtering, or part of the image
+    hash or part of the image alias name.
+
+lxc image show [remote:]<image>
+    Yaml output of the user modifiable properties of an image.
+
+lxc image edit [remote:]<image>
+    Edit image, either by launching external editor or reading STDIN.
+    Example: lxc image edit <image> # launch editor
+             cat image.yml | lxc image edit <image> # read from image.yml
+
+lxc image alias create [remote:]<alias> <fingerprint>
+    Create a new alias for an existing image.
+
+lxc image alias delete [remote:]<alias>
+    Delete an alias.
+
+lxc image alias list [remote:] [filter]
+    List the aliases. Filters may be part of the image hash or part of the image alias name.
+`)
+}
+
+func (c *imageCmd) flags() {
+	gnuflag.BoolVar(&c.publicImage, "public", false, i18n.G("Make image public"))
+	gnuflag.BoolVar(&c.copyAliases, "copy-aliases", false, i18n.G("Copy aliases from source"))
+	gnuflag.BoolVar(&c.autoUpdate, "auto-update", false, i18n.G("Keep the image up to date after initial copy"))
+	gnuflag.Var(&c.addAliases, "alias", i18n.G("New alias to define at target"))
+	gnuflag.StringVar(&c.format, "format", "table", i18n.G("Format"))
+}
+
+func (c *imageCmd) doImageAlias(config *lxd.Config, args []string) error {
 	var remote string
 	switch args[1] {
 	case "list":
-		/* alias list [<remote>:] */
+		filters := []string{}
+
 		if len(args) > 2 {
-			remote, _ = config.ParseRemoteAndContainer(args[2])
+			result := strings.SplitN(args[2], ":", 2)
+			if len(result) == 1 {
+				filters = append(filters, args[2])
+				remote, _ = config.ParseRemoteAndContainer("")
+			} else {
+				remote, _ = config.ParseRemoteAndContainer(args[2])
+			}
 		} else {
 			remote, _ = config.ParseRemoteAndContainer("")
 		}
+
+		if len(args) > 3 {
+			for _, filter := range args[3:] {
+				filters = append(filters, filter)
+			}
+		}
+
 		d, err := lxd.NewClient(config, remote)
 		if err != nil {
 			return err
@@ -105,7 +194,7 @@ func doImageAlias(config *lxd.Config, args []string) error {
 			return err
 		}
 
-		showAliases(resp)
+		c.showAliases(resp, filters)
 
 		return nil
 	case "create":
@@ -150,46 +239,61 @@ func (c *imageCmd) run(config *lxd.Config, args []string) error {
 		if len(args) < 2 {
 			return errArgs
 		}
-		return doImageAlias(config, args)
+		return c.doImageAlias(config, args)
 
 	case "copy":
 		/* copy [<remote>:]<image> [<rmeote>:]<image> */
 		if len(args) != 3 {
 			return errArgs
 		}
+
 		remote, inName := config.ParseRemoteAndContainer(args[1])
 		if inName == "" {
-			return errArgs
+			inName = "default"
 		}
+
 		destRemote, outName := config.ParseRemoteAndContainer(args[2])
 		if outName != "" {
 			return errArgs
 		}
+
 		d, err := lxd.NewClient(config, remote)
 		if err != nil {
 			return err
 		}
+
 		dest, err := lxd.NewClient(config, destRemote)
 		if err != nil {
 			return err
 		}
-		image := dereferenceAlias(d, inName)
-		return d.CopyImage(image, dest, copyAliases, addAliases, publicImage)
+
+		progressHandler := func(progress string) {
+			fmt.Printf(i18n.G("Copying the image: %s")+"\r", progress)
+		}
+
+		err = d.CopyImage(inName, dest, c.copyAliases, c.addAliases, c.publicImage, c.autoUpdate, progressHandler)
+		if err == nil {
+			fmt.Println(i18n.G("Image copied successfully!"))
+		}
+		return err
 
 	case "delete":
 		/* delete [<remote>:]<image> */
 		if len(args) < 2 {
 			return errArgs
 		}
+
 		remote, inName := config.ParseRemoteAndContainer(args[1])
 		if inName == "" {
-			return errArgs
+			inName = "default"
 		}
+
 		d, err := lxd.NewClient(config, remote)
 		if err != nil {
 			return err
 		}
-		image := dereferenceAlias(d, inName)
+
+		image := c.dereferenceAlias(d, inName)
 		err = d.DeleteImage(image)
 		return err
 
@@ -197,47 +301,62 @@ func (c *imageCmd) run(config *lxd.Config, args []string) error {
 		if len(args) < 2 {
 			return errArgs
 		}
+
 		remote, inName := config.ParseRemoteAndContainer(args[1])
 		if inName == "" {
-			return errArgs
+			inName = "default"
 		}
+
 		d, err := lxd.NewClient(config, remote)
 		if err != nil {
 			return err
 		}
 
-		image := dereferenceAlias(d, inName)
+		image := c.dereferenceAlias(d, inName)
 		info, err := d.GetImageInfo(image)
 		if err != nil {
 			return err
 		}
-		fmt.Printf(gettext.Gettext("Fingerprint: %s")+"\n", info.Fingerprint)
-		public := gettext.Gettext("no")
-		if shared.InterfaceToBool(info) {
-			public = gettext.Gettext("yes")
+
+		public := i18n.G("no")
+		if info.Public {
+			public = i18n.G("yes")
 		}
-		fmt.Printf(gettext.Gettext("Size: %.2fMB")+"\n", float64(info.Size)/1024.0/1024.0)
-		arch, _ := shared.ArchitectureName(info.Architecture)
-		fmt.Printf(gettext.Gettext("Architecture: %s")+"\n", arch)
-		fmt.Printf(gettext.Gettext("Public: %s")+"\n", public)
-		fmt.Printf(gettext.Gettext("Timestamps:") + "\n")
+
+		autoUpdate := i18n.G("disabled")
+		if info.AutoUpdate {
+			autoUpdate = i18n.G("enabled")
+		}
+
+		fmt.Printf(i18n.G("Fingerprint: %s")+"\n", info.Fingerprint)
+		fmt.Printf(i18n.G("Size: %.2fMB")+"\n", float64(info.Size)/1024.0/1024.0)
+		fmt.Printf(i18n.G("Architecture: %s")+"\n", info.Architecture)
+		fmt.Printf(i18n.G("Public: %s")+"\n", public)
+		fmt.Printf(i18n.G("Timestamps:") + "\n")
 		const layout = "2006/01/02 15:04 UTC"
-		if info.CreationDate != 0 {
-			fmt.Printf("    "+gettext.Gettext("Created: %s")+"\n", time.Unix(info.CreationDate, 0).UTC().Format(layout))
+		if info.CreationDate.UTC().Unix() != 0 {
+			fmt.Printf("    "+i18n.G("Created: %s")+"\n", info.CreationDate.UTC().Format(layout))
 		}
-		fmt.Printf("    "+gettext.Gettext("Uploaded: %s")+"\n", time.Unix(info.UploadDate, 0).UTC().Format(layout))
-		if info.ExpiryDate != 0 {
-			fmt.Printf("    "+gettext.Gettext("Expires: %s")+"\n", time.Unix(info.ExpiryDate, 0).UTC().Format(layout))
+		fmt.Printf("    "+i18n.G("Uploaded: %s")+"\n", info.UploadDate.UTC().Format(layout))
+		if info.ExpiryDate.UTC().Unix() != 0 {
+			fmt.Printf("    "+i18n.G("Expires: %s")+"\n", info.ExpiryDate.UTC().Format(layout))
 		} else {
-			fmt.Printf("    " + gettext.Gettext("Expires: never") + "\n")
+			fmt.Printf("    " + i18n.G("Expires: never") + "\n")
 		}
-		fmt.Println(gettext.Gettext("Properties:"))
+		fmt.Println(i18n.G("Properties:"))
 		for key, value := range info.Properties {
 			fmt.Printf("    %s: %s\n", key, value)
 		}
-		fmt.Println(gettext.Gettext("Aliases:"))
+		fmt.Println(i18n.G("Aliases:"))
 		for _, alias := range info.Aliases {
 			fmt.Printf("    - %s\n", alias.Name)
+		}
+		fmt.Printf(i18n.G("Auto update: %s")+"\n", autoUpdate)
+		if info.Source != nil {
+			fmt.Println(i18n.G("Source:"))
+			fmt.Printf("    Server: %s\n", info.Source.Server)
+			fmt.Printf("    Protocol: %s\n", info.Source.Protocol)
+			fmt.Printf("    Alias: %s\n", info.Source.Alias)
 		}
 		return nil
 
@@ -246,6 +365,7 @@ func (c *imageCmd) run(config *lxd.Config, args []string) error {
 			return errArgs
 		}
 
+		var fingerprint string
 		var imageFile string
 		var rootfsFile string
 		var properties []string
@@ -281,20 +401,47 @@ func (c *imageCmd) run(config *lxd.Config, args []string) error {
 			return err
 		}
 
-		fingerprint, err := d.PostImage(imageFile, rootfsFile, properties, publicImage, addAliases)
+		handler := func(percent int) {
+			fmt.Printf(i18n.G("Transferring image: %d%%")+"\r", percent)
+			if percent == 100 {
+				fmt.Printf("\n")
+			}
+		}
+
+		if strings.HasPrefix(imageFile, "https://") {
+			fingerprint, err = d.PostImageURL(imageFile, c.publicImage, c.addAliases)
+		} else if strings.HasPrefix(imageFile, "http://") {
+			return fmt.Errorf(i18n.G("Only https:// is supported for remote image import."))
+		} else {
+			fingerprint, err = d.PostImage(imageFile, rootfsFile, properties, c.publicImage, c.addAliases, handler)
+		}
+
 		if err != nil {
 			return err
 		}
-
-		fmt.Printf(gettext.Gettext("Image imported with fingerprint: %s")+"\n", fingerprint)
+		fmt.Printf(i18n.G("Image imported with fingerprint: %s")+"\n", fingerprint)
 
 		return nil
 
 	case "list":
+		filters := []string{}
+
 		if len(args) > 1 {
-			remote, _ = config.ParseRemoteAndContainer(args[1])
+			result := strings.SplitN(args[1], ":", 2)
+			if len(result) == 1 {
+				filters = append(filters, args[1])
+				remote, _ = config.ParseRemoteAndContainer("")
+			} else {
+				remote, _ = config.ParseRemoteAndContainer(args[1])
+			}
 		} else {
 			remote, _ = config.ParseRemoteAndContainer("")
+		}
+
+		if len(args) > 2 {
+			for _, filter := range args[2:] {
+				filters = append(filters, filter)
+			}
 		}
 
 		d, err := lxd.NewClient(config, remote)
@@ -302,105 +449,43 @@ func (c *imageCmd) run(config *lxd.Config, args []string) error {
 			return err
 		}
 
-		images, err := d.ListImages()
+		var images []shared.ImageInfo
+		allImages, err := d.ListImages()
 		if err != nil {
 			return err
 		}
 
-		return showImages(images)
+		for _, image := range allImages {
+			if !c.imageShouldShow(filters, &image) {
+				continue
+			}
+
+			images = append(images, image)
+		}
+
+		return c.showImages(images, filters)
 
 	case "edit":
 		if len(args) < 2 {
 			return errArgs
 		}
+
 		remote, inName := config.ParseRemoteAndContainer(args[1])
 		if inName == "" {
-			return errArgs
+			inName = "default"
 		}
+
 		d, err := lxd.NewClient(config, remote)
 		if err != nil {
 			return err
 		}
 
-		image := dereferenceAlias(d, inName)
+		image := c.dereferenceAlias(d, inName)
 		if image == "" {
 			image = inName
 		}
 
-		if !terminal.IsTerminal(syscall.Stdin) {
-			contents, err := ioutil.ReadAll(os.Stdin)
-			if err != nil {
-				return err
-			}
-
-			newdata := shared.BriefImageInfo{}
-			err = yaml.Unmarshal(contents, &newdata)
-			if err != nil {
-				return err
-			}
-			return d.PutImageInfo(image, newdata)
-		}
-
-		info, err := d.GetImageInfo(image)
-		if err != nil {
-			return err
-		}
-
-		properties := info.BriefInfo()
-		editor := os.Getenv("VISUAL")
-		if editor == "" {
-			editor = os.Getenv("EDITOR")
-			if editor == "" {
-				editor = "vi"
-			}
-		}
-		data, err := yaml.Marshal(&properties)
-		f, err := ioutil.TempFile("", "lxd_lxc_image_")
-		if err != nil {
-			return err
-		}
-		fname := f.Name()
-		if err = f.Chmod(0600); err != nil {
-			f.Close()
-			os.Remove(fname)
-			return err
-		}
-		f.Write([]byte(imageEditHelp + "\n"))
-		f.Write(data)
-		f.Close()
-		defer os.Remove(fname)
-
-		for {
-			cmdParts := strings.Fields(editor)
-			cmd := exec.Command(cmdParts[0], append(cmdParts[1:], fname)...)
-			cmd.Stdin = os.Stdin
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			err = cmd.Run()
-			if err != nil {
-				return err
-			}
-			contents, err := ioutil.ReadFile(fname)
-			if err != nil {
-				return err
-			}
-			newdata := shared.BriefImageInfo{}
-			err = yaml.Unmarshal(contents, &newdata)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, gettext.Gettext("YAML parse error %v")+"\n", err)
-				fmt.Println(gettext.Gettext("Press enter to open the editor again"))
-				_, err := os.Stdin.Read(make([]byte, 1))
-				if err != nil {
-					return err
-				}
-
-				continue
-			}
-			err = d.PutImageInfo(image, newdata)
-			break
-		}
-
-		return err
+		return c.doImageEdit(d, image)
 
 	case "export":
 		if len(args) < 2 {
@@ -409,7 +494,7 @@ func (c *imageCmd) run(config *lxd.Config, args []string) error {
 
 		remote, inName := config.ParseRemoteAndContainer(args[1])
 		if inName == "" {
-			return errArgs
+			inName = "default"
 		}
 
 		d, err := lxd.NewClient(config, remote)
@@ -417,19 +502,20 @@ func (c *imageCmd) run(config *lxd.Config, args []string) error {
 			return err
 		}
 
-		image := dereferenceAlias(d, inName)
+		image := c.dereferenceAlias(d, inName)
 
 		target := "."
 		if len(args) > 2 {
 			target = args[2]
 		}
-		_, outfile, err := d.ExportImage(image, target)
+
+		outfile, err := d.ExportImage(image, target)
 		if err != nil {
 			return err
 		}
 
 		if target != "-" {
-			fmt.Printf(gettext.Gettext("Output is in %s")+"\n", outfile)
+			fmt.Printf(i18n.G("Output is in %s")+"\n", outfile)
 		}
 		return nil
 
@@ -437,33 +523,35 @@ func (c *imageCmd) run(config *lxd.Config, args []string) error {
 		if len(args) < 2 {
 			return errArgs
 		}
+
 		remote, inName := config.ParseRemoteAndContainer(args[1])
 		if inName == "" {
-			return errArgs
+			inName = "default"
 		}
+
 		d, err := lxd.NewClient(config, remote)
 		if err != nil {
 			return err
 		}
 
-		image := dereferenceAlias(d, inName)
+		image := c.dereferenceAlias(d, inName)
 		info, err := d.GetImageInfo(image)
 		if err != nil {
 			return err
 		}
 
-		properties := info.BriefInfo()
+		properties := info.Brief()
 
 		data, err := yaml.Marshal(&properties)
 		fmt.Printf("%s", data)
 		return err
 
 	default:
-		return fmt.Errorf(gettext.Gettext("Unknown image command %s"), args[0])
+		return errArgs
 	}
 }
 
-func dereferenceAlias(d *lxd.Client, inName string) string {
+func (c *imageCmd) dereferenceAlias(d *lxd.Client, inName string) string {
 	result := d.GetAlias(inName)
 	if result == "" {
 		return inName
@@ -471,7 +559,7 @@ func dereferenceAlias(d *lxd.Client, inName string) string {
 	return result
 }
 
-func shortestAlias(list shared.ImageAliases) string {
+func (c *imageCmd) shortestAlias(list []shared.ImageAlias) string {
 	shortest := ""
 	for _, l := range list {
 		if shortest == "" {
@@ -486,7 +574,7 @@ func shortestAlias(list shared.ImageAliases) string {
 	return shortest
 }
 
-func findDescription(props map[string]string) string {
+func (c *imageCmd) findDescription(props map[string]string) string {
 	for k, v := range props {
 		if k == "description" {
 			return v
@@ -495,58 +583,222 @@ func findDescription(props map[string]string) string {
 	return ""
 }
 
-func showImages(images []shared.ImageInfo) error {
+func (c *imageCmd) showImages(images []shared.ImageInfo, filters []string) error {
+	switch c.format {
+	case listFormatTable:
+		data := [][]string{}
+		for _, image := range images {
+			if !c.imageShouldShow(filters, &image) {
+				continue
+			}
+
+			shortest := c.shortestAlias(image.Aliases)
+			if len(image.Aliases) > 1 {
+				shortest = fmt.Sprintf(i18n.G("%s (%d more)"), shortest, len(image.Aliases)-1)
+			}
+			fp := image.Fingerprint[0:12]
+			public := i18n.G("no")
+			description := c.findDescription(image.Properties)
+
+			if image.Public {
+				public = i18n.G("yes")
+			}
+
+			const layout = "Jan 2, 2006 at 3:04pm (MST)"
+			uploaded := image.UploadDate.UTC().Format(layout)
+			size := fmt.Sprintf("%.2fMB", float64(image.Size)/1024.0/1024.0)
+			data = append(data, []string{shortest, fp, public, description, image.Architecture, size, uploaded})
+		}
+
+		table := tablewriter.NewWriter(os.Stdout)
+		table.SetAutoWrapText(false)
+		table.SetAlignment(tablewriter.ALIGN_LEFT)
+		table.SetRowLine(true)
+		table.SetHeader([]string{
+			i18n.G("ALIAS"),
+			i18n.G("FINGERPRINT"),
+			i18n.G("PUBLIC"),
+			i18n.G("DESCRIPTION"),
+			i18n.G("ARCH"),
+			i18n.G("SIZE"),
+			i18n.G("UPLOAD DATE")})
+		sort.Sort(SortImage(data))
+		table.AppendBulk(data)
+		table.Render()
+	case listFormatJSON:
+		data := make([]*shared.ImageInfo, len(images))
+		for i := range images {
+			data[i] = &images[i]
+		}
+		enc := json.NewEncoder(os.Stdout)
+		err := enc.Encode(data)
+		if err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("invalid format %q", c.format)
+	}
+
+	return nil
+}
+
+func (c *imageCmd) showAliases(aliases shared.ImageAliases, filters []string) error {
 	data := [][]string{}
-	for _, image := range images {
-		shortest := shortestAlias(image.Aliases)
-		if len(image.Aliases) > 1 {
-			shortest = fmt.Sprintf(gettext.Gettext("%s (%d more)"), shortest, len(image.Aliases)-1)
+	for _, alias := range aliases {
+		if !c.aliasShouldShow(filters, &alias) {
+			continue
 		}
-		fp := image.Fingerprint[0:12]
-		public := gettext.Gettext("no")
-		description := findDescription(image.Properties)
-		if shared.InterfaceToBool(image.Public) {
-			public = gettext.Gettext("yes")
-		}
-		const layout = "Jan 2, 2006 at 3:04pm (MST)"
-		uploaded := time.Unix(image.UploadDate, 0).Format(layout)
-		arch, _ := shared.ArchitectureName(image.Architecture)
-		size := fmt.Sprintf("%.2fMB", float64(image.Size)/1024.0/1024.0)
-		data = append(data, []string{shortest, fp, public, description, arch, size, uploaded})
+
+		data = append(data, []string{alias.Name, alias.Target[0:12], alias.Description})
 	}
 
 	table := tablewriter.NewWriter(os.Stdout)
-	table.SetColWidth(50)
+	table.SetAutoWrapText(false)
+	table.SetAlignment(tablewriter.ALIGN_LEFT)
+	table.SetRowLine(true)
 	table.SetHeader([]string{
-		gettext.Gettext("ALIAS"),
-		gettext.Gettext("FINGERPRINT"),
-		gettext.Gettext("PUBLIC"),
-		gettext.Gettext("DESCRIPTION"),
-		gettext.Gettext("ARCH"),
-		gettext.Gettext("SIZE"),
-		gettext.Gettext("UPLOAD DATE")})
-	sort.Sort(ByName(data))
+		i18n.G("ALIAS"),
+		i18n.G("FINGERPRINT"),
+		i18n.G("DESCRIPTION")})
+	sort.Sort(SortImage(data))
 	table.AppendBulk(data)
 	table.Render()
 
 	return nil
 }
 
-func showAliases(aliases []shared.ImageAlias) error {
-	data := [][]string{}
-	for _, alias := range aliases {
-		data = append(data, []string{alias.Description, alias.Name[0:12]})
+func (c *imageCmd) doImageEdit(client *lxd.Client, image string) error {
+	// If stdin isn't a terminal, read text from it
+	if !termios.IsTerminal(int(syscall.Stdin)) {
+		contents, err := ioutil.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+
+		newdata := shared.BriefImageInfo{}
+		err = yaml.Unmarshal(contents, &newdata)
+		if err != nil {
+			return err
+		}
+		return client.PutImageInfo(image, newdata)
 	}
 
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{
-		gettext.Gettext("ALIAS"),
-		gettext.Gettext("FINGERPRINT")})
-
-	for _, v := range data {
-		table.Append(v)
+	// Extract the current value
+	config, err := client.GetImageInfo(image)
+	if err != nil {
+		return err
 	}
-	table.Render()
 
+	brief := config.Brief()
+	data, err := yaml.Marshal(&brief)
+	if err != nil {
+		return err
+	}
+
+	// Spawn the editor
+	content, err := shared.TextEditor("", []byte(c.imageEditHelp()+"\n\n"+string(data)))
+	if err != nil {
+		return err
+	}
+
+	for {
+		// Parse the text received from the editor
+		newdata := shared.BriefImageInfo{}
+		err = yaml.Unmarshal(content, &newdata)
+		if err == nil {
+			err = client.PutImageInfo(image, newdata)
+		}
+
+		// Respawn the editor
+		if err != nil {
+			fmt.Fprintf(os.Stderr, i18n.G("Config parsing error: %s")+"\n", err)
+			fmt.Println(i18n.G("Press enter to start the editor again"))
+
+			_, err := os.Stdin.Read(make([]byte, 1))
+			if err != nil {
+				return err
+			}
+
+			content, err = shared.TextEditor("", content)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		break
+	}
 	return nil
+}
+
+func (c *imageCmd) imageShouldShow(filters []string, state *shared.ImageInfo) bool {
+	if len(filters) == 0 {
+		return true
+	}
+
+	for _, filter := range filters {
+		found := false
+		if strings.Contains(filter, "=") {
+			membs := strings.SplitN(filter, "=", 2)
+
+			key := membs[0]
+			var value string
+			if len(membs) < 2 {
+				value = ""
+			} else {
+				value = membs[1]
+			}
+
+			for configKey, configValue := range state.Properties {
+				list := listCmd{}
+				if list.dotPrefixMatch(key, configKey) {
+					//try to test filter value as a regexp
+					regexpValue := value
+					if !(strings.Contains(value, "^") || strings.Contains(value, "$")) {
+						regexpValue = "^" + regexpValue + "$"
+					}
+					r, err := regexp.Compile(regexpValue)
+					//if not regexp compatible use original value
+					if err != nil {
+						if value == configValue {
+							found = true
+							break
+						}
+					} else if r.MatchString(configValue) == true {
+						found = true
+						break
+					}
+				}
+			}
+		} else {
+			for _, alias := range state.Aliases {
+				if strings.Contains(alias.Name, filter) {
+					found = true
+					break
+				}
+			}
+			if strings.Contains(state.Fingerprint, filter) {
+				found = true
+			}
+		}
+
+		if !found {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (c *imageCmd) aliasShouldShow(filters []string, state *shared.ImageAliasesEntry) bool {
+	if len(filters) == 0 {
+		return true
+	}
+
+	for _, filter := range filters {
+		if strings.Contains(state.Name, filter) || strings.Contains(state.Target, filter) {
+			return true
+		}
+	}
+
+	return false
 }

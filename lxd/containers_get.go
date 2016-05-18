@@ -3,14 +3,13 @@ package main
 import (
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/lxc/lxd/shared"
 )
 
 func containersGet(d *Daemon, r *http.Request) Response {
-	for {
+	for i := 0; i < 100; i++ {
 		result, err := doContainersGet(d, d.isRecursionRequest(r))
 		if err == nil {
 			return SyncResponse(true, result)
@@ -21,10 +20,12 @@ func containersGet(d *Daemon, r *http.Request) Response {
 		}
 		// 1 s may seem drastic, but we really don't want to thrash
 		// perhaps we should use a random amount
-		shared.Debugf("DBERR: containersGet, db is locked")
-		shared.PrintStack()
-		time.Sleep(1 * time.Second)
+		time.Sleep(100 * time.Millisecond)
 	}
+
+	shared.Debugf("DBERR: containersGet, db is locked")
+	shared.PrintStack()
+	return InternalError(fmt.Errorf("DB is locked"))
 }
 
 func doContainersGet(d *Daemon, recursion bool) (interface{}, error) {
@@ -34,20 +35,24 @@ func doContainersGet(d *Daemon, recursion bool) (interface{}, error) {
 	}
 
 	resultString := []string{}
-	resultMap := shared.ContainerInfoList{}
+	resultList := []*shared.ContainerInfo{}
 	if err != nil {
 		return []string{}, err
 	}
+
 	for _, container := range result {
 		if !recursion {
 			url := fmt.Sprintf("/%s/containers/%s", shared.APIVersion, container)
 			resultString = append(resultString, url)
 		} else {
-			container, response := doContainerGet(d, container)
-			if response != nil {
-				continue
+			c, err := doContainerGet(d, container)
+			if err != nil {
+				c = &shared.ContainerInfo{
+					Name:       container,
+					Status:     shared.Error.String(),
+					StatusCode: shared.Error}
 			}
-			resultMap = append(resultMap, container)
+			resultList = append(resultList, c)
 		}
 	}
 
@@ -55,34 +60,19 @@ func doContainersGet(d *Daemon, recursion bool) (interface{}, error) {
 		return resultString, nil
 	}
 
-	return resultMap, nil
+	return resultList, nil
 }
 
-func doContainerGet(d *Daemon, cname string) (shared.ContainerInfo, Response) {
-	c, err := containerLXDLoad(d, cname)
+func doContainerGet(d *Daemon, cname string) (*shared.ContainerInfo, error) {
+	c, err := containerLoadByName(d, cname)
 	if err != nil {
-		return shared.ContainerInfo{}, SmartError(err)
+		return nil, err
 	}
 
-	results, err := dbContainerGetSnapshots(d.db, cname)
+	cts, err := c.Render()
 	if err != nil {
-		return shared.ContainerInfo{}, SmartError(err)
+		return nil, err
 	}
 
-	var body []string
-
-	for _, name := range results {
-		url := fmt.Sprintf("/%s/containers/%s/snapshots/%s", shared.APIVersion, cname, strings.SplitN(name, shared.SnapshotDelimiter, 2)[1])
-		body = append(body, url)
-	}
-
-	cts, err := c.RenderState()
-	if err != nil {
-		return shared.ContainerInfo{}, SmartError(err)
-	}
-
-	containerinfo := shared.ContainerInfo{State: *cts,
-		Snaps: body}
-
-	return containerinfo, nil
+	return cts.(*shared.ContainerInfo), nil
 }

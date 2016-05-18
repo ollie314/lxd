@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"strings"
@@ -13,80 +15,189 @@ import (
 	log "gopkg.in/inconshreveable/log15.v2"
 )
 
+type containerImageSource struct {
+	Type        string `json:"type"`
+	Certificate string `json:"certificate"`
+
+	/* for "image" type */
+	Alias       string            `json:"alias"`
+	Fingerprint string            `json:"fingerprint"`
+	Properties  map[string]string `json:"properties"`
+	Server      string            `json:"server"`
+	Secret      string            `json:"secret"`
+	Protocol    string            `json:"protocol"`
+
+	/*
+	 * for "migration" and "copy" types, as an optimization users can
+	 * provide an image hash to extract before the filesystem is rsync'd,
+	 * potentially cutting down filesystem transfer time. LXD will not go
+	 * and fetch this image, it will simply use it if it exists in the
+	 * image store.
+	 */
+	BaseImage string `json:"base-image"`
+
+	/* for "migration" type */
+	Mode       string            `json:"mode"`
+	Operation  string            `json:"operation"`
+	Websockets map[string]string `json:"secrets"`
+
+	/* for "copy" type */
+	Source string `json:"source"`
+}
+
+type containerPostReq struct {
+	Architecture string               `json:"architecture"`
+	Config       map[string]string    `json:"config"`
+	Devices      shared.Devices       `json:"devices"`
+	Ephemeral    bool                 `json:"ephemeral"`
+	Name         string               `json:"name"`
+	Profiles     []string             `json:"profiles"`
+	Source       containerImageSource `json:"source"`
+}
+
 func createFromImage(d *Daemon, req *containerPostReq) Response {
 	var hash string
 	var err error
-	var run func() shared.OperationResult
 
-	if req.Source.Alias != "" {
-		if req.Source.Mode == "pull" && req.Source.Server != "" {
-			hash, err = remoteGetImageFingerprint(d, req.Source.Server, req.Source.Alias)
-			if err != nil {
-				return InternalError(err)
-			}
+	if req.Source.Fingerprint != "" {
+		hash = req.Source.Fingerprint
+	} else if req.Source.Alias != "" {
+		if req.Source.Server != "" {
+			hash = req.Source.Alias
 		} else {
-
-			hash, err = dbImageAliasGet(d.db, req.Source.Alias)
+			_, alias, err := dbImageAliasGet(d.db, req.Source.Alias, true)
 			if err != nil {
 				return InternalError(err)
 			}
+
+			hash = alias.Target
 		}
 	} else if req.Source.Fingerprint != "" {
 		hash = req.Source.Fingerprint
-	} else {
-		return BadRequest(fmt.Errorf("must specify one of alias or fingerprint for init from image"))
-	}
+	} else if req.Source.Properties != nil {
+		if req.Source.Server != "" {
+			return BadRequest(fmt.Errorf("Property match is only supported for local images"))
+		}
 
-	if req.Source.Server != "" {
-		err := d.ImageDownload(req.Source.Server, hash, req.Source.Secret, true)
+		hashes, err := dbImagesGet(d.db, false)
 		if err != nil {
 			return InternalError(err)
 		}
+
+		var image *shared.ImageInfo
+
+		for _, hash := range hashes {
+			_, img, err := dbImageGet(d.db, hash, false, true)
+			if err != nil {
+				continue
+			}
+
+			if image != nil && img.CreationDate.Before(image.CreationDate) {
+				continue
+			}
+
+			match := true
+			for key, value := range req.Source.Properties {
+				if img.Properties[key] != value {
+					match = false
+					break
+				}
+			}
+
+			if !match {
+				continue
+			}
+
+			image = img
+		}
+
+		if image == nil {
+			return BadRequest(fmt.Errorf("No matching image could be found"))
+		}
+
+		hash = image.Fingerprint
+	} else {
+		return BadRequest(fmt.Errorf("Must specify one of alias, fingerprint or properties for init from image"))
 	}
 
-	imgInfo, err := dbImageGet(d.db, hash, false, false)
-	if err != nil {
-		return SmartError(err)
-	}
-	hash = imgInfo.Fingerprint
+	run := func(op *operation) error {
+		if req.Source.Server != "" {
+			hash, err = d.ImageDownload(
+				op, req.Source.Server, req.Source.Protocol, req.Source.Certificate, req.Source.Secret,
+				hash, true, daemonConfig["images.auto_update_cached"].GetBool())
+			if err != nil {
+				return err
+			}
+		}
 
-	args := containerLXDArgs{
-		Ctype:        cTypeRegular,
-		Config:       req.Config,
-		Profiles:     req.Profiles,
-		Ephemeral:    req.Ephemeral,
-		BaseImage:    hash,
-		Architecture: imgInfo.Architecture,
-	}
+		_, imgInfo, err := dbImageGet(d.db, hash, false, false)
+		if err != nil {
+			return err
+		}
 
-	run = shared.OperationWrap(func() error {
-		_, err := containerLXDCreateFromImage(d, req.Name, args, hash)
+		hash = imgInfo.Fingerprint
+
+		architecture, err := shared.ArchitectureId(imgInfo.Architecture)
+		if err != nil {
+			architecture = 0
+		}
+
+		args := containerArgs{
+			Architecture: architecture,
+			BaseImage:    hash,
+			Config:       req.Config,
+			Ctype:        cTypeRegular,
+			Devices:      req.Devices,
+			Ephemeral:    req.Ephemeral,
+			Name:         req.Name,
+			Profiles:     req.Profiles,
+		}
+
+		_, err = containerCreateFromImage(d, args, hash)
 		return err
-	})
+	}
 
-	resources := make(map[string][]string)
+	resources := map[string][]string{}
 	resources["containers"] = []string{req.Name}
 
-	return &asyncResponse{run: run, resources: resources}
+	op, err := operationCreate(operationClassTask, resources, nil, run, nil, nil)
+	if err != nil {
+		return InternalError(err)
+	}
+
+	return OperationResponse(op)
 }
 
 func createFromNone(d *Daemon, req *containerPostReq) Response {
-	args := containerLXDArgs{
-		Ctype:     cTypeRegular,
-		Config:    req.Config,
-		Profiles:  req.Profiles,
-		Ephemeral: req.Ephemeral,
+	architecture, err := shared.ArchitectureId(req.Architecture)
+	if err != nil {
+		architecture = 0
 	}
 
-	run := shared.OperationWrap(func() error {
-		_, err := containerLXDCreateAsEmpty(d, req.Name, args)
-		return err
-	})
+	args := containerArgs{
+		Architecture: architecture,
+		Config:       req.Config,
+		Ctype:        cTypeRegular,
+		Devices:      req.Devices,
+		Ephemeral:    req.Ephemeral,
+		Name:         req.Name,
+		Profiles:     req.Profiles,
+	}
 
-	resources := make(map[string][]string)
+	run := func(op *operation) error {
+		_, err := containerCreateAsEmpty(d, args)
+		return err
+	}
+
+	resources := map[string][]string{}
 	resources["containers"] = []string{req.Name}
 
-	return &asyncResponse{run: run, resources: resources}
+	op, err := operationCreate(operationClassTask, resources, nil, run, nil, nil)
+	if err != nil {
+		return InternalError(err)
+	}
+
+	return OperationResponse(op)
 }
 
 func createFromMigration(d *Daemon, req *containerPostReq) Response {
@@ -94,37 +205,68 @@ func createFromMigration(d *Daemon, req *containerPostReq) Response {
 		return NotImplemented
 	}
 
-	run := func() shared.OperationResult {
-		createArgs := containerLXDArgs{
-			Ctype:     cTypeRegular,
-			Config:    req.Config,
-			Profiles:  req.Profiles,
-			Ephemeral: req.Ephemeral,
-			BaseImage: req.Source.BaseImage,
+	architecture, err := shared.ArchitectureId(req.Architecture)
+	if err != nil {
+		architecture = 0
+	}
+
+	run := func(op *operation) error {
+		args := containerArgs{
+			Architecture: architecture,
+			BaseImage:    req.Source.BaseImage,
+			Config:       req.Config,
+			Ctype:        cTypeRegular,
+			Devices:      req.Devices,
+			Ephemeral:    req.Ephemeral,
+			Name:         req.Name,
+			Profiles:     req.Profiles,
 		}
 
 		var c container
-		if _, err := dbImageGet(d.db, req.Source.BaseImage, false, true); err == nil {
-			c, err = containerLXDCreateFromImage(
-				d, req.Name, createArgs, req.Source.BaseImage)
+		_, _, err := dbImageGet(d.db, req.Source.BaseImage, false, true)
 
+		/* Only create a container from an image if we're going to
+		 * rsync over the top of it. In the case of a better file
+		 * transfer mechanism, let's just use that.
+		 *
+		 * TODO: we could invent some negotiation here, where if the
+		 * source and sink both have the same image, we can clone from
+		 * it, but we have to know before sending the snapshot that
+		 * we're sending the whole thing or just a delta from the
+		 * image, so one extra negotiation round trip is needed. An
+		 * alternative is to move actual container object to a later
+		 * point and just negotiate it over the migration control
+		 * socket. Anyway, it'll happen later :)
+		 */
+		if err == nil && d.Storage.MigrationType() == MigrationFSType_RSYNC {
+			c, err = containerCreateFromImage(d, args, req.Source.BaseImage)
 			if err != nil {
-				return shared.OperationError(err)
+				return err
 			}
 		} else {
-			c, err = containerLXDCreateAsEmpty(d, req.Name, createArgs)
+			c, err = containerCreateAsEmpty(d, args)
 			if err != nil {
-				return shared.OperationError(err)
+				return err
 			}
 		}
 
-		config, err := shared.GetTLSConfig(d.certf, d.keyf)
-		if err != nil {
-			c.Delete()
-			return shared.OperationError(err)
+		var cert *x509.Certificate
+		if req.Source.Certificate != "" {
+			certBlock, _ := pem.Decode([]byte(req.Source.Certificate))
+
+			cert, err = x509.ParseCertificate(certBlock.Bytes)
+			if err != nil {
+				return err
+			}
 		}
 
-		args := MigrationSinkArgs{
+		config, err := shared.GetTLSConfig("", "", cert)
+		if err != nil {
+			c.Delete()
+			return err
+		}
+
+		migrationArgs := MigrationSinkArgs{
 			Url: req.Source.Operation,
 			Dialer: websocket.Dialer{
 				TLSClientConfig: config,
@@ -133,10 +275,10 @@ func createFromMigration(d *Daemon, req *containerPostReq) Response {
 			Secrets:   req.Source.Websockets,
 		}
 
-		sink, err := NewMigrationSink(&args)
+		sink, err := NewMigrationSink(&migrationArgs)
 		if err != nil {
 			c.Delete()
-			return shared.OperationError(err)
+			return err
 		}
 
 		// Start the storage for this container (LVM mount/umount)
@@ -146,24 +288,30 @@ func createFromMigration(d *Daemon, req *containerPostReq) Response {
 		err = sink()
 		if err != nil {
 			c.StorageStop()
+			shared.Log.Error("Error during migration sink", "err", err)
 			c.Delete()
-			return shared.OperationError(fmt.Errorf("Error transferring container data: %s", err))
+			return fmt.Errorf("Error transferring container data: %s", err)
 		}
 
 		defer c.StorageStop()
 
 		err = c.TemplateApply("copy")
 		if err != nil {
-			return shared.OperationError(err)
+			return err
 		}
 
-		return shared.OperationError(nil)
+		return nil
 	}
 
-	resources := make(map[string][]string)
+	resources := map[string][]string{}
 	resources["containers"] = []string{req.Name}
 
-	return &asyncResponse{run: run, resources: resources}
+	op, err := operationCreate(operationClassTask, resources, nil, run, nil, nil)
+	if err != nil {
+		return InternalError(err)
+	}
+
+	return OperationResponse(op)
 }
 
 func createFromCopy(d *Daemon, req *containerPostReq) Response {
@@ -171,12 +319,13 @@ func createFromCopy(d *Daemon, req *containerPostReq) Response {
 		return BadRequest(fmt.Errorf("must specify a source container"))
 	}
 
-	source, err := containerLXDLoad(d, req.Source.Source)
+	source, err := containerLoadByName(d, req.Source.Source)
 	if err != nil {
 		return SmartError(err)
 	}
 
-	sourceConfig := source.ConfigGet()
+	// Config override
+	sourceConfig := source.LocalConfig()
 
 	if req.Config == nil {
 		req.Config = make(map[string]string)
@@ -188,34 +337,49 @@ func createFromCopy(d *Daemon, req *containerPostReq) Response {
 				log.Ctx{"key": key})
 			continue
 		}
+
+		_, exists := req.Config[key]
+		if exists {
+			continue
+		}
+
 		req.Config[key] = value
 	}
 
+	// Profiles override
 	if req.Profiles == nil {
-		req.Profiles = source.ProfilesGet()
+		req.Profiles = source.Profiles()
 	}
 
-	args := containerLXDArgs{
-		Ctype:     cTypeRegular,
-		Config:    req.Config,
-		Profiles:  req.Profiles,
-		Ephemeral: req.Ephemeral,
-		BaseImage: req.Source.BaseImage,
+	args := containerArgs{
+		Architecture: source.Architecture(),
+		BaseImage:    req.Source.BaseImage,
+		Config:       req.Config,
+		Ctype:        cTypeRegular,
+		Devices:      source.LocalDevices(),
+		Ephemeral:    req.Ephemeral,
+		Name:         req.Name,
+		Profiles:     req.Profiles,
 	}
 
-	run := func() shared.OperationResult {
-		_, err := containerLXDCreateAsCopy(d, req.Name, args, source)
+	run := func(op *operation) error {
+		_, err := containerCreateAsCopy(d, args, source)
 		if err != nil {
-			return shared.OperationError(err)
+			return err
 		}
 
-		return shared.OperationSuccess
+		return nil
 	}
 
-	resources := make(map[string][]string)
+	resources := map[string][]string{}
 	resources["containers"] = []string{req.Name, req.Source.Source}
 
-	return &asyncResponse{run: run, resources: resources}
+	op, err := operationCreate(operationClassTask, resources, nil, run, nil, nil)
+	if err != nil {
+		return InternalError(err)
+	}
+
+	return OperationResponse(op)
 }
 
 func containersPost(d *Daemon, r *http.Request) Response {
@@ -229,6 +393,14 @@ func containersPost(d *Daemon, r *http.Request) Response {
 	if req.Name == "" {
 		req.Name = strings.ToLower(petname.Generate(2, "-"))
 		shared.Debugf("No name provided, creating %s", req.Name)
+	}
+
+	if req.Devices == nil {
+		req.Devices = shared.Devices{}
+	}
+
+	if req.Config == nil {
+		req.Config = map[string]string{}
 	}
 
 	if strings.Contains(req.Name, shared.SnapshotDelimiter) {
@@ -247,5 +419,4 @@ func containersPost(d *Daemon, r *http.Request) Response {
 	default:
 		return BadRequest(fmt.Errorf("unknown source type %s", req.Source.Type))
 	}
-
 }

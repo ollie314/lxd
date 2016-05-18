@@ -2,7 +2,8 @@ package shared
 
 type ServerStateEnvironment struct {
 	Addresses          []string `json:"addresses"`
-	Architectures      []int    `json:"architectures"`
+	Architectures      []string `json:"architectures"`
+	Certificate        string   `json:"certificate"`
 	Driver             string   `json:"driver"`
 	DriverVersion      string   `json:"driver_version"`
 	Kernel             string   `json:"kernel"`
@@ -27,7 +28,7 @@ type BriefServerState struct {
 	Config map[string]interface{} `json:"config"`
 }
 
-func (c *ServerState) BriefState() BriefServerState {
+func (c *ServerState) Brief() BriefServerState {
 	retstate := BriefServerState{Config: c.Config}
 	return retstate
 }

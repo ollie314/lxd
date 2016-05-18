@@ -8,8 +8,6 @@ import (
 	"github.com/mattn/go-sqlite3"
 
 	"github.com/lxc/lxd/shared"
-
-	log "gopkg.in/inconshreveable/log15.v2"
 )
 
 var (
@@ -36,7 +34,7 @@ type Profile struct {
 // Profiles will contain a list of all Profiles.
 type Profiles []Profile
 
-const DB_CURRENT_VERSION int = 17
+const DB_CURRENT_VERSION int = 29
 
 // CURRENT_SCHEMA contains the current SQLite SQL Schema.
 const CURRENT_SCHEMA string = `
@@ -60,6 +58,8 @@ CREATE TABLE IF NOT EXISTS containers (
     architecture INTEGER NOT NULL,
     type INTEGER NOT NULL,
     ephemeral INTEGER NOT NULL DEFAULT 0,
+    stateful INTEGER NOT NULL DEFAULT 0,
+    creation_date DATETIME,
     UNIQUE (name)
 );
 CREATE TABLE IF NOT EXISTS containers_config (
@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS images (
     filename VARCHAR(255) NOT NULL,
     size INTEGER NOT NULL,
     public INTEGER NOT NULL DEFAULT 0,
+    auto_update INTEGER NOT NULL DEFAULT 0,
     architecture INTEGER NOT NULL,
     creation_date DATETIME,
     expiry_date DATETIME,
@@ -125,9 +126,19 @@ CREATE TABLE IF NOT EXISTS images_properties (
     value TEXT,
     FOREIGN KEY (image_id) REFERENCES images (id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS images_source (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    image_id INTEGER NOT NULL,
+    server TEXT NOT NULL,
+    protocol INTEGER NOT NULL,
+    certificate TEXT NOT NULL,
+    alias VARCHAR(255) NOT NULL,
+    FOREIGN KEY (image_id) REFERENCES images (id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS profiles (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     name VARCHAR(255) NOT NULL,
+    description TEXT,
     UNIQUE (name)
 );
 CREATE TABLE IF NOT EXISTS profiles_config (
@@ -162,24 +173,23 @@ CREATE TABLE IF NOT EXISTS schema (
 );`
 
 // Create the initial (current) schema for a given SQLite DB connection.
-// This should stay indempotent.
 func createDb(db *sql.DB) (err error) {
+	latestVersion := dbGetSchema(db)
+
+	if latestVersion != 0 {
+		return nil
+	}
+
 	_, err = db.Exec(CURRENT_SCHEMA)
 	if err != nil {
 		return err
 	}
 
-	// To make the schema creation indempotent, only insert the schema version
-	// if there isn't one already.
-	latestVersion := dbGetSchema(db)
-
-	if latestVersion == 0 {
-		// There isn't an entry for schema version, let's put it in.
-		insertStmt := `INSERT INTO schema (version, updated_at) values (?, strftime("%s"));`
-		_, err = db.Exec(insertStmt, DB_CURRENT_VERSION)
-		if err != nil {
-			return err
-		}
+	// There isn't an entry for schema version, let's put it in.
+	insertStmt := `INSERT INTO schema (version, updated_at) values (?, strftime("%s"));`
+	_, err = db.Exec(insertStmt, DB_CURRENT_VERSION)
+	if err != nil {
+		return err
 	}
 
 	err = dbProfileCreateDefault(db)
@@ -187,7 +197,7 @@ func createDb(db *sql.DB) (err error) {
 		return err
 	}
 
-	return dbProfileCreateMigratable(db)
+	return dbProfileCreateDocker(db)
 }
 
 func dbGetSchema(db *sql.DB) (v int) {
@@ -217,7 +227,7 @@ func initializeDbObject(d *Daemon, path string) (err error) {
 		return err
 	}
 
-	// Table creation is indempotent, run it every time
+	// Create the DB if it doesn't exist.
 	err = createDb(d.db)
 	if err != nil {
 		return fmt.Errorf("Error creating database: %s", err)
@@ -262,7 +272,7 @@ func isNoMatchError(err error) bool {
 }
 
 func dbBegin(db *sql.DB) (*sql.Tx, error) {
-	for {
+	for i := 0; i < 100; i++ {
 		tx, err := db.Begin()
 		if err == nil {
 			return tx, nil
@@ -271,14 +281,16 @@ func dbBegin(db *sql.DB) (*sql.Tx, error) {
 			shared.Debugf("DbBegin: error %q", err)
 			return nil, err
 		}
-		shared.Debugf("DbBegin: DB was locked")
-		shared.PrintStack()
-		time.Sleep(1 * time.Second)
+		time.Sleep(100 * time.Millisecond)
 	}
+
+	shared.Debugf("DbBegin: DB still locked")
+	shared.PrintStack()
+	return nil, fmt.Errorf("DB is locked")
 }
 
 func txCommit(tx *sql.Tx) error {
-	for {
+	for i := 0; i < 100; i++ {
 		err := tx.Commit()
 		if err == nil {
 			return nil
@@ -287,14 +299,16 @@ func txCommit(tx *sql.Tx) error {
 			shared.Debugf("Txcommit: error %q", err)
 			return err
 		}
-		shared.Debugf("Txcommit: db was locked")
-		shared.PrintStack()
-		time.Sleep(1 * time.Second)
+		time.Sleep(100 * time.Millisecond)
 	}
+
+	shared.Debugf("Txcommit: db still locked")
+	shared.PrintStack()
+	return fmt.Errorf("DB is locked")
 }
 
 func dbQueryRowScan(db *sql.DB, q string, args []interface{}, outargs []interface{}) error {
-	for {
+	for i := 0; i < 100; i++ {
 		err := db.QueryRow(q, args...).Scan(outargs...)
 		if err == nil {
 			return nil
@@ -303,17 +317,18 @@ func dbQueryRowScan(db *sql.DB, q string, args []interface{}, outargs []interfac
 			return err
 		}
 		if !isDbLockedError(err) {
-			shared.Log.Debug("DbQuery: query error", log.Ctx{"query": q, "args": args, "err": err})
 			return err
 		}
-		shared.Debugf("DbQueryRowScan: query %q args %q, DB was locked", q, args)
-		shared.PrintStack()
-		time.Sleep(1 * time.Second)
+		time.Sleep(100 * time.Millisecond)
 	}
+
+	shared.Debugf("DbQueryRowScan: query %q args %q, DB still locked", q, args)
+	shared.PrintStack()
+	return fmt.Errorf("DB is locked")
 }
 
 func dbQuery(db *sql.DB, q string, args ...interface{}) (*sql.Rows, error) {
-	for {
+	for i := 0; i < 100; i++ {
 		result, err := db.Query(q, args...)
 		if err == nil {
 			return result, nil
@@ -322,10 +337,12 @@ func dbQuery(db *sql.DB, q string, args ...interface{}) (*sql.Rows, error) {
 			shared.Debugf("DbQuery: query %q error %q", q, err)
 			return nil, err
 		}
-		shared.Debugf("DbQuery: query %q args %q, DB was locked", q, args)
-		shared.PrintStack()
-		time.Sleep(1 * time.Second)
+		time.Sleep(100 * time.Millisecond)
 	}
+
+	shared.Debugf("DbQuery: query %q args %q, DB still locked", q, args)
+	shared.PrintStack()
+	return nil, fmt.Errorf("DB is locked")
 }
 
 func doDbQueryScan(db *sql.DB, q string, args []interface{}, outargs []interface{}) ([][]interface{}, error) {
@@ -386,7 +403,7 @@ func doDbQueryScan(db *sql.DB, q string, args []interface{}, outargs []interface
  * of interfaces, containing pointers to the actual output arguments.
  */
 func dbQueryScan(db *sql.DB, q string, inargs []interface{}, outfmt []interface{}) ([][]interface{}, error) {
-	for {
+	for i := 0; i < 100; i++ {
 		result, err := doDbQueryScan(db, q, inargs, outfmt)
 		if err == nil {
 			return result, nil
@@ -395,14 +412,16 @@ func dbQueryScan(db *sql.DB, q string, inargs []interface{}, outfmt []interface{
 			shared.Debugf("DbQuery: query %q error %q", q, err)
 			return nil, err
 		}
-		shared.Debugf("DbQueryscan: query %q inargs %q, DB was locked", q, inargs)
-		shared.PrintStack()
-		time.Sleep(1 * time.Second)
+		time.Sleep(100 * time.Millisecond)
 	}
+
+	shared.Debugf("DbQueryscan: query %q inargs %q, DB still locked", q, inargs)
+	shared.PrintStack()
+	return nil, fmt.Errorf("DB is locked")
 }
 
 func dbExec(db *sql.DB, q string, args ...interface{}) (sql.Result, error) {
-	for {
+	for i := 0; i < 100; i++ {
 		result, err := db.Exec(q, args...)
 		if err == nil {
 			return result, nil
@@ -411,8 +430,10 @@ func dbExec(db *sql.DB, q string, args ...interface{}) (sql.Result, error) {
 			shared.Debugf("DbExec: query %q error %q", q, err)
 			return nil, err
 		}
-		shared.Debugf("DbExec: query %q args %q, DB was locked", q, args)
-		shared.PrintStack()
-		time.Sleep(1 * time.Second)
+		time.Sleep(100 * time.Millisecond)
 	}
+
+	shared.Debugf("DbExec: query %q args %q, DB still locked", q, args)
+	shared.PrintStack()
+	return nil, fmt.Errorf("DB is locked")
 }

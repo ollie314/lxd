@@ -3,7 +3,7 @@ package main
 import (
 	"database/sql"
 	"fmt"
-	"strings"
+	"time"
 
 	"github.com/lxc/lxd/shared"
 
@@ -18,11 +18,41 @@ const (
 )
 
 func dbContainerRemove(db *sql.DB, name string) error {
-	_, err := dbExec(db, "DELETE FROM containers WHERE name=?", name)
-	return err
+	id, err := dbContainerId(db, name)
+	if err != nil {
+		return err
+	}
+
+	tx, err := dbBegin(db)
+	if err != nil {
+		return err
+	}
+
+	err = dbContainerConfigClear(tx, id)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	_, err = tx.Exec("DELETE FROM containers WHERE id=?", id)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	return txCommit(tx)
 }
 
-func dbContainerIDGet(db *sql.DB, name string) (int, error) {
+func dbContainerName(db *sql.DB, id int) (string, error) {
+	q := "SELECT name FROM containers WHERE id=?"
+	name := ""
+	arg1 := []interface{}{id}
+	arg2 := []interface{}{&name}
+	err := dbQueryRowScan(db, q, arg1, arg2)
+	return name, err
+}
+
+func dbContainerId(db *sql.DB, name string) (int, error) {
 	q := "SELECT id FROM containers WHERE name=?"
 	id := -1
 	arg1 := []interface{}{name}
@@ -31,45 +61,51 @@ func dbContainerIDGet(db *sql.DB, name string) (int, error) {
 	return id, err
 }
 
-func dbContainerGet(db *sql.DB, name string) (*containerLXDArgs, error) {
-	args := &containerLXDArgs{
-		Ephemeral: false,
-	}
+func dbContainerGet(db *sql.DB, name string) (containerArgs, error) {
+	args := containerArgs{}
+	args.Name = name
 
 	ephemInt := -1
-	q := "SELECT id, architecture, type, ephemeral FROM containers WHERE name=?"
+	statefulInt := -1
+	q := "SELECT id, architecture, type, ephemeral, stateful, creation_date FROM containers WHERE name=?"
 	arg1 := []interface{}{name}
-	arg2 := []interface{}{&args.ID, &args.Architecture, &args.Ctype, &ephemInt}
+	arg2 := []interface{}{&args.Id, &args.Architecture, &args.Ctype, &ephemInt, &statefulInt, &args.CreationDate}
 	err := dbQueryRowScan(db, q, arg1, arg2)
 	if err != nil {
-		return nil, err
+		return args, err
 	}
-	if args.ID == -1 {
-		return nil, fmt.Errorf("Unknown container")
+
+	if args.Id == -1 {
+		return args, fmt.Errorf("Unknown container")
 	}
 
 	if ephemInt == 1 {
 		args.Ephemeral = true
 	}
 
-	config, err := dbContainerConfigGet(db, args.ID)
+	if statefulInt == 1 {
+		args.Stateful = true
+	}
+
+	config, err := dbContainerConfig(db, args.Id)
 	if err != nil {
-		return nil, err
+		return args, err
 	}
 	args.Config = config
 
-	profiles, err := dbContainerProfilesGet(db, args.ID)
+	profiles, err := dbContainerProfiles(db, args.Id)
 	if err != nil {
-		return nil, err
+		return args, err
 	}
 	args.Profiles = profiles
 
-	args.Devices = shared.Devices{}
 	/* get container_devices */
-	newdevs, err := dbDevicesGet(db, name, false)
+	args.Devices = shared.Devices{}
+	newdevs, err := dbDevices(db, name, false)
 	if err != nil {
-		return nil, err
+		return args, err
 	}
+
 	for k, v := range newdevs {
 		args.Devices[k] = v
 	}
@@ -77,12 +113,8 @@ func dbContainerGet(db *sql.DB, name string) (*containerLXDArgs, error) {
 	return args, nil
 }
 
-func dbContainerCreate(db *sql.DB, name string, args containerLXDArgs) (int, error) {
-	if args.Ctype == cTypeRegular && !shared.ValidHostname(name) {
-		return 0, fmt.Errorf("Invalid container name")
-	}
-
-	id, err := dbContainerIDGet(db, name)
+func dbContainerCreate(db *sql.DB, args containerArgs) (int, error) {
+	id, err := dbContainerId(db, args.Name)
 	if err == nil {
 		return 0, DbErrAlreadyDefined
 	}
@@ -91,19 +123,27 @@ func dbContainerCreate(db *sql.DB, name string, args containerLXDArgs) (int, err
 	if err != nil {
 		return 0, err
 	}
+
 	ephemInt := 0
 	if args.Ephemeral == true {
 		ephemInt = 1
 	}
 
-	str := fmt.Sprintf("INSERT INTO containers (name, architecture, type, ephemeral) VALUES (?, ?, ?, ?)")
+	statefulInt := 0
+	if args.Stateful == true {
+		statefulInt = 1
+	}
+
+	args.CreationDate = time.Now().UTC()
+
+	str := fmt.Sprintf("INSERT INTO containers (name, architecture, type, ephemeral, creation_date, stateful) VALUES (?, ?, ?, ?, ?, ?)")
 	stmt, err := tx.Prepare(str)
 	if err != nil {
 		tx.Rollback()
 		return 0, err
 	}
 	defer stmt.Close()
-	result, err := stmt.Exec(name, args.Architecture, args.Ctype, ephemInt)
+	result, err := stmt.Exec(args.Name, args.Architecture, args.Ctype, ephemInt, args.CreationDate.Unix(), statefulInt)
 	if err != nil {
 		tx.Rollback()
 		return 0, err
@@ -112,7 +152,7 @@ func dbContainerCreate(db *sql.DB, name string, args containerLXDArgs) (int, err
 	id64, err := result.LastInsertId()
 	if err != nil {
 		tx.Rollback()
-		return 0, fmt.Errorf("Error inserting %s into database", name)
+		return 0, fmt.Errorf("Error inserting %s into database", args.Name)
 	}
 	// TODO: is this really int64? we should fix it everywhere if so
 	id = int(id64)
@@ -164,18 +204,7 @@ func dbContainerConfigInsert(tx *sql.Tx, id int, config map[string]string) error
 	defer stmt.Close()
 
 	for k, v := range config {
-		if k == "raw.lxc" {
-			err := validateRawLxc(config["raw.lxc"])
-			if err != nil {
-				return err
-			}
-		}
-
-		if !ValidContainerConfigKey(k) {
-			return fmt.Errorf("Bad key: %s", k)
-		}
-
-		_, err = stmt.Exec(id, k, v)
+		_, err := stmt.Exec(id, k, v)
 		if err != nil {
 			shared.Debugf("Error adding configuration item %s = %s to container %d",
 				k, v, id)
@@ -184,6 +213,21 @@ func dbContainerConfigInsert(tx *sql.Tx, id int, config map[string]string) error
 	}
 
 	return nil
+}
+
+func dbContainerConfigRemove(db *sql.DB, id int, name string) error {
+	_, err := dbExec(db, "DELETE FROM containers_config WHERE key=? AND container_id=?", name, id)
+	return err
+}
+
+func dbContainerSetStateful(db *sql.DB, id int, stateful bool) error {
+	statefulInt := 0
+	if stateful {
+		statefulInt = 1
+	}
+
+	_, err := dbExec(db, "UPDATE containers SET stateful=? WHERE id=?", statefulInt, id)
+	return err
 }
 
 func dbContainerProfilesInsert(tx *sql.Tx, id int, profiles []string) error {
@@ -209,7 +253,7 @@ func dbContainerProfilesInsert(tx *sql.Tx, id int, profiles []string) error {
 }
 
 // Get a list of profiles for a given container id.
-func dbContainerProfilesGet(db *sql.DB, containerID int) ([]string, error) {
+func dbContainerProfiles(db *sql.DB, containerId int) ([]string, error) {
 	var name string
 	var profiles []string
 
@@ -218,7 +262,7 @@ func dbContainerProfilesGet(db *sql.DB, containerID int) ([]string, error) {
         JOIN profiles ON containers_profiles.profile_id=profiles.id
 		WHERE container_id=?
         ORDER BY containers_profiles.apply_order`
-	inargs := []interface{}{containerID}
+	inargs := []interface{}{containerId}
 	outfmt := []interface{}{name}
 
 	results, err := dbQueryScan(db, query, inargs, outfmt)
@@ -235,12 +279,12 @@ func dbContainerProfilesGet(db *sql.DB, containerID int) ([]string, error) {
 	return profiles, nil
 }
 
-// dbContainerConfigGet gets the container configuration map from the DB
-func dbContainerConfigGet(db *sql.DB, containerID int) (map[string]string, error) {
+// dbContainerConfig gets the container configuration map from the DB
+func dbContainerConfig(db *sql.DB, containerId int) (map[string]string, error) {
 	var key, value string
 	q := `SELECT key, value FROM containers_config WHERE container_id=?`
 
-	inargs := []interface{}{containerID}
+	inargs := []interface{}{containerId}
 	outfmt := []interface{}{key, value}
 
 	// Results is already a slice here, not db Rows anymore.
@@ -280,10 +324,6 @@ func dbContainersList(db *sql.DB, cType containerType) ([]string, error) {
 }
 
 func dbContainerRename(db *sql.DB, oldName string, newName string) error {
-	if !strings.Contains(newName, shared.SnapshotDelimiter) && !shared.ValidHostname(newName) {
-		return fmt.Errorf("Invalid container name")
-	}
-
 	tx, err := dbBegin(db)
 	if err != nil {
 		return err
@@ -311,6 +351,26 @@ func dbContainerRename(db *sql.DB, oldName string, newName string) error {
 	return txCommit(tx)
 }
 
+func dbContainerUpdate(tx *sql.Tx, id int, architecture int, ephemeral bool) error {
+	str := fmt.Sprintf("UPDATE containers SET architecture=?, ephemeral=? WHERE id=?")
+	stmt, err := tx.Prepare(str)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	ephemeralInt := 0
+	if ephemeral {
+		ephemeralInt = 1
+	}
+
+	if _, err := stmt.Exec(architecture, ephemeralInt, id); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func dbContainerGetSnapshots(db *sql.DB, name string) ([]string, error) {
 	result := []string{}
 
@@ -329,48 +389,4 @@ func dbContainerGetSnapshots(db *sql.DB, name string) ([]string, error) {
 	}
 
 	return result, nil
-}
-
-// ValidContainerConfigKey returns if the given config key is a known/valid key.
-func ValidContainerConfigKey(k string) bool {
-	switch k {
-	case "boot.autostart":
-		return true
-	case "boot.autostart.delay":
-		return true
-	case "boot.autostart.priority":
-		return true
-	case "limits.cpus":
-		return true
-	case "limits.memory":
-		return true
-	case "security.privileged":
-		return true
-	case "security.nesting":
-		return true
-	case "raw.apparmor":
-		return true
-	case "raw.lxc":
-		return true
-	case "volatile.base_image":
-		return true
-	case "volatile.last_state.idmap":
-		return true
-	case "volatile.last_state.power":
-		return true
-	}
-
-	if _, err := extractInterfaceFromConfigName(k); err == nil {
-		return true
-	}
-
-	if strings.HasPrefix(k, "environment.") {
-		return true
-	}
-
-	if strings.HasPrefix(k, "user.") {
-		return true
-	}
-
-	return false
 }

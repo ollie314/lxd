@@ -4,32 +4,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
 
-	"github.com/chai2010/gettext-go/gettext"
 	"github.com/gorilla/websocket"
-	"golang.org/x/crypto/ssh/terminal"
 
 	"github.com/lxc/lxd"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/gnuflag"
+	"github.com/lxc/lxd/shared/i18n"
+	"github.com/lxc/lxd/shared/termios"
 )
-
-type execCmd struct{}
-
-func (c *execCmd) showByDefault() bool {
-	return true
-}
-
-func (c *execCmd) usage() string {
-	return gettext.Gettext(
-		`Execute the specified command in a container.
-
-lxc exec [remote:]container [--env EDITOR=/usr/bin/vim]... <command>`)
-}
 
 type envFlag []string
 
@@ -46,55 +32,56 @@ func (f *envFlag) Set(value string) error {
 	return nil
 }
 
-var envArgs envFlag
-
-func (c *execCmd) flags() {
-	gnuflag.Var(&envArgs, "env", gettext.Gettext("An environment variable of the form HOME=/home/foo"))
+type execCmd struct {
+	modeFlag string
+	envArgs  envFlag
 }
 
-func controlSocketHandler(c *lxd.Client, control *websocket.Conn) {
-	for {
-		width, height, err := terminal.GetSize(syscall.Stdout)
-		if err != nil {
-			continue
-		}
+func (c *execCmd) showByDefault() bool {
+	return true
+}
 
-		shared.Debugf("Window size is now: %dx%d", width, height)
+func (c *execCmd) usage() string {
+	return i18n.G(
+		`Execute the specified command in a container.
 
-		w, err := control.NextWriter(websocket.TextMessage)
-		if err != nil {
-			shared.Debugf("Got error getting next writer %s", err)
-			break
-		}
+lxc exec [remote:]container [--mode=auto|interactive|non-interactive] [--env EDITOR=/usr/bin/vim]... <command>
 
-		msg := shared.ContainerExecControl{}
-		msg.Command = "window-resize"
-		msg.Args = make(map[string]string)
-		msg.Args["width"] = strconv.Itoa(width)
-		msg.Args["height"] = strconv.Itoa(height)
+Mode defaults to non-interactive, interactive mode is selected if both stdin AND stdout are terminals (stderr is ignored).`)
+}
 
-		buf, err := json.Marshal(msg)
-		if err != nil {
-			shared.Debugf("Failed to convert to json %s", err)
-			break
-		}
-		_, err = w.Write(buf)
+func (c *execCmd) flags() {
+	gnuflag.Var(&c.envArgs, "env", i18n.G("An environment variable of the form HOME=/home/foo"))
+	gnuflag.StringVar(&c.modeFlag, "mode", "auto", i18n.G("Override the terminal mode (auto, interactive or non-interactive)"))
+}
 
-		w.Close()
-		if err != nil {
-			shared.Debugf("Got err writing %s", err)
-			break
-		}
-
-		ch := make(chan os.Signal)
-		signal.Notify(ch, syscall.SIGWINCH)
-		sig := <-ch
-
-		shared.Debugf("Received '%s signal', updating window geometry.", sig)
+func (c *execCmd) sendTermSize(control *websocket.Conn) error {
+	width, height, err := termios.GetSize(int(syscall.Stdout))
+	if err != nil {
+		return err
 	}
 
-	closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
-	control.WriteMessage(websocket.CloseMessage, closeMsg)
+	shared.Debugf("Window size is now: %dx%d", width, height)
+
+	w, err := control.NextWriter(websocket.TextMessage)
+	if err != nil {
+		return err
+	}
+
+	msg := shared.ContainerExecControl{}
+	msg.Command = "window-resize"
+	msg.Args = make(map[string]string)
+	msg.Args["width"] = strconv.Itoa(width)
+	msg.Args["height"] = strconv.Itoa(height)
+
+	buf, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(buf)
+
+	w.Close()
+	return err
 }
 
 func (c *execCmd) run(config *lxd.Config, args []string) error {
@@ -116,7 +103,7 @@ func (c *execCmd) run(config *lxd.Config, args []string) error {
 		}
 	}
 
-	for _, arg := range envArgs {
+	for _, arg := range c.envArgs {
 		pieces := strings.SplitN(arg, "=", 2)
 		value := ""
 		if len(pieces) > 1 {
@@ -125,23 +112,41 @@ func (c *execCmd) run(config *lxd.Config, args []string) error {
 		env[pieces[0]] = value
 	}
 
-	cfd := syscall.Stdout
-	var oldttystate *terminal.State
-	interactive := terminal.IsTerminal(cfd)
+	cfd := int(syscall.Stdin)
+
+	var interactive bool
+	if c.modeFlag == "interactive" {
+		interactive = true
+	} else if c.modeFlag == "non-interactive" {
+		interactive = false
+	} else {
+		interactive = termios.IsTerminal(cfd) && termios.IsTerminal(int(syscall.Stdout))
+	}
+
+	var oldttystate *termios.State
 	if interactive {
-		oldttystate, err = terminal.MakeRaw(cfd)
+		oldttystate, err = termios.MakeRaw(cfd)
 		if err != nil {
 			return err
 		}
-		defer terminal.Restore(cfd, oldttystate)
+		defer termios.Restore(cfd, oldttystate)
 	}
 
-	handler := controlSocketHandler
+	handler := c.controlSocketHandler
 	if !interactive {
 		handler = nil
 	}
 
-	ret, err := d.Exec(name, args[1:], env, os.Stdin, os.Stdout, os.Stderr, handler)
+	var width, height int
+	if interactive {
+		width, height, err = termios.GetSize(int(syscall.Stdout))
+		if err != nil {
+			return err
+		}
+	}
+
+	stdout := c.getStdout()
+	ret, err := d.Exec(name, args[1:], env, os.Stdin, stdout, os.Stderr, handler, width, height)
 	if err != nil {
 		return err
 	}
@@ -154,10 +159,9 @@ func (c *execCmd) run(config *lxd.Config, args []string) error {
 		 * Additionally, since os.Exit() exits without running deferred
 		 * functions, we restore the terminal explicitly.
 		 */
-		terminal.Restore(cfd, oldttystate)
+		termios.Restore(cfd, oldttystate)
 	}
 
-	/* we get the result of waitpid() here so we need to transform it */
-	os.Exit(ret >> 8)
-	return fmt.Errorf(gettext.Gettext("unreachable return reached"))
+	os.Exit(ret)
+	return fmt.Errorf(i18n.G("unreachable return reached"))
 }

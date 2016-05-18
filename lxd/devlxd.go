@@ -18,10 +18,6 @@ import (
 	"github.com/lxc/lxd/shared"
 )
 
-func socketPath() string {
-	return shared.VarPath("devlxd")
-}
-
 type devLxdResponse struct {
 	content interface{}
 	code    int
@@ -46,7 +42,7 @@ type devLxdHandler struct {
 
 var configGet = devLxdHandler{"/1.0/config", func(c container, r *http.Request) *devLxdResponse {
 	filtered := []string{}
-	for k, _ := range c.ConfigGet() {
+	for k, _ := range c.ExpandedConfig() {
 		if strings.HasPrefix(k, "user.") {
 			filtered = append(filtered, fmt.Sprintf("/1.0/config/%s", k))
 		}
@@ -60,7 +56,7 @@ var configKeyGet = devLxdHandler{"/1.0/config/{key}", func(c container, r *http.
 		return &devLxdResponse{"not authorized", http.StatusForbidden, "raw"}
 	}
 
-	value, ok := c.ConfigGet()[key]
+	value, ok := c.ExpandedConfig()[key]
 	if !ok {
 		return &devLxdResponse{"not found", http.StatusNotFound, "raw"}
 	}
@@ -69,8 +65,8 @@ var configKeyGet = devLxdHandler{"/1.0/config/{key}", func(c container, r *http.
 }}
 
 var metadataGet = devLxdHandler{"/1.0/meta-data", func(c container, r *http.Request) *devLxdResponse {
-	value := c.ConfigGet()["user.meta-data"]
-	return okResponse(fmt.Sprintf("#cloud-config\ninstance-id: %s\nlocal-hostname: %s\n%s", c.NameGet(), c.NameGet(), value), "raw")
+	value := c.ExpandedConfig()["user.meta-data"]
+	return okResponse(fmt.Sprintf("#cloud-config\ninstance-id: %s\nlocal-hostname: %s\n%s", c.Name(), c.Name(), value), "raw")
 }}
 
 var handlers = []devLxdHandler{
@@ -78,7 +74,7 @@ var handlers = []devLxdHandler{
 		return okResponse([]string{"/1.0"}, "json")
 	}},
 	devLxdHandler{"/1.0", func(c container, r *http.Request) *devLxdResponse {
-		return okResponse(shared.Jmap{"api_compat": 0}, "json")
+		return okResponse(shared.Jmap{"api_version": shared.APIVersion}, "json")
 	}},
 	configGet,
 	configKeyGet,
@@ -89,21 +85,34 @@ var handlers = []devLxdHandler{
 func hoistReq(f func(container, *http.Request) *devLxdResponse, d *Daemon) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn := extractUnderlyingConn(w)
-		pid, ok := pidMapper.m[conn]
+		cred, ok := pidMapper.m[conn]
 		if !ok {
 			http.Error(w, pidNotInContainerErr.Error(), 500)
 			return
 		}
 
-		c, err := findContainerForPid(pid, d)
+		c, err := findContainerForPid(cred.pid, d)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
 
+		// Access control
+		rootUid := int64(0)
+
+		idmapset, err := c.LastIdmapSet()
+		if err == nil && idmapset != nil {
+			uid, _ := idmapset.ShiftIntoNs(0, 0)
+			rootUid = int64(uid)
+		}
+
+		if rootUid != cred.uid {
+			http.Error(w, "Access denied for non-root user", 401)
+			return
+		}
+
 		resp := f(c, r)
 		if resp.code != http.StatusOK {
-			w.Header().Set("Content-Type", "application/octet-stream")
 			http.Error(w, fmt.Sprintf("%s", resp.content), resp.code)
 		} else if resp.ctype == "json" {
 			w.Header().Set("Content-Type", "application/json")
@@ -116,11 +125,7 @@ func hoistReq(f func(container, *http.Request) *devLxdResponse, d *Daemon) func(
 }
 
 func createAndBindDevLxd() (*net.UnixListener, error) {
-	if err := os.MkdirAll(socketPath(), 0777); err != nil {
-		return nil, err
-	}
-
-	sockFile := path.Join(socketPath(), "sock")
+	sockFile := path.Join(shared.VarPath("devlxd"), "sock")
 
 	/*
 	 * If this socket exists, that means a previous lxd died and didn't
@@ -156,19 +161,14 @@ func createAndBindDevLxd() (*net.UnixListener, error) {
 	return unixl, nil
 }
 
-func setupDevLxdMount(c *containerLXD) error {
-	mtab := fmt.Sprintf("%s dev/lxd none bind,create=dir 0 0", socketPath())
-	return setConfigItem(c, "lxc.mount.entry", mtab)
-}
-
-func devLxdServer(d *Daemon) http.Server {
+func devLxdServer(d *Daemon) *http.Server {
 	m := mux.NewRouter()
 
 	for _, handler := range handlers {
 		m.HandleFunc(handler.path, hoistReq(handler.f, d))
 	}
 
-	return http.Server{
+	return &http.Server{
 		Handler:   m,
 		ConnState: pidMapper.ConnStateHandler,
 	}
@@ -199,21 +199,27 @@ func devLxdServer(d *Daemon) http.Server {
  * from our http handlers, since there appears to be no way to pass information
  * around here.
  */
-var pidMapper = ConnPidMapper{m: map[*net.UnixConn]int32{}}
+var pidMapper = ConnPidMapper{m: map[*net.UnixConn]*ucred{}}
+
+type ucred struct {
+	pid int32
+	uid int64
+	gid int64
+}
 
 type ConnPidMapper struct {
-	m map[*net.UnixConn]int32
+	m map[*net.UnixConn]*ucred
 }
 
 func (m *ConnPidMapper) ConnStateHandler(conn net.Conn, state http.ConnState) {
 	unixConn := conn.(*net.UnixConn)
 	switch state {
 	case http.StateNew:
-		pid, err := getPid(unixConn)
+		cred, err := getCred(unixConn)
 		if err != nil {
-			shared.Debugf("Error getting pid for conn %s", err)
+			shared.Debugf("Error getting ucred for conn %s", err)
 		} else {
-			m.m[unixConn] = pid
+			m.m[unixConn] = cred
 		}
 	case http.StateActive:
 		return
@@ -248,15 +254,15 @@ func extractUnderlyingFd(unixConnPtr *net.UnixConn) int {
 	return int(fd.Int())
 }
 
-func getPid(conn *net.UnixConn) (int32, error) {
+func getCred(conn *net.UnixConn) (*ucred, error) {
 	fd := extractUnderlyingFd(conn)
 
-	_, _, pid, err := getUcred(fd)
+	uid, gid, pid, err := getUcred(fd)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	return pid, nil
+	return &ucred{pid, int64(uid), int64(gid)}, nil
 }
 
 /*
@@ -311,9 +317,9 @@ func findContainerForPid(pid int32, d *Daemon) (container, error) {
 		if strings.HasPrefix(string(cmdline), "[lxc monitor]") {
 			// container names can't have spaces
 			parts := strings.Split(string(cmdline), " ")
-			name := parts[len(parts)-1]
+			name := strings.TrimSuffix(parts[len(parts)-1], "\x00")
 
-			return containerLXDLoad(d, name)
+			return containerLoadByName(d, name)
 		}
 
 		status, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
@@ -347,12 +353,16 @@ func findContainerForPid(pid int32, d *Daemon) (container, error) {
 	}
 
 	for _, container := range containers {
-		c, err := containerLXDLoad(d, container)
+		c, err := containerLoadByName(d, container)
 		if err != nil {
 			return nil, err
 		}
 
-		initpid := c.InitPidGet()
+		if !c.IsRunning() {
+			continue
+		}
+
+		initpid := c.InitPID()
 		pidNs, err := os.Readlink(fmt.Sprintf("/proc/%d/ns/pid", initpid))
 		if err != nil {
 			return nil, err

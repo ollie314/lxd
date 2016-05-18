@@ -1,7 +1,7 @@
 #!/bin/sh
 ensure_removed() {
   bad=0
-  lxc exec foo -- stat /dev/lxdkvm && bad=1
+  lxc exec foo -- stat /dev/ttyS0 && bad=1
   if [ "${bad}" -eq 1 ]; then
     echo "device should have been removed; $*"
     false
@@ -10,13 +10,13 @@ ensure_removed() {
 
 dounixdevtest() {
     lxc start foo
-    lxc config device add foo kvm unix-char "$@"
-    lxc exec foo -- stat /dev/lxdkvm
+    lxc config device add foo tty unix-char "$@"
+    lxc exec foo -- stat /dev/ttyS0
     lxc exec foo reboot
-    lxc exec foo -- stat /dev/lxdkvm
+    lxc exec foo -- stat /dev/ttyS0
     lxc restart foo --force
-    lxc exec foo -- stat /dev/lxdkvm
-    lxc config device remove foo kvm
+    lxc exec foo -- stat /dev/ttyS0
+    lxc config device remove foo tty
     ensure_removed "was not hot-removed"
     lxc exec foo reboot
     ensure_removed "removed device re-appeared after container reboot"
@@ -26,14 +26,11 @@ dounixdevtest() {
 }
 
 testunixdevs() {
-  rm -rf /dev/lxdkvm || true
-  if mknod /dev/lxdkvm c 10 232; then
-    echo "Testing /dev/lxdkvm"
-    dounixdevtest path=/dev/lxdkvm
-    rm -f /dev/lxdkvm
-  fi
-  echo "Testing /dev/lxdkvm 10 232"
-  dounixdevtest path=/dev/lxdkvm major=10 minor=232
+  echo "Testing passing char device /dev/ttyS0"
+  dounixdevtest path=/dev/ttyS0
+
+  echo "Testing passing char device 4 64"
+  dounixdevtest path=/dev/ttyS0 major=4 minor=64
 }
 
 ensure_fs_unmounted() {
@@ -46,18 +43,23 @@ ensure_fs_unmounted() {
 }
 
 testloopmounts() {
-  lpath=$(losetup -f) || { echo "no loop support"; return; }
-  echo "${lpath}" >> "${TEST_DIR}/loops"
-  loop=$(basename "${lpath}")
   loopfile=$(mktemp -p "${TEST_DIR}" loop_XXX)
   dd if=/dev/zero of="${loopfile}" bs=1M seek=200 count=1
   mkfs.ext4 -F "${loopfile}"
-  losetup "${loop}" "${loopfile}" || { echo "no loop support"; return; }
-  mount "${lpath}" /mnt || { echo "loop mount failed"; return; }
-  touch /mnt/hello
-  umount /mnt
+
+  lpath=$(losetup --show -f "${loopfile}")
+  if [ ! -e "${lpath}" ]; then
+    echo "failed to setup loop"
+    false
+  fi
+  echo "${lpath}" >> "${TEST_DIR}/loops"
+
+  mkdir -p "${TEST_DIR}/mnt"
+  mount "${lpath}" "${TEST_DIR}/mnt" || { echo "loop mount failed"; return; }
+  touch "${TEST_DIR}/mnt/hello"
+  umount -l "${TEST_DIR}/mnt"
   lxc start foo
-  lxc config device add foo loop disk source="${lpath}" path=/mnt
+  lxc config device add foo mnt disk source="${lpath}" path=/mnt
   lxc exec foo stat /mnt/hello
   # Note - we need to add a set_running_config_item to lxc
   # or work around its absence somehow.  Once that's done, we
@@ -66,7 +68,7 @@ testloopmounts() {
   #lxc exec foo stat /mnt/hello
   lxc restart foo --force
   lxc exec foo stat /mnt/hello
-  lxc config device remove foo loop
+  lxc config device remove foo mnt
   ensure_fs_unmounted "fs should have been hot-unmounted"
   lxc exec foo reboot
   ensure_fs_unmounted "removed fs re-appeared after reboot"
@@ -74,7 +76,7 @@ testloopmounts() {
   ensure_fs_unmounted "removed fs re-appeared after restart"
   lxc stop foo --force
   losetup -d "${lpath}"
-  sed -i "/${loop}/d" "${TEST_DIR}/loops"
+  sed -i "\|^${lpath}|d" "${TEST_DIR}/loops"
 }
 
 test_config_profiles() {
@@ -99,38 +101,43 @@ test_config_profiles() {
   lxc config show foo | grep BADCONF
   lxc config unset foo user.user_data
 
-  lxc config device add foo home disk source=/mnt path=/mnt readonly=true
+  mkdir -p "${TEST_DIR}/mnt1"
+  lxc config device add foo mnt1 disk source="${TEST_DIR}/mnt1" path=/mnt1 readonly=true
   lxc profile create onenic
-  lxc profile device add onenic eth0 nic nictype=bridged parent=lxcbr0
+  lxc profile device add onenic eth0 nic nictype=bridged parent=lxdbr0
   lxc profile apply foo onenic
   lxc profile create unconfined
   lxc profile set unconfined raw.lxc "lxc.aa_profile=unconfined"
   lxc profile apply foo onenic,unconfined
 
-  lxc config device list foo | grep home
-  lxc config device show foo | grep "/mnt"
+  lxc config device list foo | grep mnt1
+  lxc config device show foo | grep "/mnt1"
   lxc config show foo | grep "onenic" -A1 | grep "unconfined"
   lxc profile list | grep onenic
   lxc profile device list onenic | grep eth0
-  lxc profile device show onenic | grep lxcbr0
+  lxc profile device show onenic | grep lxdbr0
 
   # test live-adding a nic
   lxc start foo
-  lxc config show foo | grep -q "raw.lxc" && false
-  lxc config show foo | grep -v "volatile.eth0.hwaddr" | grep -q "eth0" && false
-  lxc config device add foo eth2 nic nictype=bridged parent=lxcbr0 name=eth10
+  ! lxc config show foo | grep -q "raw.lxc"
+  lxc config show foo --expanded | grep -q "raw.lxc"
+  ! lxc config show foo | grep -v "volatile.eth0" | grep -q "eth0"
+  lxc config show foo --expanded | grep -v "volatile.eth0" | grep -q "eth0"
+  lxc config device add foo eth2 nic nictype=bridged parent=lxdbr0 name=eth10
   lxc exec foo -- /sbin/ifconfig -a | grep eth0
   lxc exec foo -- /sbin/ifconfig -a | grep eth10
   lxc config device list foo | grep eth2
   lxc config device remove foo eth2
 
   # test live-adding a disk
-  lxc config device add foo etc disk source=/etc path=/mnt2 readonly=true
+  mkdir "${TEST_DIR}/mnt2"
+  touch "${TEST_DIR}/mnt2/hosts"
+  lxc config device add foo mnt2 disk source="${TEST_DIR}/mnt2" path=/mnt2 readonly=true
   lxc exec foo -- ls /mnt2/hosts
   lxc stop foo --force
   lxc start foo
   lxc exec foo -- ls /mnt2/hosts
-  lxc config device remove foo etc
+  lxc config device remove foo mnt2
   ! lxc exec foo -- ls /mnt2/hosts
   lxc stop foo --force
   lxc start foo
@@ -149,12 +156,14 @@ test_config_profiles() {
   lxc list user.prop=value | grep foo && bad=1
   if [ "${bad}" -eq 1 ]; then
     echo "property unset failed"
+    false
   fi
 
   bad=0
   lxc config set foo user.prop 2>/dev/null && bad=1
   if [ "${bad}" -eq 1 ]; then
     echo "property set succeded when it shouldn't have"
+    false
   fi
 
   testunixdevs

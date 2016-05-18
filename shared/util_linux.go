@@ -7,10 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"syscall"
 	"unsafe"
-
-	"github.com/chai2010/gettext-go/gettext"
 )
 
 // #cgo LDFLAGS: -lutil -lpthread
@@ -185,7 +184,13 @@ int shiftowner(char *basepath, char *path, int uid, int gid) {
 import "C"
 
 func ShiftOwner(basepath string, path string, uid int, gid int) error {
-	r := C.shiftowner(C.CString(basepath), C.CString(path), C.int(uid), C.int(gid))
+	cbasepath := C.CString(basepath)
+	defer C.free(unsafe.Pointer(cbasepath))
+
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+
+	r := C.shiftowner(cbasepath, cpath, C.int(uid), C.int(gid))
 	if r != 0 {
 		return fmt.Errorf("Failed to change ownership of: %s", path)
 	}
@@ -234,7 +239,7 @@ func GroupName(gid int) (string, error) {
 	bufSize := C.size_t(C.sysconf(C._SC_GETGR_R_SIZE_MAX))
 	buf := C.malloc(bufSize)
 	if buf == nil {
-		return "", fmt.Errorf(gettext.Gettext("allocation failed"))
+		return "", fmt.Errorf("allocation failed")
 	}
 	defer C.free(buf)
 
@@ -248,11 +253,11 @@ func GroupName(gid int) (string, error) {
 		&result)
 
 	if rv != 0 {
-		return "", fmt.Errorf(gettext.Gettext("failed group lookup: %s"), syscall.Errno(rv))
+		return "", fmt.Errorf("failed group lookup: %s", syscall.Errno(rv))
 	}
 
 	if result == nil {
-		return "", fmt.Errorf(gettext.Gettext("unknown group %s"), gid)
+		return "", fmt.Errorf("unknown group %d", gid)
 	}
 
 	return C.GoString(result.gr_name), nil
@@ -266,31 +271,67 @@ func GroupId(name string) (int, error) {
 	bufSize := C.size_t(C.sysconf(C._SC_GETGR_R_SIZE_MAX))
 	buf := C.malloc(bufSize)
 	if buf == nil {
-		return -1, fmt.Errorf(gettext.Gettext("allocation failed"))
+		return -1, fmt.Errorf("allocation failed")
 	}
 	defer C.free(buf)
 
 	// mygetgrgid_r is a wrapper around getgrgid_r to
 	// to avoid using gid_t because C.gid_t(gid) for
 	// unknown reasons doesn't work on linux.
-	rv := C.getgrnam_r(C.CString(name),
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+
+	rv := C.getgrnam_r(cname,
 		&grp,
 		(*C.char)(buf),
 		bufSize,
 		&result)
 
 	if rv != 0 {
-		return -1, fmt.Errorf(gettext.Gettext("failed group lookup: %s"), syscall.Errno(rv))
+		return -1, fmt.Errorf("failed group lookup: %s", syscall.Errno(rv))
 	}
 
 	if result == nil {
-		return -1, fmt.Errorf(gettext.Gettext("unknown group %s"), name)
+		return -1, fmt.Errorf("unknown group %s", name)
 	}
 
 	return int(C.int(result.gr_gid)), nil
 }
 
+// --- pure Go functions ---
+
+func GetFileStat(p string) (uid int, gid int, major int, minor int,
+	inode uint64, nlink int, err error) {
+	var stat syscall.Stat_t
+	err = syscall.Lstat(p, &stat)
+	if err != nil {
+		return
+	}
+	uid = int(stat.Uid)
+	gid = int(stat.Gid)
+	inode = uint64(stat.Ino)
+	nlink = int(stat.Nlink)
+	major = -1
+	minor = -1
+	if stat.Mode&syscall.S_IFBLK != 0 || stat.Mode&syscall.S_IFCHR != 0 {
+		major = int(stat.Rdev / 256)
+		minor = int(stat.Rdev % 256)
+	}
+
+	return
+}
+
 func IsMountPoint(name string) bool {
+	_, err := exec.LookPath("mountpoint")
+	if err == nil {
+		err = exec.Command("mountpoint", "-q", name).Run()
+		if err != nil {
+			return false
+		}
+
+		return true
+	}
+
 	stat, err := os.Stat(name)
 	if err != nil {
 		return false

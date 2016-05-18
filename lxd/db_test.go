@@ -4,8 +4,10 @@ import (
 	"database/sql"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/logging"
 )
 
 const DB_FIXTURES string = `
@@ -20,18 +22,22 @@ const DB_FIXTURES string = `
     INSERT INTO images_properties (image_id, type, key, value) VALUES (1, 0, 'thekey', 'some value');
     INSERT INTO profiles_config (profile_id, key, value) VALUES (3, 'thekey', 'thevalue');
     INSERT INTO profiles_devices (profile_id, name, type) VALUES (3, 'devicename', 1);
-    INSERT INTO profiles_devices_config (profile_device_id, key, value) VALUES (2, 'devicekey', 'devicevalue');
+    INSERT INTO profiles_devices_config (profile_device_id, key, value) VALUES (4, 'devicekey', 'devicevalue');
     `
 
 //  This Helper will initialize a test in-memory DB.
 func createTestDb(t *testing.T) (db *sql.DB) {
 	// Setup logging if main() hasn't been called/when testing
 	if shared.Log == nil {
-		shared.SetLogger("", "", true, true)
+		var err error
+		shared.Log, err = logging.GetLogger("", "", true, true, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	var err error
-	d := &Daemon{IsMock: true}
+	d := &Daemon{MockMode: true}
 	err = initializeDbObject(d, ":memory:")
 	db = d.db
 
@@ -141,7 +147,7 @@ func Test_deleting_a_profile_cascades_on_related_tables(t *testing.T) {
 	}
 
 	// Make sure there are 0 profiles_devices_config entries left.
-	statements = `SELECT count(*) FROM profiles_devices_config WHERE profile_device_id == 3;`
+	statements = `SELECT count(*) FROM profiles_devices_config WHERE profile_device_id == 4;`
 	err = db.QueryRow(statements).Scan(&count)
 
 	if count != 0 {
@@ -189,7 +195,7 @@ func Test_initializing_db_is_indempotent(t *testing.T) {
 	var err error
 
 	// This calls "createDb" once already.
-	d := &Daemon{IsMock: true}
+	d := &Daemon{MockMode: true}
 	err = initializeDbObject(d, ":memory:")
 	db = d.db
 
@@ -224,7 +230,7 @@ func Test_running_dbUpdateFromV6_adds_on_delete_cascade(t *testing.T) {
 	var err error
 	var count int
 
-	d := &Daemon{IsMock: true}
+	d := &Daemon{MockMode: true}
 	err = initializeDbObject(d, ":memory:")
 	defer d.db.Close()
 
@@ -366,10 +372,11 @@ INSERT INTO containers_config (container_id, key, value) VALUES (1, 'thekey', 't
 
 	// The "foreign key" on containers_config now points to nothing.
 	// Let's run the schema upgrades.
-	d := &Daemon{IsMock: true}
+	d := &Daemon{MockMode: true}
 	d.db = db
-	err = dbUpdate(d, 1)
+	daemonConfigInit(db)
 
+	err = dbUpdate(d, 1)
 	if err != nil {
 		t.Error("Error upgrading database schema!")
 		t.Fatal(err)
@@ -393,12 +400,12 @@ INSERT INTO containers_config (container_id, key, value) VALUES (1, 'thekey', 't
 func Test_dbImageGet_finds_image_for_fingerprint(t *testing.T) {
 	var db *sql.DB
 	var err error
-	var result *shared.ImageBaseInfo
+	var result *shared.ImageInfo
 
 	db = createTestDb(t)
 	defer db.Close()
 
-	result, err = dbImageGet(db, "fingerprint", false, false)
+	_, result, err = dbImageGet(db, "fingerprint", false, false)
 
 	if err != nil {
 		t.Fatal(err)
@@ -412,16 +419,16 @@ func Test_dbImageGet_finds_image_for_fingerprint(t *testing.T) {
 		t.Fatal("Filename should be set.")
 	}
 
-	if result.CreationDate != 1431547174 {
-		t.Fatal(result.CreationDate)
+	if result.CreationDate.UTC() != time.Unix(1431547174, 0).UTC() {
+		t.Fatal(fmt.Sprintf("%s != %s", result.CreationDate, time.Unix(1431547174, 0)))
 	}
 
-	if result.ExpiryDate != 1431547175 { // It was short lived
-		t.Fatal(result.ExpiryDate)
+	if result.ExpiryDate.UTC() != time.Unix(1431547175, 0).UTC() { // It was short lived
+		t.Fatal(fmt.Sprintf("%s != %s", result.ExpiryDate, time.Unix(1431547175, 0)))
 	}
 
-	if result.UploadDate != 1431547176 {
-		t.Fatal(result.UploadDate)
+	if result.UploadDate.UTC() != time.Unix(1431547176, 0).UTC() {
+		t.Fatal(fmt.Sprintf("%s != %s", result.UploadDate, time.Unix(1431547176, 0)))
 	}
 }
 
@@ -432,7 +439,7 @@ func Test_dbImageGet_for_missing_fingerprint(t *testing.T) {
 	db = createTestDb(t)
 	defer db.Close()
 
-	_, err = dbImageGet(db, "unknown", false, false)
+	_, _, err = dbImageGet(db, "unknown", false, false)
 
 	if err != sql.ErrNoRows {
 		t.Fatal("Wrong err type returned")
@@ -447,7 +454,8 @@ func Test_dbImageAliasGet_alias_exists(t *testing.T) {
 	db = createTestDb(t)
 	defer db.Close()
 
-	result, err = dbImageAliasGet(db, "somealias")
+	_, alias, err := dbImageAliasGet(db, "somealias", true)
+	result = alias.Target
 
 	if err != nil {
 		t.Fatal(err)
@@ -466,12 +474,11 @@ func Test_dbImageAliasGet_alias_does_not_exists(t *testing.T) {
 	db = createTestDb(t)
 	defer db.Close()
 
-	_, err = dbImageAliasGet(db, "whatever")
+	_, _, err = dbImageAliasGet(db, "whatever", true)
 
 	if err != NoSuchObjectError {
 		t.Fatal("Error should be NoSuchObjectError")
 	}
-
 }
 
 func Test_dbImageAliasAdd(t *testing.T) {
@@ -487,17 +494,18 @@ func Test_dbImageAliasAdd(t *testing.T) {
 		t.Fatal("Error inserting Image alias.")
 	}
 
-	result, err = dbImageAliasGet(db, "Chaosphere")
+	_, alias, err := dbImageAliasGet(db, "Chaosphere", true)
 	if err != nil {
 		t.Fatal(err)
 	}
+	result = alias.Target
 
 	if result != "fingerprint" {
 		t.Fatal("Couldn't retrieve newly created alias.")
 	}
 }
 
-func Test_dbContainerConfigGet(t *testing.T) {
+func Test_dbContainerConfig(t *testing.T) {
 	var db *sql.DB
 	var err error
 	var result map[string]string
@@ -508,7 +516,7 @@ func Test_dbContainerConfigGet(t *testing.T) {
 
 	_, err = db.Exec("INSERT INTO containers_config (container_id, key, value) VALUES (1, 'something', 'something else');")
 
-	result, err = dbContainerConfigGet(db, 1)
+	result, err = dbContainerConfig(db, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -522,7 +530,7 @@ func Test_dbContainerConfigGet(t *testing.T) {
 	}
 }
 
-func Test_dbProfileConfigGet(t *testing.T) {
+func Test_dbProfileConfig(t *testing.T) {
 	var db *sql.DB
 	var err error
 	var result map[string]string
@@ -533,7 +541,7 @@ func Test_dbProfileConfigGet(t *testing.T) {
 
 	_, err = db.Exec("INSERT INTO profiles_config (profile_id, key, value) VALUES (3, 'something', 'something else');")
 
-	result, err = dbProfileConfigGet(db, "theprofile")
+	result, err = dbProfileConfig(db, "theprofile")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,7 +555,7 @@ func Test_dbProfileConfigGet(t *testing.T) {
 	}
 }
 
-func Test_dbContainerProfilesGet(t *testing.T) {
+func Test_dbContainerProfiles(t *testing.T) {
 	var db *sql.DB
 	var err error
 	var result []string
@@ -557,7 +565,7 @@ func Test_dbContainerProfilesGet(t *testing.T) {
 	defer db.Close()
 
 	expected = []string{"theprofile"}
-	result, err = dbContainerProfilesGet(db, 1)
+	result, err = dbContainerProfiles(db, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -569,7 +577,7 @@ func Test_dbContainerProfilesGet(t *testing.T) {
 	}
 }
 
-func Test_dbDevicesGet_profiles(t *testing.T) {
+func Test_dbDevices_profiles(t *testing.T) {
 	var db *sql.DB
 	var err error
 	var result shared.Devices
@@ -579,7 +587,7 @@ func Test_dbDevicesGet_profiles(t *testing.T) {
 	db = createTestDb(t)
 	defer db.Close()
 
-	result, err = dbDevicesGet(db, "theprofile", true)
+	result, err = dbDevices(db, "theprofile", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,7 +603,7 @@ func Test_dbDevicesGet_profiles(t *testing.T) {
 
 }
 
-func Test_dbDevicesGet_containers(t *testing.T) {
+func Test_dbDevices_containers(t *testing.T) {
 	var db *sql.DB
 	var err error
 	var result shared.Devices
@@ -605,7 +613,7 @@ func Test_dbDevicesGet_containers(t *testing.T) {
 	db = createTestDb(t)
 	defer db.Close()
 
-	result, err = dbDevicesGet(db, "thename", false)
+	result, err = dbDevices(db, "thename", false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -5,20 +5,21 @@ import (
 )
 
 func (suite *lxdTestSuite) TestContainer_ProfilesDefault() {
-	args := containerLXDArgs{
+	args := containerArgs{
 		Ctype:     cTypeRegular,
 		Ephemeral: false,
+		Name:      "testFoo",
 	}
 
-	c, err := containerLXDCreateInternal(suite.d, "testFoo", args)
+	c, err := containerCreateInternal(suite.d, args)
 	suite.Req.Nil(err)
 	defer c.Delete()
 
-	profiles := c.ProfilesGet()
+	profiles := c.Profiles()
 	suite.Len(
 		profiles,
 		1,
-		"No default profile created on containerLXDCreateInternal.")
+		"No default profile created on containerCreateInternal.")
 
 	suite.Equal(
 		"default",
@@ -31,6 +32,7 @@ func (suite *lxdTestSuite) TestContainer_ProfilesMulti() {
 	_, err := dbProfileCreate(
 		suite.d.db,
 		"unprivileged",
+		"unprivileged",
 		map[string]string{"security.privileged": "true"},
 		shared.Devices{})
 
@@ -39,21 +41,22 @@ func (suite *lxdTestSuite) TestContainer_ProfilesMulti() {
 		dbProfileDelete(suite.d.db, "unprivileged")
 	}()
 
-	args := containerLXDArgs{
+	args := containerArgs{
 		Ctype:     cTypeRegular,
 		Ephemeral: false,
 		Profiles:  []string{"default", "unprivileged"},
+		Name:      "testFoo",
 	}
 
-	c, err := containerLXDCreateInternal(suite.d, "testFoo", args)
+	c, err := containerCreateInternal(suite.d, args)
 	suite.Req.Nil(err)
 	defer c.Delete()
 
-	profiles := c.ProfilesGet()
+	profiles := c.Profiles()
 	suite.Len(
 		profiles,
 		2,
-		"Didn't get both profiles in containerLXDCreateInternal.")
+		"Didn't get both profiles in containerCreateInternal.")
 
 	suite.True(
 		c.IsPrivileged(),
@@ -61,7 +64,7 @@ func (suite *lxdTestSuite) TestContainer_ProfilesMulti() {
 }
 
 func (suite *lxdTestSuite) TestContainer_ProfilesOverwriteDefaultNic() {
-	args := containerLXDArgs{
+	args := containerArgs{
 		Ctype:     cTypeRegular,
 		Ephemeral: false,
 		Config:    map[string]string{"security.privileged": "true"},
@@ -70,15 +73,18 @@ func (suite *lxdTestSuite) TestContainer_ProfilesOverwriteDefaultNic() {
 				"type":    "nic",
 				"nictype": "bridged",
 				"parent":  "unknownbr0"}},
+		Name: "testFoo",
 	}
 
-	c, err := containerLXDCreateInternal(suite.d, "testFoo", args)
+	c, err := containerCreateInternal(suite.d, args)
 	suite.Req.Nil(err)
 
 	suite.True(c.IsPrivileged(), "This container should be privileged.")
 
-	state, err := c.RenderState()
+	out, err := c.Render()
 	suite.Req.Nil(err)
+
+	state := out.(*shared.ContainerInfo)
 	defer c.Delete()
 
 	suite.Equal(
@@ -88,7 +94,7 @@ func (suite *lxdTestSuite) TestContainer_ProfilesOverwriteDefaultNic() {
 }
 
 func (suite *lxdTestSuite) TestContainer_LoadFromDB() {
-	args := containerLXDArgs{
+	args := containerArgs{
 		Ctype:     cTypeRegular,
 		Ephemeral: false,
 		Config:    map[string]string{"security.privileged": "true"},
@@ -97,76 +103,86 @@ func (suite *lxdTestSuite) TestContainer_LoadFromDB() {
 				"type":    "nic",
 				"nictype": "bridged",
 				"parent":  "unknownbr0"}},
+		Name: "testFoo",
 	}
 
-	c, err := containerLXDCreateInternal(suite.d, "testFoo", args)
+	// Create the container
+	c, err := containerCreateInternal(suite.d, args)
 	suite.Req.Nil(err)
 	defer c.Delete()
 
-	c2, err := containerLXDLoad(suite.d, "testFoo")
+	// Load the container and trigger initLXC()
+	c2, err := containerLoadByName(suite.d, "testFoo")
+	c2.IsRunning()
+	suite.Req.Nil(err)
+
 	suite.Exactly(
 		c,
 		c2,
 		"The loaded container isn't excactly the same as the created one.")
 }
 
-func (suite *lxdTestSuite) TestContainer_PathGet_Regular() {
+func (suite *lxdTestSuite) TestContainer_Path_Regular() {
 	// Regular
-	args := containerLXDArgs{
+	args := containerArgs{
 		Ctype:     cTypeRegular,
 		Ephemeral: false,
+		Name:      "testFoo",
 	}
 
-	c, err := containerLXDCreateInternal(suite.d, "testFoo", args)
+	c, err := containerCreateInternal(suite.d, args)
 	suite.Req.Nil(err)
 	defer c.Delete()
 
 	suite.Req.False(c.IsSnapshot(), "Shouldn't be a snapshot.")
-	suite.Req.Equal(shared.VarPath("containers", "testFoo"), c.PathGet(""))
-	suite.Req.Equal(shared.VarPath("containers", "testFoo2"), c.PathGet("testFoo2"))
+	suite.Req.Equal(shared.VarPath("containers", "testFoo"), c.Path())
+	suite.Req.Equal(shared.VarPath("containers", "testFoo2"), containerPath("testFoo2", false))
 }
 
-func (suite *lxdTestSuite) TestContainer_PathGet_Snapshot() {
+func (suite *lxdTestSuite) TestContainer_Path_Snapshot() {
 	// Snapshot
-	args := containerLXDArgs{
+	args := containerArgs{
 		Ctype:     cTypeSnapshot,
 		Ephemeral: false,
+		Name:      "test/snap0",
 	}
 
-	c, err := containerLXDCreateInternal(suite.d, "test/snap0", args)
+	c, err := containerCreateInternal(suite.d, args)
 	suite.Req.Nil(err)
 	defer c.Delete()
 
 	suite.Req.True(c.IsSnapshot(), "Should be a snapshot.")
 	suite.Req.Equal(
 		shared.VarPath("snapshots", "test", "snap0"),
-		c.PathGet(""))
+		c.Path())
 	suite.Req.Equal(
 		shared.VarPath("snapshots", "test", "snap1"),
-		c.PathGet("test/snap1"))
+		containerPath("test/snap1", true))
 }
 
-func (suite *lxdTestSuite) TestContainer_LogPathGet() {
-	args := containerLXDArgs{
+func (suite *lxdTestSuite) TestContainer_LogPath() {
+	args := containerArgs{
 		Ctype:     cTypeRegular,
 		Ephemeral: false,
+		Name:      "testFoo",
 	}
 
-	c, err := containerLXDCreateInternal(suite.d, "testFoo", args)
+	c, err := containerCreateInternal(suite.d, args)
 	suite.Req.Nil(err)
 	defer c.Delete()
 
-	suite.Req.Equal(shared.VarPath("logs", "testFoo"), c.LogPathGet())
+	suite.Req.Equal(shared.VarPath("logs", "testFoo"), c.LogPath())
 }
 
 func (suite *lxdTestSuite) TestContainer_IsPrivileged_Privileged() {
-	args := containerLXDArgs{
+	args := containerArgs{
 		Ctype:     cTypeRegular,
 		Ephemeral: false,
 		Config:    map[string]string{"security.privileged": "true"},
+		Name:      "testFoo",
 	}
 
-	c, err := containerLXDCreateInternal(suite.d, "testFoo", args)
+	c, err := containerCreateInternal(suite.d, args)
 	suite.Req.Nil(err)
 	defer c.Delete()
 
@@ -175,13 +191,14 @@ func (suite *lxdTestSuite) TestContainer_IsPrivileged_Privileged() {
 }
 
 func (suite *lxdTestSuite) TestContainer_IsPrivileged_Unprivileged() {
-	args := containerLXDArgs{
+	args := containerArgs{
 		Ctype:     cTypeRegular,
 		Ephemeral: false,
 		Config:    map[string]string{"security.privileged": "false"},
+		Name:      "testFoo",
 	}
 
-	c, err := containerLXDCreateInternal(suite.d, "testFoo", args)
+	c, err := containerCreateInternal(suite.d, args)
 	suite.Req.Nil(err)
 	defer c.Delete()
 
@@ -190,15 +207,16 @@ func (suite *lxdTestSuite) TestContainer_IsPrivileged_Unprivileged() {
 }
 
 func (suite *lxdTestSuite) TestContainer_Rename() {
-	args := containerLXDArgs{
+	args := containerArgs{
 		Ctype:     cTypeRegular,
 		Ephemeral: false,
+		Name:      "testFoo",
 	}
 
-	c, err := containerLXDCreateInternal(suite.d, "testFoo", args)
+	c, err := containerCreateInternal(suite.d, args)
 	suite.Req.Nil(err)
 	defer c.Delete()
 
 	suite.Req.Nil(c.Rename("testFoo2"), "Failed to rename the container.")
-	suite.Req.Equal(shared.VarPath("containers", "testFoo2"), c.PathGet(""))
+	suite.Req.Equal(shared.VarPath("containers", "testFoo2"), c.Path())
 }

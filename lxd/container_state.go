@@ -7,12 +7,20 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+
 	"github.com/lxc/lxd/shared"
 )
 
-func containerStateGet(d *Daemon, r *http.Request) Response {
+type containerStatePutReq struct {
+	Action   string `json:"action"`
+	Timeout  int    `json:"timeout"`
+	Force    bool   `json:"force"`
+	Stateful bool   `json:"stateful"`
+}
+
+func containerState(d *Daemon, r *http.Request) Response {
 	name := mux.Vars(r)["name"]
-	c, err := containerLXDLoad(d, name)
+	c, err := containerLoadByName(d, name)
 	if err != nil {
 		return SmartError(err)
 	}
@@ -22,7 +30,7 @@ func containerStateGet(d *Daemon, r *http.Request) Response {
 		return InternalError(err)
 	}
 
-	return SyncResponse(true, state.Status)
+	return SyncResponse(true, state)
 }
 
 func containerStatePut(d *Daemon, r *http.Request) Response {
@@ -38,59 +46,99 @@ func containerStatePut(d *Daemon, r *http.Request) Response {
 		return BadRequest(err)
 	}
 
-	c, err := containerLXDLoad(d, name)
+	// Don't mess with containers while in setup mode
+	<-d.readyChan
+
+	c, err := containerLoadByName(d, name)
 	if err != nil {
 		return SmartError(err)
 	}
 
-	var do func() error
+	var do func(*operation) error
 	switch shared.ContainerAction(raw.Action) {
 	case shared.Start:
-		do = func() error {
-			if err = c.Start(); err != nil {
+		do = func(op *operation) error {
+			if err = c.Start(raw.Stateful); err != nil {
 				return err
 			}
 			return nil
 		}
 	case shared.Stop:
-		if raw.Timeout == 0 || raw.Force {
-			do = func() error {
-				if err = c.Stop(); err != nil {
+		if raw.Stateful {
+			do = func(op *operation) error {
+				err := c.Stop(raw.Stateful)
+				if err != nil {
 					return err
 				}
+
+				return nil
+			}
+		} else if raw.Timeout == 0 || raw.Force {
+			do = func(op *operation) error {
+				err = c.Stop(false)
+				if err != nil {
+					return err
+				}
+
+				if c.IsEphemeral() {
+					c.Delete()
+				}
+
 				return nil
 			}
 		} else {
-			do = func() error {
-				if err = c.Shutdown(time.Duration(raw.Timeout) * time.Second); err != nil {
+			do = func(op *operation) error {
+				err = c.Shutdown(time.Duration(raw.Timeout) * time.Second)
+				if err != nil {
 					return err
 				}
+
+				if c.IsEphemeral() {
+					c.Delete()
+				}
+
 				return nil
 			}
 		}
 	case shared.Restart:
-		do = func() error {
+		do = func(op *operation) error {
 			if raw.Timeout == 0 || raw.Force {
-				if err = c.Stop(); err != nil {
+				err = c.Stop(false)
+				if err != nil {
 					return err
 				}
 			} else {
-				if err = c.Shutdown(time.Duration(raw.Timeout) * time.Second); err != nil {
+				err = c.Shutdown(time.Duration(raw.Timeout) * time.Second)
+				if err != nil {
 					return err
 				}
 			}
-			if err = c.Start(); err != nil {
+			err = c.Start(false)
+			if err != nil {
 				return err
 			}
+
 			return nil
 		}
 	case shared.Freeze:
-		do = c.Freeze
+		do = func(op *operation) error {
+			return c.Freeze()
+		}
 	case shared.Unfreeze:
-		do = c.Unfreeze
+		do = func(op *operation) error {
+			return c.Unfreeze()
+		}
 	default:
 		return BadRequest(fmt.Errorf("unknown action %s", raw.Action))
 	}
 
-	return AsyncResponse(shared.OperationWrap(do), nil)
+	resources := map[string][]string{}
+	resources["containers"] = []string{name}
+
+	op, err := operationCreate(operationClassTask, resources, nil, do, nil, nil)
+	if err != nil {
+		return InternalError(err)
+	}
+
+	return OperationResponse(op)
 }

@@ -149,15 +149,16 @@ def destroy_image(args, lxd):
               "containers before destroying storage.")
         sys.exit()
 
-    pvname = check_output("sudo vgs {} --noheadings -o pv_name"
+    pvname = check_output("vgs {} --noheadings -o pv_name"
                           .format(vgname), shell=True).decode().strip()
     print("Removing volume group {}".format(vgname))
     check_output("vgremove -f {}".format(vgname), shell=True)
     print("Removing physical volume {}".format(pvname))
     check_output("pvremove -y {}".format(pvname), shell=True)
 
-    imgfname = check_output("losetup {} --list --output BACK-FILE --noheadings"
-                            .format(pvname), shell=True).decode().strip()
+    lostr = check_output("losetup -a | grep {}".format(pvname),
+                         shell=True).decode().strip()
+    imgfname = lostr.split('(')[-1].replace(')', '')
     print("Detaching loop device {}".format(pvname))
     check_output("losetup -d {}".format(pvname), shell=True)
     print("Deleting backing file {}".format(imgfname))
@@ -175,7 +176,7 @@ def do_main():
  To de-configure LXD and destroy the LVM volumes and backing file:
     %s --destroy
 """ % (sys.argv[0], sys.argv[0])))
-    parser.add_argument("-s", "--size",
+    parser.add_argument("-s", "--size", default="10G",
                         help=_("Size of backing file to register as LVM PV"))
     parser.add_argument("--destroy", action="store_true", default=False,
                         help=_("Un-configure LXD and delete image file"))
@@ -187,7 +188,13 @@ def do_main():
     try:
         check_output("type vgcreate", shell=True)
     except:
-        sys.exit("lvm2 tools not found. try 'apt-get install lvm2'")
+        sys.exit("lvm2 tools not found. try 'apt-get install lvm2 "
+                 "thin-provisioning-tools'")
+    try:
+        check_output("type thin_check", shell=True)
+    except:
+        sys.exit("lvm thin provisioning tools are required. "
+                 "try 'apt-get install thin-provisioning-tools'")
 
     lxd = connect_to_socket()
 

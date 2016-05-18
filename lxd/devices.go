@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -15,570 +19,803 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/lxc/lxd/shared"
-	"gopkg.in/lxc/go-lxc.v2"
 
 	log "gopkg.in/inconshreveable/log15.v2"
 )
 
-func devGetOptions(d shared.Device) (string, error) {
-	opts := []string{"bind", "create=file"}
-	if d["uid"] != "" {
-		u, err := strconv.Atoi(d["uid"])
-		if err != nil {
-			return "", err
-		}
-		opts = append(opts, fmt.Sprintf("uid=%d", u))
-	}
-	if d["gid"] != "" {
-		g, err := strconv.Atoi(d["gid"])
-		if err != nil {
-			return "", err
-		}
-		opts = append(opts, fmt.Sprintf("gid=%d", g))
-	}
-	if d["mode"] != "" {
-		m, err := devModeOct(d["mode"])
-		if err != nil {
-			return "", err
-		}
-		opts = append(opts, fmt.Sprintf("mode=%0d", m))
-	} else {
-		opts = append(opts, "mode=0660")
-	}
+var deviceSchedRebalance = make(chan []string, 2)
 
-	return strings.Join(opts, ","), nil
+type deviceBlockLimit struct {
+	readBps   int64
+	readIops  int64
+	writeBps  int64
+	writeIops int64
 }
 
-func modeHasRead(mode int) bool {
-	if mode&0444 != 0 {
+type deviceTaskCPU struct {
+	id    int
+	strId string
+	count *int
+}
+type deviceTaskCPUs []deviceTaskCPU
+
+func (c deviceTaskCPUs) Len() int           { return len(c) }
+func (c deviceTaskCPUs) Less(i, j int) bool { return *c[i].count < *c[j].count }
+func (c deviceTaskCPUs) Swap(i, j int)      { c[i], c[j] = c[j], c[i] }
+
+func deviceNetlinkListener() (chan []string, chan []string, error) {
+	NETLINK_KOBJECT_UEVENT := 15
+	UEVENT_BUFFER_SIZE := 2048
+
+	fd, err := syscall.Socket(
+		syscall.AF_NETLINK, syscall.SOCK_RAW,
+		NETLINK_KOBJECT_UEVENT,
+	)
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	nl := syscall.SockaddrNetlink{
+		Family: syscall.AF_NETLINK,
+		Pid:    uint32(os.Getpid()),
+		Groups: 1,
+	}
+
+	err = syscall.Bind(fd, &nl)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	chCPU := make(chan []string, 1)
+	chNetwork := make(chan []string, 0)
+
+	go func(chCPU chan []string, chNetwork chan []string) {
+		b := make([]byte, UEVENT_BUFFER_SIZE*2)
+		for {
+			_, err := syscall.Read(fd, b)
+			if err != nil {
+				continue
+			}
+
+			props := map[string]string{}
+			last := 0
+			for i, e := range b {
+				if i == len(b) || e == 0 {
+					msg := string(b[last+1 : i])
+					last = i
+					if len(msg) == 0 || msg == "\x00" {
+						continue
+					}
+
+					fields := strings.SplitN(msg, "=", 2)
+					if len(fields) != 2 {
+						continue
+					}
+
+					props[fields[0]] = fields[1]
+				}
+			}
+
+			if props["SUBSYSTEM"] == "cpu" {
+				if props["DRIVER"] != "processor" {
+					continue
+				}
+
+				if props["ACTION"] != "offline" && props["ACTION"] != "online" {
+					continue
+				}
+
+				// As CPU re-balancing affects all containers, no need to queue them
+				select {
+				case chCPU <- []string{path.Base(props["DEVPATH"]), props["ACTION"]}:
+				default:
+					// Channel is full, drop the event
+				}
+			}
+
+			if props["SUBSYSTEM"] == "net" {
+				if props["ACTION"] != "add" && props["ACTION"] != "removed" {
+					continue
+				}
+
+				if !shared.PathExists(fmt.Sprintf("/sys/class/net/%s", props["INTERFACE"])) {
+					continue
+				}
+
+				// Network balancing is interface specific, so queue everything
+				chNetwork <- []string{props["INTERFACE"], props["ACTION"]}
+			}
+		}
+	}(chCPU, chNetwork)
+
+	return chCPU, chNetwork, nil
+}
+
+func parseCpuset(cpu string) ([]int, error) {
+	cpus := []int{}
+	chunks := strings.Split(cpu, ",")
+	for _, chunk := range chunks {
+		if strings.Contains(chunk, "-") {
+			// Range
+			fields := strings.SplitN(chunk, "-", 2)
+			if len(fields) != 2 {
+				return nil, fmt.Errorf("Invalid cpuset value: %s", cpu)
+			}
+
+			low, err := strconv.Atoi(fields[0])
+			if err != nil {
+				return nil, fmt.Errorf("Invalid cpuset value: %s", cpu)
+			}
+
+			high, err := strconv.Atoi(fields[1])
+			if err != nil {
+				return nil, fmt.Errorf("Invalid cpuset value: %s", cpu)
+			}
+
+			for i := low; i <= high; i++ {
+				cpus = append(cpus, i)
+			}
+		} else {
+			// Simple entry
+			nr, err := strconv.Atoi(chunk)
+			if err != nil {
+				return nil, fmt.Errorf("Invalid cpuset value: %s", cpu)
+			}
+			cpus = append(cpus, nr)
+		}
+	}
+	return cpus, nil
+}
+
+func deviceTaskBalance(d *Daemon) {
+	min := func(x, y int) int {
+		if x < y {
+			return x
+		}
+		return y
+	}
+
+	// Don't bother running when CGroup support isn't there
+	if !cgCpusetController {
+		return
+	}
+
+	// Get effective cpus list - those are all guaranteed to be online
+	effectiveCpus, err := cGroupGet("cpuset", "/", "cpuset.effective_cpus")
+	if err != nil {
+		// Older kernel - use cpuset.cpus
+		effectiveCpus, err = cGroupGet("cpuset", "/", "cpuset.cpus")
+		if err != nil {
+			shared.Log.Error("Error reading host's cpuset.cpus")
+			return
+		}
+	}
+	err = cGroupSet("cpuset", "/lxc", "cpuset.cpus", effectiveCpus)
+	if err != nil && shared.PathExists("/sys/fs/cgroup/cpuset/lxc") {
+		shared.Log.Warn("Error setting lxd's cpuset.cpus", log.Ctx{"err": err})
+	}
+	cpus, err := parseCpuset(effectiveCpus)
+	if err != nil {
+		shared.Log.Error("Error parsing host's cpu set", log.Ctx{"cpuset": effectiveCpus, "err": err})
+		return
+	}
+
+	// Iterate through the containers
+	containers, err := dbContainersList(d.db, cTypeRegular)
+	fixedContainers := map[int][]container{}
+	balancedContainers := map[container]int{}
+	for _, name := range containers {
+		c, err := containerLoadByName(d, name)
+		if err != nil {
+			continue
+		}
+
+		conf := c.ExpandedConfig()
+		cpulimit, ok := conf["limits.cpu"]
+		if !ok || cpulimit == "" {
+			cpulimit = effectiveCpus
+		}
+
+		if !c.IsRunning() {
+			continue
+		}
+
+		count, err := strconv.Atoi(cpulimit)
+		if err == nil {
+			// Load-balance
+			count = min(count, len(cpus))
+			balancedContainers[c] = count
+		} else {
+			// Pinned
+			containerCpus, err := parseCpuset(cpulimit)
+			if err != nil {
+				return
+			}
+			for _, nr := range containerCpus {
+				if !shared.IntInSlice(nr, cpus) {
+					continue
+				}
+
+				_, ok := fixedContainers[nr]
+				if ok {
+					fixedContainers[nr] = append(fixedContainers[nr], c)
+				} else {
+					fixedContainers[nr] = []container{c}
+				}
+			}
+		}
+	}
+
+	// Balance things
+	pinning := map[container][]string{}
+	usage := map[int]deviceTaskCPU{}
+
+	for _, id := range cpus {
+		cpu := deviceTaskCPU{}
+		cpu.id = id
+		cpu.strId = fmt.Sprintf("%d", id)
+		count := 0
+		cpu.count = &count
+
+		usage[id] = cpu
+	}
+
+	for cpu, ctns := range fixedContainers {
+		c, ok := usage[cpu]
+		if !ok {
+			shared.Log.Error("Internal error: container using unavailable cpu")
+			continue
+		}
+		id := c.strId
+		for _, ctn := range ctns {
+			_, ok := pinning[ctn]
+			if ok {
+				pinning[ctn] = append(pinning[ctn], id)
+			} else {
+				pinning[ctn] = []string{id}
+			}
+			*c.count += 1
+		}
+	}
+
+	sortedUsage := make(deviceTaskCPUs, 0)
+	for _, value := range usage {
+		sortedUsage = append(sortedUsage, value)
+	}
+
+	for ctn, count := range balancedContainers {
+		sort.Sort(sortedUsage)
+		for _, cpu := range sortedUsage {
+			if count == 0 {
+				break
+			}
+			count -= 1
+
+			id := cpu.strId
+			_, ok := pinning[ctn]
+			if ok {
+				pinning[ctn] = append(pinning[ctn], id)
+			} else {
+				pinning[ctn] = []string{id}
+			}
+			*cpu.count += 1
+		}
+	}
+
+	// Set the new pinning
+	for ctn, set := range pinning {
+		// Confirm the container didn't just stop
+		if !ctn.IsRunning() {
+			continue
+		}
+
+		sort.Strings(set)
+		err := ctn.CGroupSet("cpuset.cpus", strings.Join(set, ","))
+		if err != nil {
+			shared.Log.Error("balance: Unable to set cpuset", log.Ctx{"name": ctn.Name(), "err": err, "value": strings.Join(set, ",")})
+		}
+	}
+}
+
+func deviceNetworkPriority(d *Daemon, netif string) {
+	// Don't bother running when CGroup support isn't there
+	if !cgNetPrioController {
+		return
+	}
+
+	containers, err := dbContainersList(d.db, cTypeRegular)
+	if err != nil {
+		return
+	}
+
+	for _, name := range containers {
+		// Get the container struct
+		c, err := containerLoadByName(d, name)
+		if err != nil {
+			continue
+		}
+
+		// Extract the current priority
+		networkPriority := c.ExpandedConfig()["limits.network.priority"]
+		if networkPriority == "" {
+			continue
+		}
+
+		networkInt, err := strconv.Atoi(networkPriority)
+		if err != nil {
+			continue
+		}
+
+		// Set the value for the new interface
+		c.CGroupSet("net_prio.ifpriomap", fmt.Sprintf("%s %d", netif, networkInt))
+	}
+
+	return
+}
+
+func deviceEventListener(d *Daemon) {
+	chNetlinkCPU, chNetlinkNetwork, err := deviceNetlinkListener()
+	if err != nil {
+		shared.Log.Error("scheduler: couldn't setup netlink listener")
+		return
+	}
+
+	for {
+		select {
+		case e := <-chNetlinkCPU:
+			if len(e) != 2 {
+				shared.Log.Error("Scheduler: received an invalid cpu hotplug event")
+				continue
+			}
+
+			if !cgCpusetController {
+				continue
+			}
+
+			shared.Debugf("Scheduler: cpu: %s is now %s: re-balancing", e[0], e[1])
+			deviceTaskBalance(d)
+		case e := <-chNetlinkNetwork:
+			if len(e) != 2 {
+				shared.Log.Error("Scheduler: received an invalid network hotplug event")
+				continue
+			}
+
+			if !cgNetPrioController {
+				continue
+			}
+
+			shared.Debugf("Scheduler: network: %s has been added: updating network priorities", e[0])
+			deviceNetworkPriority(d, e[0])
+		case e := <-deviceSchedRebalance:
+			if len(e) != 3 {
+				shared.Log.Error("Scheduler: received an invalid rebalance event")
+				continue
+			}
+
+			if !cgCpusetController {
+				continue
+			}
+
+			shared.Debugf("Scheduler: %s %s %s: re-balancing", e[0], e[1], e[2])
+			deviceTaskBalance(d)
+		}
+	}
+}
+
+func deviceTaskSchedulerTrigger(srcType string, srcName string, srcStatus string) {
+	// Spawn a go routine which then triggers the scheduler
+	select {
+	case deviceSchedRebalance <- []string{srcType, srcName, srcStatus}:
+	default:
+		// Channel is full, drop the event
+	}
+}
+
+func deviceIsBlockdev(path string) bool {
+	// Get a stat struct from the provided path
+	stat := syscall.Stat_t{}
+	err := syscall.Stat(path, &stat)
+	if err != nil {
+		return false
+	}
+
+	// Check if it's a block device
+	if stat.Mode&syscall.S_IFMT == syscall.S_IFBLK {
 		return true
 	}
+
+	// Not a device
 	return false
 }
 
-func modeHasWrite(mode int) bool {
-	if mode&0222 != 0 {
-		return true
-	}
-	return false
-}
-
-func devModeOct(strmode string) (int, error) {
+func deviceModeOct(strmode string) (int, error) {
+	// Default mode
 	if strmode == "" {
-		return 0660, nil
+		return 0600, nil
 	}
+
+	// Converted mode
 	i, err := strconv.ParseInt(strmode, 8, 32)
 	if err != nil {
 		return 0, fmt.Errorf("Bad device mode: %s", strmode)
 	}
+
 	return int(i), nil
 }
 
-func devModeString(strmode string) (string, error) {
-	i, err := devModeOct(strmode)
-	if err != nil {
-		return "", err
-	}
-	mode := "m"
-	if modeHasRead(i) {
-		mode = mode + "r"
-	}
-	if modeHasWrite(i) {
-		mode = mode + "w"
-	}
-	return mode, nil
-}
-
-func getDev(path string) (int, int, error) {
+func deviceGetAttributes(path string) (string, int, int, error) {
+	// Get a stat struct from the provided path
 	stat := syscall.Stat_t{}
 	err := syscall.Stat(path, &stat)
 	if err != nil {
-		return 0, 0, err
+		return "", 0, 0, err
 	}
+
+	// Check what kind of file it is
+	dType := ""
+	if stat.Mode&syscall.S_IFMT == syscall.S_IFBLK {
+		dType = "b"
+	} else if stat.Mode&syscall.S_IFMT == syscall.S_IFCHR {
+		dType = "c"
+	} else {
+		return "", 0, 0, fmt.Errorf("Not a device")
+	}
+
+	// Return the device information
 	major := int(stat.Rdev / 256)
 	minor := int(stat.Rdev % 256)
-	return major, minor, nil
+	return dType, major, minor, nil
 }
 
-func deviceCgroupInfo(dev shared.Device) (string, error) {
-	var err error
-
-	t := dev["type"]
-	switch t {
-	case "unix-char":
-		t = "c"
-	case "unix-block":
-		t = "b"
-	default: // internal error - look at how we were called
-		return "", fmt.Errorf("BUG: bad device type %s", dev["type"])
-	}
-
-	var major, minor int
-	if dev["major"] == "" && dev["minor"] == "" {
-		devname := dev["path"]
-		if !filepath.IsAbs(devname) {
-			devname = filepath.Join("/", devname)
-		}
-		major, minor, err = getDev(devname)
-		if err != nil {
-			return "", err
-		}
-	} else if dev["major"] != "" && dev["minor"] != "" {
-		major, err = strconv.Atoi(dev["major"])
-		if err != nil {
-			return "", err
-		}
-		minor, err = strconv.Atoi(dev["minor"])
-		if err != nil {
-			return "", err
-		}
-	} else {
-		return "", fmt.Errorf("Both major and minor must be supplied for devices")
-	}
-
-	mode, err := devModeString(dev["mode"])
-	if err != nil {
-		return "", err
-	}
-	devcg := fmt.Sprintf("%s %d:%d %s", t, major, minor, mode)
-	return devcg, nil
-}
-
-/*
- * unixDevCgroup only grabs the cgroup devices.allow statement
- * we need.  We'll add a mount.entry to bind mount the actual
- * device later.
- */
-func unixDevCgroup(dev shared.Device) ([][]string, error) {
-	devcg, err := deviceCgroupInfo(dev)
-	if err != nil {
-		return [][]string{}, err
-	}
-	entry := []string{"lxc.cgroup.devices.allow", devcg}
-	return [][]string{entry}, nil
-}
-
-func deviceToLxc(cntPath string, d shared.Device) ([][]string, error) {
-	switch d["type"] {
-	case "unix-char":
-		return unixDevCgroup(d)
-	case "unix-block":
-		return unixDevCgroup(d)
-
-	case "nic":
-		if d["nictype"] != "bridged" && d["nictype"] != "" {
-			return nil, fmt.Errorf("Bad nic type: %s", d["nictype"])
-		}
-		var l1 = []string{"lxc.network.type", "veth"}
-		var lines = [][]string{l1}
-		var l2 []string
-		if d["hwaddr"] != "" {
-			l2 = []string{"lxc.network.hwaddr", d["hwaddr"]}
-			lines = append(lines, l2)
-		}
-		if d["mtu"] != "" {
-			l2 = []string{"lxc.network.mtu", d["mtu"]}
-			lines = append(lines, l2)
-		}
-		if d["parent"] != "" {
-			l2 = []string{"lxc.network.link", d["parent"]}
-			lines = append(lines, l2)
-		}
-		if d["name"] != "" {
-			l2 = []string{"lxc.network.name", d["name"]}
-			lines = append(lines, l2)
-		}
-		return lines, nil
-	case "disk":
-		var p string
-		configLines := [][]string{}
-		if d["path"] == "/" || d["path"] == "" {
-			p = ""
-		} else if d["path"][0:1] == "/" {
-			p = d["path"][1:]
-		} else {
-			p = d["path"]
-		}
-		source := d["source"]
-		options := []string{}
-		if shared.IsBlockdevPath(d["source"]) {
-			l, err := mountTmpBlockdev(cntPath, d)
+func deviceNextInterfaceHWAddr() (string, error) {
+	// Generate a new random MAC address using the usual prefix
+	ret := bytes.Buffer{}
+	for _, c := range "00:16:3e:xx:xx:xx" {
+		if c == 'x' {
+			c, err := rand.Int(rand.Reader, big.NewInt(16))
 			if err != nil {
-				return nil, fmt.Errorf("Error adding blockdev: %s", err)
+				return "", err
 			}
-			configLines = append(configLines, l)
-			return configLines, nil
-		} else if shared.IsDir(source) {
-			options = append(options, "bind")
-			options = append(options, "create=dir")
-		} else /* file bind mount */ {
-			/* Todo - can we distinguish between file bind mount and
-			 * a qcow2 (or other fs container) file? */
-			options = append(options, "bind")
-			options = append(options, "create=file")
+			ret.WriteString(fmt.Sprintf("%x", c.Int64()))
+		} else {
+			ret.WriteString(string(c))
 		}
-		if d["readonly"] == "1" || d["readonly"] == "true" {
-			options = append(options, "ro")
-		}
-		if d["optional"] == "1" || d["optional"] == "true" {
-			options = append(options, "optional")
-		}
-		opts := strings.Join(options, ",")
-		if opts == "" {
-			opts = "defaults"
-		}
-		l := []string{"lxc.mount.entry", fmt.Sprintf("%s %s %s %s 0 0", source, p, "none", opts)}
-		configLines = append(configLines, l)
-		return configLines, nil
-	case "none":
-		return nil, nil
-	default:
-		return nil, fmt.Errorf("Bad device type")
 	}
+
+	return ret.String(), nil
 }
 
-func dbDeviceTypeToString(t int) (string, error) {
-	switch t {
-	case 0:
-		return "none", nil
-	case 1:
-		return "nic", nil
-	case 2:
-		return "disk", nil
-	case 3:
-		return "unix-char", nil
-	case 4:
-		return "unix-block", nil
-	default:
-		return "", fmt.Errorf("Invalid device type %d", t)
-	}
-}
-
-func deviceTypeToDbType(t string) (int, error) {
-	switch t {
-	case "none":
-		return 0, nil
-	case "nic":
-		return 1, nil
-	case "disk":
-		return 2, nil
-	case "unix-char":
-		return 3, nil
-	case "unix-block":
-		return 4, nil
-	default:
-		return -1, fmt.Errorf("Invalid device type %s", t)
-	}
-}
-
-func validDeviceConfig(t, k, v string) bool {
-	if k == "type" {
-		return false
-	}
-	switch t {
-	case "unix-char":
-		switch k {
-		case "path":
-			return true
-		case "major":
-			return true
-		case "minor":
-			return true
-		case "uid":
-			return true
-		case "gid":
-			return true
-		case "mode":
-			return true
-		default:
-			return false
-		}
-	case "unix-block":
-		switch k {
-		case "path":
-			return true
-		case "major":
-			return true
-		case "minor":
-			return true
-		case "uid":
-			return true
-		case "gid":
-			return true
-		case "mode":
-			return true
-		default:
-			return false
-		}
-	case "nic":
-		switch k {
-		case "parent":
-			return true
-		case "name":
-			return true
-		case "hwaddr":
-			return true
-		case "mtu":
-			return true
-		case "nictype":
-			if v != "bridged" && v != "" {
-				return false
-			}
-			return true
-		default:
-			return false
-		}
-	case "disk":
-		switch k {
-		case "path":
-			return true
-		case "source":
-			return true
-		case "readonly", "optional":
-			return true
-		default:
-			return false
-		}
-	case "none":
-		return false
-	default:
-		return false
-	}
-}
-
-func tempNic() string {
+func deviceNextVeth() string {
+	// Return a new random veth device name
 	randBytes := make([]byte, 4)
 	rand.Read(randBytes)
 	return "veth" + hex.EncodeToString(randBytes)
 }
 
-func inList(l []string, s string) bool {
-	for _, ls := range l {
-		if ls == s {
-			return true
-		}
-	}
-	return false
+func deviceRemoveInterface(nic string) error {
+	return exec.Command("ip", "link", "del", nic).Run()
 }
 
-func nextUnusedNic(c container) string {
-	lxContainer := c.LXContainerGet()
-
-	list, err := lxContainer.Interfaces()
-	if err != nil || len(list) == 0 {
-		return "eth0"
-	}
-	i := 0
-	// is it worth sorting list?
-	for {
-		nic := fmt.Sprintf("eth%d", i)
-		if !inList(list, nic) {
-			return nic
-		}
-		i = i + 1
-	}
-}
-
-func setupNic(tx *sql.Tx, c container, name string, d map[string]string) (string, error) {
-	if d["nictype"] != "bridged" {
-		return "", fmt.Errorf("Unsupported nic type: %s", d["nictype"])
-	}
-	if d["parent"] == "" {
-		return "", fmt.Errorf("No bridge given")
-	}
-	if d["name"] == "" {
-		d["name"] = nextUnusedNic(c)
-	}
-
-	n1 := tempNic()
-	n2 := tempNic()
-
-	err := exec.Command("ip", "link", "add", n1, "type", "veth", "peer", "name", n2).Run()
-	if err != nil {
-		return "", err
-	}
-
-	err = exec.Command("brctl", "addif", d["parent"], n1).Run()
-	if err != nil {
-		removeInterface(n2)
-		return "", err
-	}
-
-	key := fmt.Sprintf("volatile.%s.hwaddr", name)
-	config := c.ConfigGet()
-	hwaddr := config[key]
-
-	if hwaddr == "" {
-		if d["hwaddr"] != "" {
-			hwaddr, err = generateMacAddr(d["hwaddr"])
-			if err != nil {
-				return "", err
-			}
-		} else {
-			hwaddr, err = generateMacAddr("00:16:3e:xx:xx:xx")
-			if err != nil {
-				return "", err
-			}
-		}
-
-		if hwaddr != d["hwaddr"] {
-			stmt := `INSERT OR REPLACE into containers_config (container_id, key, value) VALUES (?, ?, ?)`
-			_, err = tx.Exec(stmt, c.IDGet(), key, hwaddr)
-
-			if err != nil {
-				removeInterface(n2)
-				return "", err
-			}
-		}
-	}
-
-	err = exec.Command("ip", "link", "set", "dev", n2, "address", hwaddr).Run()
-	if err != nil {
-		removeInterface(n2)
-		return "", err
-	}
-
-	return n2, nil
-}
-
-func removeInterface(nic string) {
-	_ = exec.Command("ip", "link", "del", nic).Run()
-}
-
-/*
- * Detach an interface in a container
- * The thing is, there doesn't seem to be a good way of doing
- * this without relying on /sys in the container or /sbin/ip
- * in the container being reliable.  We can look at the
- * /sys/devices/virtual/net/$name/ifindex (i.e. if 7, then delete 8 on host)
- * we can just ip link del $name in the container.
- *
- * if we just did a lxc config device add of this nic, then
- * lxc simply doesn't know the peername for this nic
- *
- * probably the thing to do is re-exec ourselves asking to
- * setns into the container's netns (only) and remove the nic.  for
- * now just don't do it, but don't fail either.
- */
-func detachInterface(c container, key string) error {
-	options := lxc.DefaultAttachOptions
-	options.ClearEnv = false
-	options.Namespaces = syscall.CLONE_NEWNET
-	nullDev, err := os.OpenFile(os.DevNull, os.O_RDWR, 0666)
-	if err != nil {
-		return err
-	}
-	defer nullDev.Close()
-	nullfd := nullDev.Fd()
-	options.StdinFd = nullfd
-	options.StdoutFd = nullfd
-	options.StderrFd = nullfd
-	command := []string{"ip", "link", "del", key}
-	lxContainer := c.LXContainerGet()
-	_, err = lxContainer.RunCommand(command, options)
-	return err
-}
-
-func txUpdateNic(tx *sql.Tx, cId int, devname string, nicname string) error {
-	q := `
-	SELECT id FROM containers_devices
-	WHERE container_id == ? AND type == 1 AND name == ?`
-	var dId int
-	err := tx.QueryRow(q, cId, devname).Scan(&dId)
-	if err != nil {
-		return err
-	}
-
-	stmt := `INSERT OR REPLACE into containers_devices_config (container_device_id, key, value) VALUES (?, ?, ?)`
-	_, err = tx.Exec(stmt, dId, "name", nicname)
-	return err
-}
-
-func (c *containerLXD) DetachUnixDev(dev shared.Device) error {
-	cginfo, err := deviceCgroupInfo(dev)
-	if err != nil {
-		return err
-	}
-	c.c.SetCgroupItem("devices.remove", cginfo)
-	pid := c.c.InitPid()
-	if pid == -1 { // container not running
-		return nil
-	}
-	pidstr := fmt.Sprintf("%d", pid)
-	if err := exec.Command(os.Args[0], "forkumount", pidstr, dev["path"]).Run(); err != nil {
-		shared.Log.Warn("Error unmounting device", log.Ctx{"Error": err})
-		return err
-	}
-	if err := os.Remove(fmt.Sprintf("/proc/%d/root/%s", pid, dev["path"])); err != nil {
-		shared.Log.Warn("Error removing device", log.Ctx{"Error": err})
-		return err
-	}
-
-	return nil
-}
-
-func (c *containerLXD) AttachUnixDev(dev shared.Device) error {
-	return c.setupUnixDev(dev)
-}
-
-/*
- * Given a running container and a list of devices before and after a
- * config change, update the devices in the container.
- *
- * Currently we only support nics.  Disks will be supported once we
- * decide how best to insert them.
- */
-func devicesApplyDeltaLive(tx *sql.Tx, c container, preDevList shared.Devices, postDevList shared.Devices) error {
-	rmList, addList := preDevList.Update(postDevList)
+func deviceMountDisk(srcPath string, dstPath string, readonly bool, recursive bool) error {
 	var err error
 
-	for key, dev := range rmList {
-		switch dev["type"] {
-		case "nic":
-			if dev["name"] == "" {
-				return fmt.Errorf("Do not know a name for the nic for device %s", key)
-			}
-			if err := detachInterface(c, dev["name"]); err != nil {
-				return fmt.Errorf("Error removing device %s (nic %s) from container %s: %s", key, dev["name"], c.NameGet(), err)
-			}
-		case "disk":
-			return c.DetachMount(dev)
-		case "unix-block":
-			return c.DetachUnixDev(dev)
-		case "unix-char":
-			return c.DetachUnixDev(dev)
+	// Prepare the mount flags
+	flags := 0
+	if readonly {
+		flags |= syscall.MS_RDONLY
+	}
+
+	// Detect the filesystem
+	fstype := "none"
+	if deviceIsBlockdev(srcPath) {
+		fstype, err = shared.BlockFsDetect(srcPath)
+		if err != nil {
+			return err
+		}
+	} else {
+		flags |= syscall.MS_BIND
+		if recursive {
+			flags |= syscall.MS_REC
 		}
 	}
 
-	lxContainer := c.LXContainerGet()
+	// Mount the filesystem
+	if err = syscall.Mount(srcPath, dstPath, fstype, uintptr(flags), ""); err != nil {
+		return fmt.Errorf("Unable to mount %s at %s: %s", srcPath, dstPath, err)
+	}
 
-	for key, dev := range addList {
-		switch dev["type"] {
-		case "nic":
-			var tmpName string
-			if tmpName, err = setupNic(tx, c, key, dev); err != nil {
-				return fmt.Errorf("Unable to create nic %s for container %s: %s", dev["name"], c.NameGet(), err)
-			}
-			if err := lxContainer.AttachInterface(tmpName, dev["name"]); err != nil {
-				removeInterface(tmpName)
-				return fmt.Errorf("Unable to move nic %s into container %s as %s: %s", tmpName, c.NameGet(), dev["name"], err)
-			}
-
-			if err := txUpdateNic(tx, c.IDGet(), key, dev["name"]); err != nil {
-				shared.Debugf("Warning: failed to update database entry for new nic %s: %s", key, err)
-				return err
-			}
-		case "disk":
-			if dev["source"] == "" || dev["path"] == "" {
-				return fmt.Errorf("no source or destination given")
-			}
-			return c.AttachMount(dev)
-		case "unix-block":
-			return c.AttachUnixDev(dev)
-		case "unix-char":
-			return c.AttachUnixDev(dev)
-		}
+	flags = syscall.MS_REC | syscall.MS_SLAVE
+	if err = syscall.Mount("", dstPath, "", uintptr(flags), ""); err != nil {
+		return fmt.Errorf("unable to make mount %s private: %s", dstPath, err)
 	}
 
 	return nil
+}
+
+func deviceParseCPU(cpuAllowance string, cpuPriority string) (string, string, string, error) {
+	var err error
+
+	// Parse priority
+	cpuShares := 0
+	cpuPriorityInt := 10
+	if cpuPriority != "" {
+		cpuPriorityInt, err = strconv.Atoi(cpuPriority)
+		if err != nil {
+			return "", "", "", err
+		}
+	}
+	cpuShares -= 10 - cpuPriorityInt
+
+	// Parse allowance
+	cpuCfsQuota := "-1"
+	cpuCfsPeriod := "100000"
+
+	if cpuAllowance != "" {
+		if strings.HasSuffix(cpuAllowance, "%") {
+			// Percentage based allocation
+			percent, err := strconv.Atoi(strings.TrimSuffix(cpuAllowance, "%"))
+			if err != nil {
+				return "", "", "", err
+			}
+
+			cpuShares += (10 * percent) + 24
+		} else {
+			// Time based allocation
+			fields := strings.SplitN(cpuAllowance, "/", 2)
+			if len(fields) != 2 {
+				return "", "", "", fmt.Errorf("Invalid allowance: %s", cpuAllowance)
+			}
+
+			quota, err := strconv.Atoi(strings.TrimSuffix(fields[0], "ms"))
+			if err != nil {
+				return "", "", "", err
+			}
+
+			period, err := strconv.Atoi(strings.TrimSuffix(fields[1], "ms"))
+			if err != nil {
+				return "", "", "", err
+			}
+
+			// Set limit in ms
+			cpuCfsQuota = fmt.Sprintf("%d", quota*1000)
+			cpuCfsPeriod = fmt.Sprintf("%d", period*1000)
+			cpuShares += 1024
+		}
+	} else {
+		// Default is 100%
+		cpuShares += 1024
+	}
+
+	// Deal with a potential negative score
+	if cpuShares < 0 {
+		cpuShares = 0
+	}
+
+	return fmt.Sprintf("%d", cpuShares), cpuCfsQuota, cpuCfsPeriod, nil
+}
+
+func deviceTotalMemory() (int64, error) {
+	// Open /proc/meminfo
+	f, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return -1, err
+	}
+	defer f.Close()
+
+	// Read it line by line
+	scan := bufio.NewScanner(f)
+	for scan.Scan() {
+		line := scan.Text()
+
+		// We only care about MemTotal
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+
+		// Extract the before last (value) and last (unit) fields
+		fields := strings.Split(line, " ")
+		value := fields[len(fields)-2] + fields[len(fields)-1]
+
+		// Feed the result to shared.ParseByteSizeString to get an int value
+		valueBytes, err := shared.ParseByteSizeString(value)
+		if err != nil {
+			return -1, err
+		}
+
+		return valueBytes, nil
+	}
+
+	return -1, fmt.Errorf("Couldn't find MemTotal")
+}
+
+func deviceGetParentBlocks(path string) ([]string, error) {
+	var devices []string
+	var device []string
+
+	// Expand the mount path
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+
+	expPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		expPath = absPath
+	}
+
+	// Find the source mount of the path
+	file, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	match := ""
+	for scanner.Scan() {
+		line := scanner.Text()
+		rows := strings.Fields(line)
+
+		if len(rows[4]) <= len(match) {
+			continue
+		}
+
+		if expPath != rows[4] && !strings.HasPrefix(expPath, rows[4]) {
+			continue
+		}
+
+		match = rows[4]
+
+		// Go backward to avoid problems with optional fields
+		device = []string{rows[2], rows[len(rows)-2]}
+	}
+
+	if device == nil {
+		return nil, fmt.Errorf("Couldn't find a match /proc/self/mountinfo entry")
+	}
+
+	// Handle the most simple case
+	if !strings.HasPrefix(device[0], "0:") {
+		return []string{device[0]}, nil
+	}
+
+	// Deal with per-filesystem oddities. We don't care about failures here
+	// because any non-special filesystem => directory backend.
+	fs, _ := filesystemDetect(expPath)
+
+	if fs == "zfs" && shared.PathExists("/dev/zfs") {
+		// Accessible zfs filesystems
+		poolName := strings.Split(device[1], "/")[0]
+
+		output, err := exec.Command("zpool", "status", poolName).CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("Failed to query zfs filesystem information for %s: %s", device[1], output)
+		}
+
+		header := true
+		for _, line := range strings.Split(string(output), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 5 {
+				continue
+			}
+
+			if fields[1] != "ONLINE" {
+				continue
+			}
+
+			if header {
+				header = false
+				continue
+			}
+
+			var path string
+			if shared.PathExists(fields[0]) {
+				if shared.IsBlockdevPath(fields[0]) {
+					path = fields[0]
+				} else {
+					subDevices, err := deviceGetParentBlocks(fields[0])
+					if err != nil {
+						return nil, err
+					}
+
+					for _, dev := range subDevices {
+						devices = append(devices, dev)
+					}
+				}
+			} else if shared.PathExists(fmt.Sprintf("/dev/%s", fields[0])) {
+				path = fmt.Sprintf("/dev/%s", fields[0])
+			} else if shared.PathExists(fmt.Sprintf("/dev/disk/by-id/%s", fields[0])) {
+				path = fmt.Sprintf("/dev/disk/by-id/%s", fields[0])
+			} else if shared.PathExists(fmt.Sprintf("/dev/mapper/%s", fields[0])) {
+				path = fmt.Sprintf("/dev/mapper/%s", fields[0])
+			} else {
+				continue
+			}
+
+			if path != "" {
+				_, major, minor, err := deviceGetAttributes(path)
+				if err != nil {
+					continue
+				}
+
+				devices = append(devices, fmt.Sprintf("%d:%d", major, minor))
+			}
+		}
+
+		if len(devices) == 0 {
+			return nil, fmt.Errorf("Unable to find backing block for zfs pool: %s", poolName)
+		}
+	} else if fs == "btrfs" && shared.PathExists(device[1]) {
+		// Accessible btrfs filesystems
+		output, err := exec.Command("btrfs", "filesystem", "show", device[1]).CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("Failed to query btrfs filesystem information for %s: %s", device[1], output)
+		}
+
+		for _, line := range strings.Split(string(output), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) == 0 || fields[0] != "devid" {
+				continue
+			}
+
+			_, major, minor, err := deviceGetAttributes(fields[len(fields)-1])
+			if err != nil {
+				return nil, err
+			}
+
+			devices = append(devices, fmt.Sprintf("%d:%d", major, minor))
+		}
+	} else if shared.PathExists(device[1]) {
+		// Anything else with a valid path
+		_, major, minor, err := deviceGetAttributes(device[1])
+		if err != nil {
+			return nil, err
+		}
+
+		devices = append(devices, fmt.Sprintf("%d:%d", major, minor))
+	} else {
+		return nil, fmt.Errorf("Invalid block device: %s", device[1])
+	}
+
+	return devices, nil
+}
+
+func deviceParseDiskLimit(readSpeed string, writeSpeed string) (int64, int64, int64, int64, error) {
+	parseValue := func(value string) (int64, int64, error) {
+		var err error
+
+		bps := int64(0)
+		iops := int64(0)
+
+		if readSpeed == "" {
+			return bps, iops, nil
+		}
+
+		if strings.HasSuffix(value, "iops") {
+			iops, err = strconv.ParseInt(strings.TrimSuffix(value, "iops"), 10, 64)
+			if err != nil {
+				return -1, -1, err
+			}
+		} else {
+			bps, err = shared.ParseByteSizeString(value)
+			if err != nil {
+				return -1, -1, err
+			}
+		}
+
+		return bps, iops, nil
+	}
+
+	readBps, readIops, err := parseValue(readSpeed)
+	if err != nil {
+		return -1, -1, -1, -1, err
+	}
+
+	writeBps, writeIops, err := parseValue(writeSpeed)
+	if err != nil {
+		return -1, -1, -1, -1, err
+	}
+
+	return readBps, readIops, writeBps, writeIops, nil
 }

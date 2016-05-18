@@ -3,11 +3,10 @@ package main
 import (
 	"fmt"
 
-	"github.com/chai2010/gettext-go/gettext"
-
 	"github.com/lxc/lxd"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/gnuflag"
+	"github.com/lxc/lxd/shared/i18n"
 )
 
 type restoreCmd struct {
@@ -19,14 +18,21 @@ func (c *restoreCmd) showByDefault() bool {
 }
 
 func (c *restoreCmd) usage() string {
-	return gettext.Gettext(
-		`Set the current state of a resource back to what it was when it was snapshotted.
+	return i18n.G(
+		`Set the current state of a resource back to a snapshot.
 
-lxc restore [remote:]<resource> <snapshot name> [--stateful]`)
+lxc restore [remote:]<container> <snapshot name> [--stateful]
+
+Restores a container from a snapshot (optionally with running state, see
+snapshot help for details).
+
+For example:
+lxc snapshot u1 snap0 # create the snapshot
+lxc restore u1 snap0 # restore the snapshot`)
 }
 
 func (c *restoreCmd) flags() {
-	gnuflag.BoolVar(&c.stateful, "stateful", false, gettext.Gettext("Whether or not to restore the container's running state from snapshot (if available)"))
+	gnuflag.BoolVar(&c.stateful, "stateful", false, i18n.G("Whether or not to restore the container's running state from snapshot (if available)"))
 }
 
 func (c *restoreCmd) run(config *lxd.Config, args []string) error {

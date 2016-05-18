@@ -13,7 +13,7 @@ import (
 )
 
 func containerLogsGet(d *Daemon, r *http.Request) Response {
-	/* Let's explicitly *not* try to do a containerLXDLoad here. In some
+	/* Let's explicitly *not* try to do a containerLoadByName here. In some
 	 * cases (e.g. when container creation failed), the container won't
 	 * exist in the DB but it does have some log files on disk.
 	 *
@@ -22,11 +22,11 @@ func containerLogsGet(d *Daemon, r *http.Request) Response {
 	 */
 	name := mux.Vars(r)["name"]
 
-	if err := validContainerName(name); err != nil {
+	if err := containerValidName(name); err != nil {
 		return BadRequest(err)
 	}
 
-	result := []map[string]interface{}{}
+	result := []string{}
 
 	dents, err := ioutil.ReadDir(shared.LogPath(name))
 	if err != nil {
@@ -34,10 +34,7 @@ func containerLogsGet(d *Daemon, r *http.Request) Response {
 	}
 
 	for _, f := range dents {
-		result = append(result, map[string]interface{}{
-			"name": f.Name(),
-			"size": f.Size(),
-		})
+		result = append(result, fmt.Sprintf("/%s/containers/%s/logs/%s", shared.APIVersion, name, f.Name()))
 	}
 
 	return SyncResponse(true, result)
@@ -62,7 +59,7 @@ func containerLogGet(d *Daemon, r *http.Request) Response {
 	name := mux.Vars(r)["name"]
 	file := mux.Vars(r)["file"]
 
-	if err := validContainerName(name); err != nil {
+	if err := containerValidName(name); err != nil {
 		return BadRequest(err)
 	}
 
@@ -82,7 +79,7 @@ func containerLogDelete(d *Daemon, r *http.Request) Response {
 	name := mux.Vars(r)["name"]
 	file := mux.Vars(r)["file"]
 
-	if err := validContainerName(name); err != nil {
+	if err := containerValidName(name); err != nil {
 		return BadRequest(err)
 	}
 

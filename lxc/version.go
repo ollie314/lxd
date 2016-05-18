@@ -3,10 +3,9 @@ package main
 import (
 	"fmt"
 
-	"github.com/chai2010/gettext-go/gettext"
-
 	"github.com/lxc/lxd"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/i18n"
 )
 
 type versionCmd struct{}
@@ -16,8 +15,8 @@ func (c *versionCmd) showByDefault() bool {
 }
 
 func (c *versionCmd) usage() string {
-	return gettext.Gettext(
-		`Prints the version number of LXD.
+	return i18n.G(
+		`Prints the version number of this client tool.
 
 lxc version`)
 }

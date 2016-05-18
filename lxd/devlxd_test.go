@@ -43,6 +43,8 @@ func setupDir() error {
 		return err
 	}
 
+	os.MkdirAll(fmt.Sprintf("%s/devlxd", testDir), 0755)
+
 	return os.Setenv("LXD_DIR", testDir)
 }
 
@@ -85,13 +87,13 @@ func TestCredsSendRecv(t *testing.T) {
 		}
 		defer conn.Close()
 
-		pid, err := getPid(conn)
+		cred, err := getCred(conn)
 		if err != nil {
 			t.Log(err)
 			result <- -1
 			return
 		}
-		result <- pid
+		result <- cred.pid
 	}()
 
 	conn, err := connect(fmt.Sprintf("%s/devlxd/sock", testDir))
@@ -118,7 +120,8 @@ func TestHttpRequest(t *testing.T) {
 	}
 	defer os.RemoveAll(testDir)
 
-	d, err := startDaemon()
+	d := &Daemon{}
+	err := d.Init()
 	if err != nil {
 		t.Fatal(err)
 	}

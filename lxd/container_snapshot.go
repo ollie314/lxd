@@ -10,9 +10,12 @@ import (
 	"github.com/gorilla/mux"
 
 	"github.com/lxc/lxd/shared"
-
-	log "gopkg.in/inconshreveable/log15.v2"
 )
+
+type containerSnapshotPostReq struct {
+	Name     string `json:"name"`
+	Stateful bool   `json:"stateful"`
+}
 
 func containerSnapshotsGet(d *Daemon, r *http.Request) Response {
 	recursionStr := r.FormValue("recursion")
@@ -22,41 +25,31 @@ func containerSnapshotsGet(d *Daemon, r *http.Request) Response {
 	}
 
 	cname := mux.Vars(r)["name"]
-	// Makes sure the requested container exists.
-	_, err = containerLXDLoad(d, cname)
+	c, err := containerLoadByName(d, cname)
 	if err != nil {
 		return SmartError(err)
 	}
 
-	regexp := cname + shared.SnapshotDelimiter
-	length := len(regexp)
-	q := "SELECT name FROM containers WHERE type=? AND SUBSTR(name,1,?)=?"
-	var name string
-	inargs := []interface{}{cTypeSnapshot, length, regexp}
-	outfmt := []interface{}{name}
-	results, err := dbQueryScan(d.db, q, inargs, outfmt)
+	snaps, err := c.Snapshots()
 	if err != nil {
 		return SmartError(err)
 	}
 
 	resultString := []string{}
-	resultMap := []shared.Jmap{}
+	resultMap := []*shared.SnapshotInfo{}
 
-	for _, r := range results {
-		name = r[0].(string)
-		sc, err := containerLXDLoad(d, name)
-		if err != nil {
-			shared.Log.Error("Failed to load snapshot", log.Ctx{"snapshot": name})
-			continue
-		}
-
-		snapName := strings.TrimPrefix(name, regexp)
+	for _, snap := range snaps {
+		snapName := strings.SplitN(snap.Name(), shared.SnapshotDelimiter, 2)[1]
 		if recursion == 0 {
 			url := fmt.Sprintf("/%s/containers/%s/snapshots/%s", shared.APIVersion, cname, snapName)
 			resultString = append(resultString, url)
 		} else {
-			body := shared.Jmap{"name": snapName, "stateful": shared.PathExists(sc.StateDirGet())}
-			resultMap = append(resultMap, body)
+			render, err := snap.Render()
+			if err != nil {
+				continue
+			}
+
+			resultMap = append(resultMap, render.(*shared.SnapshotInfo))
 		}
 	}
 
@@ -112,45 +105,40 @@ func containerSnapshotsPost(d *Daemon, r *http.Request) Response {
 	 * 2. copy the database info over
 	 * 3. copy over the rootfs
 	 */
-	c, err := containerLXDLoad(d, name)
+	c, err := containerLoadByName(d, name)
 	if err != nil {
 		return SmartError(err)
 	}
 
-	raw := shared.Jmap{}
-	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+	req := containerSnapshotPostReq{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return BadRequest(err)
 	}
 
-	snapshotName, err := raw.GetString("name")
-	if err != nil || snapshotName == "" {
+	if req.Name == "" {
 		// come up with a name
 		i := nextSnapshot(d, name)
-		snapshotName = fmt.Sprintf("snap%d", i)
-	}
-
-	stateful, err := raw.GetBool("stateful")
-	if err != nil {
-		return BadRequest(err)
+		req.Name = fmt.Sprintf("snap%d", i)
 	}
 
 	fullName := name +
 		shared.SnapshotDelimiter +
-		snapshotName
+		req.Name
 
-	snapshot := func() error {
-		config := c.ConfigGet()
-		args := containerLXDArgs{
+	snapshot := func(op *operation) error {
+		args := containerArgs{
+			Name:         fullName,
 			Ctype:        cTypeSnapshot,
-			Config:       config,
-			Profiles:     c.ProfilesGet(),
+			Config:       c.LocalConfig(),
+			Profiles:     c.Profiles(),
 			Ephemeral:    c.IsEphemeral(),
-			BaseImage:    config["volatile.base_image"],
-			Architecture: c.ArchitectureGet(),
-			Devices:      c.DevicesGet(),
+			BaseImage:    c.ExpandedConfig()["volatile.base_image"],
+			Architecture: c.Architecture(),
+			Devices:      c.LocalDevices(),
+			Stateful:     req.Stateful,
 		}
 
-		_, err := containerLXDCreateAsSnapshot(d, fullName, args, c, stateful)
+		_, err := containerCreateAsSnapshot(d, args, c)
 		if err != nil {
 			return err
 		}
@@ -158,14 +146,22 @@ func containerSnapshotsPost(d *Daemon, r *http.Request) Response {
 		return nil
 	}
 
-	return AsyncResponse(shared.OperationWrap(snapshot), nil)
+	resources := map[string][]string{}
+	resources["containers"] = []string{name}
+
+	op, err := operationCreate(operationClassTask, resources, nil, snapshot, nil, nil)
+	if err != nil {
+		return InternalError(err)
+	}
+
+	return OperationResponse(op)
 }
 
 func snapshotHandler(d *Daemon, r *http.Request) Response {
 	containerName := mux.Vars(r)["name"]
 	snapshotName := mux.Vars(r)["snapshotName"]
 
-	sc, err := containerLXDLoad(
+	sc, err := containerLoadByName(
 		d,
 		containerName+
 			shared.SnapshotDelimiter+
@@ -187,8 +183,12 @@ func snapshotHandler(d *Daemon, r *http.Request) Response {
 }
 
 func snapshotGet(sc container, name string) Response {
-	body := shared.Jmap{"name": name, "stateful": shared.PathExists(sc.StateDirGet())}
-	return SyncResponse(true, body)
+	render, err := sc.Render()
+	if err != nil {
+		return SmartError(err)
+	}
+
+	return SyncResponse(true, render.(*shared.SnapshotInfo))
 }
 
 func snapshotPost(r *http.Request, sc container, containerName string) Response {
@@ -197,20 +197,56 @@ func snapshotPost(r *http.Request, sc container, containerName string) Response 
 		return BadRequest(err)
 	}
 
+	migration, err := raw.GetBool("migration")
+	if err == nil && migration {
+		ws, err := NewMigrationSource(sc)
+		if err != nil {
+			return SmartError(err)
+		}
+
+		resources := map[string][]string{}
+		resources["containers"] = []string{containerName}
+
+		op, err := operationCreate(operationClassWebsocket, resources, ws.Metadata(), ws.Do, nil, ws.Connect)
+		if err != nil {
+			return InternalError(err)
+		}
+
+		return OperationResponse(op)
+	}
+
 	newName, err := raw.GetString("name")
 	if err != nil {
 		return BadRequest(err)
 	}
 
-	rename := func() error {
+	rename := func(op *operation) error {
 		return sc.Rename(containerName + shared.SnapshotDelimiter + newName)
 	}
-	return AsyncResponse(shared.OperationWrap(rename), nil)
+
+	resources := map[string][]string{}
+	resources["containers"] = []string{containerName}
+
+	op, err := operationCreate(operationClassTask, resources, nil, rename, nil, nil)
+	if err != nil {
+		return InternalError(err)
+	}
+
+	return OperationResponse(op)
 }
 
 func snapshotDelete(sc container, name string) Response {
-	remove := func() error {
+	remove := func(op *operation) error {
 		return sc.Delete()
 	}
-	return AsyncResponse(shared.OperationWrap(remove), nil)
+
+	resources := map[string][]string{}
+	resources["containers"] = []string{sc.Name()}
+
+	op, err := operationCreate(operationClassTask, resources, nil, remove, nil, nil)
+	if err != nil {
+		return InternalError(err)
+	}
+
+	return OperationResponse(op)
 }

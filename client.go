@@ -2,7 +2,6 @@ package lxd
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -21,7 +20,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/chai2010/gettext-go/gettext"
 	"github.com/gorilla/websocket"
 
 	"github.com/lxc/lxd/shared"
@@ -29,23 +27,17 @@ import (
 
 // Client can talk to a LXD daemon.
 type Client struct {
-	config          Config
-	Remote          *RemoteConfig
-	name            string
-	http            http.Client
-	BaseURL         string
-	BaseWSURL       string
-	Transport       string
-	certf           string
-	keyf            string
+	BaseURL     string
+	BaseWSURL   string
+	Config      Config
+	Name        string
+	Remote      *RemoteConfig
+	Transport   string
+	Certificate string
+
+	Http            http.Client
 	websocketDialer websocket.Dialer
-
-	scert *x509.Certificate // the cert stored on disk
-
-	scertWire          *x509.Certificate // the cert from the tls connection
-	scertIntermediates *x509.CertPool
-	scertDigest        [sha256.Size]byte // fingerprint of server cert from connection
-	scertDigestSet     bool              // whether we've stored the fingerprint
+	simplestreams   *shared.SimpleStreams
 }
 
 type ResponseType string
@@ -75,8 +67,7 @@ type Response struct {
 	StatusCode int    `json:"status_code"`
 
 	/* Valid only for Async responses */
-	Operation string              `json:"operation"`
-	Resources map[string][]string `json:"resources"`
+	Operation string `json:"operation"`
 
 	/* Valid only for Error responses */
 	Code  int    `json:"error_code"`
@@ -110,7 +101,7 @@ func (r *Response) MetadataAsOperation() (*shared.Operation, error) {
 // response (e.g. to inspect the error code).
 func ParseResponse(r *http.Response) (*Response, error) {
 	if r == nil {
-		return nil, fmt.Errorf(gettext.Gettext("no response!"))
+		return nil, fmt.Errorf("no response!")
 	}
 	defer r.Body.Close()
 	ret := Response{}
@@ -146,118 +137,192 @@ func HoistResponse(r *http.Response, rtype ResponseType) (*Response, error) {
 	}
 
 	if resp.Type != rtype {
-		return nil, fmt.Errorf(gettext.Gettext("got bad response type, expected %s got %s"), rtype, resp.Type)
+		return nil, fmt.Errorf("got bad response type, expected %s got %s", rtype, resp.Type)
 	}
 
 	return resp, nil
 }
 
-func readMyCert() (string, string, error) {
-	certf := ConfigPath("client.crt")
-	keyf := ConfigPath("client.key")
-
-	err := shared.FindOrGenCert(certf, keyf)
-
-	return certf, keyf, err
-}
-
-/*
- * load the server cert from disk
- */
-func (c *Client) loadServerCert() {
-	cert, err := shared.ReadCert(ServerCertPath(c.name))
-	if err != nil {
-		shared.Debugf("Error reading the server certificate for %s: %v", c.name, err)
-		return
-	}
-
-	c.scert = cert
-}
-
 // NewClient returns a new LXD client.
 func NewClient(config *Config, remote string) (*Client, error) {
-	c := Client{
-		config: *config,
-		http:   http.Client{},
-	}
-
-	c.name = remote
-
 	if remote == "" {
-		return nil, fmt.Errorf(gettext.Gettext("A remote name must be provided."))
+		return nil, fmt.Errorf("A remote name must be provided.")
 	}
 
-	if r, ok := config.Remotes[remote]; ok {
-		if r.Addr[0:5] == "unix:" {
-			if r.Addr == "unix://" {
-				r.Addr = fmt.Sprintf("unix:%s", shared.VarPath("unix.socket"))
-			}
+	r, ok := config.Remotes[remote]
+	if !ok {
+		return nil, fmt.Errorf("unknown remote name: %q", remote)
+	}
+	info := ConnectInfo{
+		Name:         remote,
+		RemoteConfig: r,
+	}
 
-			c.BaseURL = "http://unix.socket"
-			c.BaseWSURL = "ws://unix.socket"
-			c.Transport = "unix"
-			uDial := func(networ, addr string) (net.Conn, error) {
-				var err error
-				var raddr *net.UnixAddr
-				if r.Addr[7:] == "unix://" {
-					raddr, err = net.ResolveUnixAddr("unix", r.Addr[7:])
-				} else {
-					raddr, err = net.ResolveUnixAddr("unix", r.Addr[5:])
-				}
-				if err != nil {
-					return nil, err
-				}
-				return net.DialUnix("unix", nil, raddr)
-			}
-			c.http.Transport = &http.Transport{Dial: uDial}
-			c.websocketDialer.NetDial = uDial
-			c.Remote = &r
-		} else {
-			certf, keyf, err := readMyCert()
-			if err != nil {
-				return nil, err
-			}
-
-			tlsconfig, err := shared.GetTLSConfig(certf, keyf)
-			if err != nil {
-				return nil, err
-			}
-
-			tr := &http.Transport{
-				TLSClientConfig: tlsconfig,
-				Dial:            shared.RFC3493Dialer,
-				Proxy:           http.ProxyFromEnvironment,
-			}
-
-			c.websocketDialer = websocket.Dialer{
-				NetDial:         shared.RFC3493Dialer,
-				TLSClientConfig: tlsconfig,
-			}
-
-			c.certf = certf
-			c.keyf = keyf
-
-			if r.Addr[0:8] == "https://" {
-				c.BaseURL = "https://" + r.Addr[8:]
-				c.BaseWSURL = "wss://" + r.Addr[8:]
-			} else {
-				c.BaseURL = "https://" + r.Addr
-				c.BaseWSURL = "wss://" + r.Addr
-			}
-			c.Transport = "https"
-			c.http.Transport = tr
-			c.loadServerCert()
-			c.Remote = &r
+	if strings.HasPrefix(r.Addr, "unix:") {
+		// replace "unix://" with the official "unix:/var/lib/lxd/unix.socket"
+		if info.RemoteConfig.Addr == "unix://" {
+			info.RemoteConfig.Addr = fmt.Sprintf("unix:%s", shared.VarPath("unix.socket"))
 		}
 	} else {
-		return nil, fmt.Errorf(gettext.Gettext("unknown remote name: %q"), remote)
+		// Read the client certificate (if it exists)
+		clientCertPath := path.Join(config.ConfigDir, "client.crt")
+		if shared.PathExists(clientCertPath) {
+			certBytes, err := ioutil.ReadFile(clientCertPath)
+			if err != nil {
+				return nil, err
+			}
+
+			info.ClientPEMCert = string(certBytes)
+		}
+
+		// Read the client key (if it exists)
+		clientKeyPath := path.Join(config.ConfigDir, "client.key")
+		if shared.PathExists(clientKeyPath) {
+			keyBytes, err := ioutil.ReadFile(clientKeyPath)
+			if err != nil {
+				return nil, err
+			}
+
+			info.ClientPEMKey = string(keyBytes)
+		}
+
+		// Read the server certificate (if it exists)
+		serverCertPath := config.ServerCertPath(remote)
+		if shared.PathExists(serverCertPath) {
+			cert, err := shared.ReadCert(serverCertPath)
+			if err != nil {
+				return nil, err
+			}
+
+			info.ServerPEMCert = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}))
+		}
+	}
+	c, err := NewClientFromInfo(info)
+	if err != nil {
+		return nil, err
+	}
+	c.Config = *config
+
+	return c, nil
+}
+
+// ConnectInfo contains the information we need to connect to a specific LXD server
+type ConnectInfo struct {
+	// Name is a simple identifier for the remote server. In 'lxc' it is
+	// the name used to lookup the address and other information in the
+	// config.yml file.
+	Name string
+	// RemoteConfig is the information about the Remote that we are
+	// connecting to. This includes information like if the remote is
+	// Public and/or Static.
+	RemoteConfig RemoteConfig
+	// ClientPEMCert is the PEM encoded bytes of the client's certificate.
+	// If Addr indicates a Unix socket, the certificate and key bytes will
+	// not be used.
+	ClientPEMCert string
+	// ClientPEMKey is the PEM encoded private bytes of the client's key associated with its certificate
+	ClientPEMKey string
+	// ServerPEMCert is the PEM encoded server certificate that we are
+	// connecting to. It can be the empty string if we do not know the
+	// server's certificate yet.
+	ServerPEMCert string
+}
+
+func connectViaUnix(c *Client, remote *RemoteConfig) error {
+	c.BaseURL = "http://unix.socket"
+	c.BaseWSURL = "ws://unix.socket"
+	c.Transport = "unix"
+	uDial := func(network, addr string) (net.Conn, error) {
+		// The arguments 'network' and 'addr' are ignored because
+		// they are the wrong information.
+		// addr is generated from BaseURL which becomes
+		// 'unix.socket:80' which is certainly not what we want.
+		// handle:
+		//   unix:///path/to/socket
+		//   unix:/path/to/socket
+		//   unix:path/to/socket
+		path := strings.TrimPrefix(remote.Addr, "unix:")
+		if strings.HasPrefix(path, "///") {
+			// translate unix:///path/to, to just "/path/to"
+			path = path[2:]
+		}
+		raddr, err := net.ResolveUnixAddr("unix", path)
+		if err != nil {
+			return nil, err
+		}
+		return net.DialUnix("unix", nil, raddr)
+	}
+	c.Http.Transport = &http.Transport{Dial: uDial}
+	c.websocketDialer.NetDial = uDial
+	c.Remote = remote
+
+	st, err := c.ServerStatus()
+	if err != nil {
+		return err
+	}
+	c.Certificate = st.Environment.Certificate
+	return nil
+}
+
+func connectViaHttp(c *Client, remote *RemoteConfig, clientCert, clientKey, serverCert string) error {
+	tlsconfig, err := shared.GetTLSConfigMem(clientCert, clientKey, serverCert)
+	if err != nil {
+		return err
 	}
 
-	if err := c.Finger(); err != nil {
+	tr := &http.Transport{
+		TLSClientConfig: tlsconfig,
+		Dial:            shared.RFC3493Dialer,
+		Proxy:           shared.ProxyFromEnvironment,
+	}
+
+	c.websocketDialer.NetDial = shared.RFC3493Dialer
+	c.websocketDialer.TLSClientConfig = tlsconfig
+
+	justAddr := strings.TrimPrefix(remote.Addr, "https://")
+	c.BaseURL = "https://" + justAddr
+	c.BaseWSURL = "wss://" + justAddr
+	c.Transport = "https"
+	c.Http.Transport = tr
+	c.Remote = remote
+	c.Certificate = serverCert
+	// We don't actually need to connect yet, defer that until someone
+	// needs something from the server.
+
+	return nil
+}
+
+// NewClientFromInfo returns a new LXD client.
+func NewClientFromInfo(info ConnectInfo) (*Client, error) {
+	c := &Client{
+		// Config: *config,
+		Http: http.Client{},
+		Config: Config{
+			Remotes: DefaultRemotes,
+			Aliases: map[string]string{},
+		},
+	}
+	c.Name = info.Name
+	var err error
+	if strings.HasPrefix(info.RemoteConfig.Addr, "unix:") {
+		err = connectViaUnix(c, &info.RemoteConfig)
+	} else {
+		err = connectViaHttp(c, &info.RemoteConfig, info.ClientPEMCert, info.ClientPEMKey, info.ServerPEMCert)
+	}
+	if err != nil {
 		return nil, err
 	}
 
-	return &c, nil
+	if info.RemoteConfig.Protocol == "simplestreams" {
+		ss, err := shared.SimpleStreamsClient(c.Remote.Addr, shared.ProxyFromEnvironment)
+		if err != nil {
+			return nil, err
+		}
+
+		c.simplestreams = ss
+	}
+
+	return c, nil
 }
 
 func (c *Client) Addresses() ([]string, error) {
@@ -272,11 +337,11 @@ func (c *Client) Addresses() ([]string, error) {
 	} else if c.Transport == "https" {
 		addresses = append(addresses, c.BaseURL[8:])
 	} else {
-		return nil, fmt.Errorf(gettext.Gettext("unknown transport type: %s"), c.Transport)
+		return nil, fmt.Errorf("unknown transport type: %s", c.Transport)
 	}
 
 	if len(addresses) == 0 {
-		return nil, fmt.Errorf(gettext.Gettext("The source remote isn't available over the network"))
+		return nil, fmt.Errorf("The source remote isn't available over the network")
 	}
 
 	return addresses, nil
@@ -296,32 +361,15 @@ func (c *Client) baseGet(getUrl string) (*Response, error) {
 
 	req.Header.Set("User-Agent", shared.UserAgent)
 
-	resp, err := c.http.Do(req)
+	resp, err := c.Http.Do(req)
 	if err != nil {
 		return nil, err
-	}
-
-	if c.scert != nil && resp.TLS != nil {
-		if !bytes.Equal(resp.TLS.PeerCertificates[0].Raw, c.scert.Raw) {
-			pUrl, _ := url.Parse(getUrl)
-			return nil, fmt.Errorf(gettext.Gettext("Server certificate for host %s has changed. Add correct certificate or remove certificate in %s"), pUrl.Host, ConfigPath("servercerts"))
-		}
-	}
-
-	if c.scertDigestSet == false && resp.TLS != nil {
-		c.scertWire = resp.TLS.PeerCertificates[0]
-		c.scertIntermediates = x509.NewCertPool()
-		for _, cert := range resp.TLS.PeerCertificates {
-			c.scertIntermediates.AddCert(cert)
-		}
-		c.scertDigest = sha256.Sum256(resp.TLS.PeerCertificates[0].Raw)
-		c.scertDigestSet = true
 	}
 
 	return HoistResponse(resp, Sync)
 }
 
-func (c *Client) put(base string, args shared.Jmap, rtype ResponseType) (*Response, error) {
+func (c *Client) put(base string, args interface{}, rtype ResponseType) (*Response, error) {
 	uri := c.url(shared.APIVersion, base)
 
 	buf := bytes.Buffer{}
@@ -339,7 +387,7 @@ func (c *Client) put(base string, args shared.Jmap, rtype ResponseType) (*Respon
 	req.Header.Set("User-Agent", shared.UserAgent)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.http.Do(req)
+	resp, err := c.Http.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -347,7 +395,7 @@ func (c *Client) put(base string, args shared.Jmap, rtype ResponseType) (*Respon
 	return HoistResponse(resp, rtype)
 }
 
-func (c *Client) post(base string, args shared.Jmap, rtype ResponseType) (*Response, error) {
+func (c *Client) post(base string, args interface{}, rtype ResponseType) (*Response, error) {
 	uri := c.url(shared.APIVersion, base)
 
 	buf := bytes.Buffer{}
@@ -365,7 +413,7 @@ func (c *Client) post(base string, args shared.Jmap, rtype ResponseType) (*Respo
 	req.Header.Set("User-Agent", shared.UserAgent)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.http.Do(req)
+	resp, err := c.Http.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -380,7 +428,7 @@ func (c *Client) getRaw(uri string) (*http.Response, error) {
 	}
 	req.Header.Set("User-Agent", shared.UserAgent)
 
-	raw, err := c.http.Do(req)
+	raw, err := c.Http.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -391,13 +439,13 @@ func (c *Client) getRaw(uri string) (*http.Response, error) {
 		if err != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf(gettext.Gettext("expected error, got %s"), resp)
+		return nil, fmt.Errorf("expected error, got %v", *resp)
 	}
 
 	return raw, nil
 }
 
-func (c *Client) delete(base string, args shared.Jmap, rtype ResponseType) (*Response, error) {
+func (c *Client) delete(base string, args interface{}, rtype ResponseType) (*Response, error) {
 	uri := c.url(shared.APIVersion, base)
 
 	buf := bytes.Buffer{}
@@ -415,7 +463,7 @@ func (c *Client) delete(base string, args shared.Jmap, rtype ResponseType) (*Res
 	req.Header.Set("User-Agent", shared.UserAgent)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.http.Do(req)
+	resp, err := c.Http.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -430,56 +478,26 @@ func (c *Client) websocket(operation string, secret string) (*websocket.Conn, er
 }
 
 func (c *Client) url(elem ...string) string {
-	return c.BaseURL + "/" + path.Join(elem...)
-}
+	path := strings.Join(elem, "/")
+	uri := c.BaseURL + "/" + path
 
-func unixDial(networ, addr string) (net.Conn, error) {
-	var raddr *net.UnixAddr
-	var err error
-	if addr == "unix.socket:80" {
-		raddr, err = net.ResolveUnixAddr("unix", shared.VarPath("unix.socket"))
-		if err != nil {
-			return nil, fmt.Errorf(gettext.Gettext("cannot resolve unix socket address: %v"), err)
-		}
-	} else { // TODO - I think this is dead code
-		raddr, err = net.ResolveUnixAddr("unix", addr)
-		if err != nil {
-			return nil, fmt.Errorf(gettext.Gettext("cannot resolve unix socket address: %v"), err)
-		}
+	if strings.HasPrefix(path, "1.0/images/aliases") {
+		return uri
 	}
-	return net.DialUnix("unix", nil, raddr)
-}
 
-var unixTransport = http.Transport{
-	Dial: unixDial,
+	if strings.Contains(path, "?") {
+		return uri
+	}
+
+	return strings.TrimSuffix(uri, "/")
 }
 
 func (c *Client) GetServerConfig() (*Response, error) {
+	if c.Remote.Protocol == "simplestreams" {
+		return nil, fmt.Errorf("This function isn't supported by simplestreams remote.")
+	}
+
 	return c.baseGet(c.url(shared.APIVersion))
-}
-
-func (c *Client) Finger() error {
-	shared.Debugf("Fingering the daemon")
-	resp, err := c.GetServerConfig()
-	if err != nil {
-		return err
-	}
-
-	jmap, err := resp.MetadataAsMap()
-	if err != nil {
-		return err
-	}
-
-	serverAPICompat, err := jmap.GetInt("api_compat")
-	if err != nil {
-		return err
-	}
-
-	if serverAPICompat != shared.APICompat {
-		return fmt.Errorf(gettext.Gettext("api version mismatch: mine: %q, daemon: %q"), shared.APICompat, serverAPICompat)
-	}
-	shared.Debugf("Pong received")
-	return nil
 }
 
 func (c *Client) AmTrusted() bool {
@@ -525,6 +543,10 @@ func (c *Client) IsPublic() bool {
 }
 
 func (c *Client) ListContainers() ([]shared.ContainerInfo, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	resp, err := c.get("containers?recursion=1")
 	if err != nil {
 		return nil, err
@@ -539,44 +561,45 @@ func (c *Client) ListContainers() ([]shared.ContainerInfo, error) {
 	return result, nil
 }
 
-func (c *Client) CopyImage(image string, dest *Client, copy_aliases bool, aliases []string, public bool) error {
-	fingerprint := c.GetAlias(image)
-	if fingerprint == "" {
-		fingerprint = image
-	}
-
-	info, err := c.GetImageInfo(fingerprint)
-	if err != nil {
-		return err
-	}
-
+func (c *Client) CopyImage(image string, dest *Client, copy_aliases bool, aliases []string, public bool, autoUpdate bool, progressHandler func(progress string)) error {
 	source := shared.Jmap{
 		"type":        "image",
 		"mode":        "pull",
 		"server":      c.BaseURL,
-		"fingerprint": fingerprint}
+		"protocol":    c.Remote.Protocol,
+		"certificate": c.Certificate,
+		"fingerprint": image}
 
-	if !shared.InterfaceToBool(info.Public) {
-		var operation string
+	target := c.GetAlias(image)
+	if target != "" {
+		image = target
+	}
 
-		resp, err := c.post("images/"+fingerprint+"/secret", nil, Async)
+	info, err := c.GetImageInfo(image)
+	if err != nil {
+		return err
+	}
+
+	if c.Remote.Protocol != "simplestreams" && !info.Public {
+		var secret string
+
+		resp, err := c.post("images/"+image+"/secret", nil, Async)
 		if err != nil {
 			return err
 		}
 
-		toScan := strings.Replace(resp.Operation, "/", " ", -1)
-		version := ""
-		count, err := fmt.Sscanf(toScan, " %s operations %s", &version, &operation)
-		if err != nil || count != 2 {
+		op, err := resp.MetadataAsOperation()
+		if err != nil {
 			return err
 		}
 
-		md := secretMd{}
-		if err := json.Unmarshal(resp.Metadata, &md); err != nil {
+		secret, err = op.Metadata.GetString("secret")
+		if err != nil {
 			return err
 		}
 
-		source["secret"] = md.Secret
+		source["secret"] = secret
+		source["fingerprint"] = image
 	}
 
 	addresses, err := c.Addresses()
@@ -584,15 +607,57 @@ func (c *Client) CopyImage(image string, dest *Client, copy_aliases bool, aliase
 		return err
 	}
 
+	operation := ""
+	handler := func(msg interface{}) {
+		if msg == nil {
+			return
+		}
+
+		event := msg.(map[string]interface{})
+		if event["type"].(string) != "operation" {
+			return
+		}
+
+		if event["metadata"] == nil {
+			return
+		}
+
+		md := event["metadata"].(map[string]interface{})
+		if !strings.HasSuffix(operation, md["id"].(string)) {
+			return
+		}
+
+		if md["metadata"] == nil {
+			return
+		}
+
+		opMd := md["metadata"].(map[string]interface{})
+		_, ok := opMd["download_progress"]
+		if ok {
+			progressHandler(opMd["download_progress"].(string))
+		}
+	}
+
+	if progressHandler != nil {
+		go dest.Monitor([]string{"operation"}, handler)
+	}
+
 	for _, addr := range addresses {
 		sourceUrl := "https://" + addr
 
 		source["server"] = sourceUrl
-		body := shared.Jmap{"public": public, "source": source}
+		body := shared.Jmap{"public": public, "auto_update": autoUpdate, "source": source}
 
-		_, err = dest.post("images", body, Sync)
+		resp, err := dest.post("images", body, Async)
 		if err != nil {
 			continue
+		}
+
+		operation = resp.Operation
+
+		err = dest.WaitForSuccess(resp.Operation)
+		if err != nil {
+			return err
 		}
 
 		break
@@ -608,7 +673,7 @@ func (c *Client) CopyImage(image string, dest *Client, copy_aliases bool, aliase
 			dest.DeleteAlias(alias.Name)
 			err = dest.PostAlias(alias.Name, alias.Description, info.Fingerprint)
 			if err != nil {
-				fmt.Printf(gettext.Gettext("Error adding alias %s")+"\n", alias.Name)
+				return fmt.Errorf("Error adding alias %s: %s", alias.Name, err)
 			}
 		}
 	}
@@ -618,18 +683,22 @@ func (c *Client) CopyImage(image string, dest *Client, copy_aliases bool, aliase
 		dest.DeleteAlias(alias)
 		err = dest.PostAlias(alias, alias, info.Fingerprint)
 		if err != nil {
-			fmt.Printf(gettext.Gettext("Error adding alias %s")+"\n", alias)
+			return fmt.Errorf("Error adding alias %s: %s\n", alias, err)
 		}
 	}
 
-	return nil
+	return err
 }
 
-func (c *Client) ExportImage(image string, target string) (*Response, string, error) {
+func (c *Client) ExportImage(image string, target string) (string, error) {
+	if c.Remote.Protocol == "simplestreams" && c.simplestreams != nil {
+		return c.simplestreams.ExportImage(image, target)
+	}
+
 	uri := c.url(shared.APIVersion, "images", image, "export")
 	raw, err := c.getRaw(uri)
 	if err != nil {
-		return nil, "", err
+		return "", err
 	}
 
 	ctype, ctypeParams, err := mime.ParseMediaType(raw.Header.Get("Content-Type"))
@@ -640,7 +709,7 @@ func (c *Client) ExportImage(image string, target string) (*Response, string, er
 	// Deal with split images
 	if ctype == "multipart/form-data" {
 		if !shared.IsDir(target) {
-			return nil, "", fmt.Errorf(gettext.Gettext("Split images can only be written to a directory."))
+			return "", fmt.Errorf("Split images can only be written to a directory.")
 		}
 
 		// Parse the POST data
@@ -649,48 +718,48 @@ func (c *Client) ExportImage(image string, target string) (*Response, string, er
 		// Get the metadata tarball
 		part, err := mr.NextPart()
 		if err != nil {
-			return nil, "", err
+			return "", err
 		}
 
 		if part.FormName() != "metadata" {
-			return nil, "", fmt.Errorf("Invalid multipart image")
+			return "", fmt.Errorf("Invalid multipart image")
 		}
 
-		imageTarf, err := os.OpenFile(part.FileName(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+		imageTarf, err := os.OpenFile(filepath.Join(target, part.FileName()), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 		if err != nil {
-			return nil, "", err
+			return "", err
 		}
 
 		_, err = io.Copy(imageTarf, part)
 
 		imageTarf.Close()
 		if err != nil {
-			return nil, "", err
+			return "", err
 		}
 
 		// Get the rootfs tarball
 		part, err = mr.NextPart()
 		if err != nil {
-			return nil, "", err
+			return "", err
 		}
 
 		if part.FormName() != "rootfs" {
-			return nil, "", fmt.Errorf("Invalid multipart image")
+			return "", fmt.Errorf("Invalid multipart image")
 		}
 
-		rootfsTarf, err := os.OpenFile(part.FileName(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+		rootfsTarf, err := os.OpenFile(filepath.Join(part.FileName()), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 		if err != nil {
-			return nil, "", err
+			return "", err
 		}
 
 		_, err = io.Copy(rootfsTarf, part)
 
 		rootfsTarf.Close()
 		if err != nil {
-			return nil, "", err
+			return "", err
 		}
 
-		return nil, target, nil
+		return target, nil
 	}
 
 	// Deal with unified images
@@ -713,7 +782,7 @@ func (c *Client) ExportImage(image string, target string) (*Response, string, er
 			defer f.Close()
 
 			if err != nil {
-				return nil, "", err
+				return "", err
 			}
 
 			wr = f
@@ -725,14 +794,12 @@ func (c *Client) ExportImage(image string, target string) (*Response, string, er
 			defer f.Close()
 
 			if err != nil {
-				return nil, "", err
+				return "", err
 			}
 
 			wr = f
 		}
-
 	} else {
-
 		// write as simple file
 		destpath = target
 		f, err := os.Create(destpath)
@@ -740,22 +807,67 @@ func (c *Client) ExportImage(image string, target string) (*Response, string, er
 
 		wr = f
 		if err != nil {
-			return nil, "", err
+			return "", err
 		}
-
 	}
 
 	_, err = io.Copy(wr, raw.Body)
 
 	if err != nil {
-		return nil, "", err
+		return "", err
 	}
 
 	// it streams to stdout or file, so no response returned
-	return nil, destpath, nil
+	return destpath, nil
 }
 
-func (c *Client) PostImage(imageFile string, rootfsFile string, properties []string, public bool, aliases []string) (string, error) {
+func (c *Client) PostImageURL(imageFile string, public bool, aliases []string) (string, error) {
+	if c.Remote.Public {
+		return "", fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	source := shared.Jmap{
+		"type": "url",
+		"mode": "pull",
+		"url":  imageFile}
+	body := shared.Jmap{"public": public, "source": source}
+
+	resp, err := c.post("images", body, Async)
+	if err != nil {
+		return "", err
+	}
+
+	op, err := c.WaitFor(resp.Operation)
+	if err != nil {
+		return "", err
+	}
+
+	if op.Metadata == nil {
+		return "", fmt.Errorf("Missing operation metadata")
+	}
+
+	fingerprint, err := op.Metadata.GetString("fingerprint")
+	if err != nil {
+		return "", err
+	}
+
+	/* add new aliases */
+	for _, alias := range aliases {
+		c.DeleteAlias(alias)
+		err = c.PostAlias(alias, alias, fingerprint)
+		if err != nil {
+			return "", fmt.Errorf("Error adding alias %s: %s", alias, err)
+		}
+	}
+
+	return fingerprint, nil
+}
+
+func (c *Client) PostImage(imageFile string, rootfsFile string, properties []string, public bool, aliases []string, progressHandler func(percent int)) (string, error) {
+	if c.Remote.Public {
+		return "", fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	uri := c.url(shared.APIVersion, "images")
 
 	var err error
@@ -763,20 +875,25 @@ func (c *Client) PostImage(imageFile string, rootfsFile string, properties []str
 	var fRootfs *os.File
 	var req *http.Request
 
-	fImage, err = os.Open(imageFile)
-	if err != nil {
-		return "", err
-	}
-	defer fImage.Close()
-
 	if rootfsFile != "" {
+		fImage, err = os.Open(imageFile)
+		if err != nil {
+			return "", err
+		}
+		defer fImage.Close()
+
 		fRootfs, err = os.Open(rootfsFile)
 		if err != nil {
 			return "", err
 		}
 		defer fRootfs.Close()
 
-		body := &bytes.Buffer{}
+		body, err := ioutil.TempFile("", "lxc_image_")
+		if err != nil {
+			return "", err
+		}
+		defer os.Remove(body.Name())
+
 		w := multipart.NewWriter(body)
 
 		// Metadata file
@@ -803,10 +920,35 @@ func (c *Client) PostImage(imageFile string, rootfsFile string, properties []str
 
 		w.Close()
 
-		req, err = http.NewRequest("POST", uri, body)
+		size, err := body.Seek(0, 2)
+		if err != nil {
+			return "", err
+		}
+
+		_, err = body.Seek(0, 0)
+		if err != nil {
+			return "", err
+		}
+
+		progress := &shared.TransferProgress{Reader: body, Length: size, Handler: progressHandler}
+
+		req, err = http.NewRequest("POST", uri, progress)
 		req.Header.Set("Content-Type", w.FormDataContentType())
 	} else {
-		req, err = http.NewRequest("POST", uri, fImage)
+		fImage, err = os.Open(imageFile)
+		if err != nil {
+			return "", err
+		}
+		defer fImage.Close()
+
+		stat, err := fImage.Stat()
+		if err != nil {
+			return "", err
+		}
+
+		progress := &shared.TransferProgress{Reader: fImage, Length: stat.Size(), Handler: progressHandler}
+
+		req, err = http.NewRequest("POST", uri, progress)
 		req.Header.Set("X-LXD-filename", filepath.Base(imageFile))
 		req.Header.Set("Content-Type", "application/octet-stream")
 	}
@@ -832,7 +974,7 @@ func (c *Client) PostImage(imageFile string, rootfsFile string, properties []str
 			if eqIndex > -1 {
 				imgProps.Set(value[:eqIndex], value[eqIndex+1:])
 			} else {
-				return "", fmt.Errorf(gettext.Gettext("Bad image property: %s"), value)
+				return "", fmt.Errorf("Bad image property: %s", value)
 			}
 
 		}
@@ -840,17 +982,17 @@ func (c *Client) PostImage(imageFile string, rootfsFile string, properties []str
 		req.Header.Set("X-LXD-properties", imgProps.Encode())
 	}
 
-	raw, err := c.http.Do(req)
+	raw, err := c.Http.Do(req)
 	if err != nil {
 		return "", err
 	}
 
-	resp, err := HoistResponse(raw, Sync)
+	resp, err := HoistResponse(raw, Async)
 	if err != nil {
 		return "", err
 	}
 
-	jmap, err := resp.MetadataAsMap()
+	jmap, err := c.AsyncWaitMeta(resp)
 	if err != nil {
 		return "", err
 	}
@@ -865,7 +1007,7 @@ func (c *Client) PostImage(imageFile string, rootfsFile string, properties []str
 		c.DeleteAlias(alias)
 		err = c.PostAlias(alias, alias, fingerprint)
 		if err != nil {
-			fmt.Printf(gettext.Gettext("Error adding alias %s")+"\n", alias)
+			return "", fmt.Errorf("Error adding alias %s: %s", alias, err)
 		}
 	}
 
@@ -873,6 +1015,10 @@ func (c *Client) PostImage(imageFile string, rootfsFile string, properties []str
 }
 
 func (c *Client) GetImageInfo(image string) (*shared.ImageInfo, error) {
+	if c.Remote.Protocol == "simplestreams" && c.simplestreams != nil {
+		return c.simplestreams.GetImageInfo(image)
+	}
+
 	resp, err := c.get(fmt.Sprintf("images/%s", image))
 	if err != nil {
 		return nil, err
@@ -887,15 +1033,19 @@ func (c *Client) GetImageInfo(image string) (*shared.ImageInfo, error) {
 }
 
 func (c *Client) PutImageInfo(name string, p shared.BriefImageInfo) error {
-	body := shared.Jmap{}
-	body["public"] = p.Public
-	body["properties"] = p.Properties
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
 
-	_, err := c.put(fmt.Sprintf("images/%s", name), body, Sync)
+	_, err := c.put(fmt.Sprintf("images/%s", name), p, Sync)
 	return err
 }
 
 func (c *Client) ListImages() ([]shared.ImageInfo, error) {
+	if c.Remote.Protocol == "simplestreams" && c.simplestreams != nil {
+		return c.simplestreams.ListImages()
+	}
+
 	resp, err := c.get("images?recursion=1")
 	if err != nil {
 		return nil, err
@@ -910,11 +1060,24 @@ func (c *Client) ListImages() ([]shared.ImageInfo, error) {
 }
 
 func (c *Client) DeleteImage(image string) error {
-	_, err := c.delete(fmt.Sprintf("images/%s", image), nil, Sync)
-	return err
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	resp, err := c.delete(fmt.Sprintf("images/%s", image), nil, Async)
+
+	if err != nil {
+		return err
+	}
+
+	return c.WaitForSuccess(resp.Operation)
 }
 
 func (c *Client) PostAlias(alias string, desc string, target string) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	body := shared.Jmap{"description": desc, "target": target, "name": alias}
 
 	_, err := c.post("images/aliases", body, Sync)
@@ -922,17 +1085,25 @@ func (c *Client) PostAlias(alias string, desc string, target string) error {
 }
 
 func (c *Client) DeleteAlias(alias string) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	_, err := c.delete(fmt.Sprintf("images/aliases/%s", alias), nil, Sync)
 	return err
 }
 
-func (c *Client) ListAliases() ([]shared.ImageAlias, error) {
+func (c *Client) ListAliases() (shared.ImageAliases, error) {
+	if c.Remote.Protocol == "simplestreams" && c.simplestreams != nil {
+		return c.simplestreams.ListAliases()
+	}
+
 	resp, err := c.get("images/aliases?recursion=1")
 	if err != nil {
 		return nil, err
 	}
 
-	var result []shared.ImageAlias
+	var result shared.ImageAliases
 
 	if err := json.Unmarshal(resp.Metadata, &result); err != nil {
 		return nil, err
@@ -941,52 +1112,11 @@ func (c *Client) ListAliases() ([]shared.ImageAlias, error) {
 	return result, nil
 }
 
-func (c *Client) UserAuthServerCert(name string, acceptCert bool) error {
-	if !c.scertDigestSet {
-		return fmt.Errorf(gettext.Gettext("No certificate on this connection"))
-	}
-
-	if c.scert != nil {
-		return nil
-	}
-
-	_, err := c.scertWire.Verify(x509.VerifyOptions{
-		DNSName:       name,
-		Intermediates: c.scertIntermediates,
-	})
-	if err != nil {
-		if acceptCert == false {
-			fmt.Printf(gettext.Gettext("Certificate fingerprint: %x")+"\n", c.scertDigest)
-			fmt.Printf(gettext.Gettext("ok (y/n)?") + " ")
-			line, err := shared.ReadStdin()
-			if err != nil {
-				return err
-			}
-			if len(line) < 1 || line[0] != 'y' && line[0] != 'Y' {
-				return fmt.Errorf(gettext.Gettext("Server certificate NACKed by user"))
-			}
-		}
-	}
-
-	// User acked the cert, now add it to our store
-	dnam := ConfigPath("servercerts")
-	err = os.MkdirAll(dnam, 0750)
-	if err != nil {
-		return fmt.Errorf(gettext.Gettext("Could not create server cert dir"))
-	}
-	certf := fmt.Sprintf("%s/%s.crt", dnam, c.name)
-	certOut, err := os.Create(certf)
-	if err != nil {
-		return err
-	}
-
-	pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: c.scertWire.Raw})
-
-	certOut.Close()
-	return err
-}
-
 func (c *Client) CertificateList() ([]shared.CertInfo, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	resp, err := c.get("certificates?recursion=1")
 	if err != nil {
 		return nil, err
@@ -1001,6 +1131,10 @@ func (c *Client) CertificateList() ([]shared.CertInfo, error) {
 }
 
 func (c *Client) AddMyCertToServer(pwd string) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	body := shared.Jmap{"type": "client", "password": pwd}
 
 	_, err := c.post("certificates", body, Sync)
@@ -1008,12 +1142,20 @@ func (c *Client) AddMyCertToServer(pwd string) error {
 }
 
 func (c *Client) CertificateAdd(cert *x509.Certificate, name string) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	b64 := base64.StdEncoding.EncodeToString(cert.Raw)
 	_, err := c.post("certificates", shared.Jmap{"type": "client", "certificate": b64, "name": name}, Sync)
 	return err
 }
 
 func (c *Client) CertificateRemove(fingerprint string) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	_, err := c.delete(fmt.Sprintf("certificates/%s", fingerprint), nil, Sync)
 	return err
 }
@@ -1031,6 +1173,10 @@ func (c *Client) IsAlias(alias string) (bool, error) {
 }
 
 func (c *Client) GetAlias(alias string) string {
+	if c.Remote.Protocol == "simplestreams" && c.simplestreams != nil {
+		return c.simplestreams.GetAlias(alias)
+	}
+
 	resp, err := c.get(fmt.Sprintf("images/aliases/%s", alias))
 	if err != nil {
 		return ""
@@ -1040,17 +1186,20 @@ func (c *Client) GetAlias(alias string) string {
 		return ""
 	}
 
-	var result shared.ImageAlias
+	var result shared.ImageAliasesEntry
 	if err := json.Unmarshal(resp.Metadata, &result); err != nil {
 		return ""
 	}
-	return result.Name
+	return result.Target
 }
 
 // Init creates a container from either a fingerprint or an alias; you must
 // provide at least one.
-func (c *Client) Init(name string, imgremote string, image string, profiles *[]string, config map[string]string, ephem bool) (*Response, error) {
-	var operation string
+func (c *Client) Init(name string, imgremote string, image string, profiles *[]string, config map[string]string, devices shared.Devices, ephem bool) (*Response, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	var tmpremote *Client
 	var err error
 
@@ -1063,54 +1212,60 @@ func (c *Client) Init(name string, imgremote string, image string, profiles *[]s
 	source := shared.Jmap{"type": "image"}
 
 	if image == "" {
-		return nil, fmt.Errorf(gettext.Gettext("You must provide an image hash or alias name."))
+		image = "default"
 	}
 
-	if imgremote != c.name {
+	if imgremote != c.Name {
 		source["type"] = "image"
 		source["mode"] = "pull"
-		tmpremote, err = NewClient(&c.config, imgremote)
+		tmpremote, err = NewClient(&c.Config, imgremote)
 		if err != nil {
 			return nil, err
 		}
 
-		fingerprint := tmpremote.GetAlias(image)
-		if fingerprint == "" {
-			fingerprint = image
-		}
+		if tmpremote.Remote.Protocol != "simplestreams" {
+			target := tmpremote.GetAlias(image)
+			if target == "" {
+				target = image
+			}
 
-		imageinfo, err := tmpremote.GetImageInfo(fingerprint)
-		if err != nil {
-			return nil, err
-		}
-
-		if len(architectures) != 0 && !shared.IntInSlice(imageinfo.Architecture, architectures) {
-			return nil, fmt.Errorf(gettext.Gettext("The image architecture is incompatible with the target server"))
-		}
-
-		if !shared.InterfaceToBool(imageinfo.Public) {
-			resp, err := tmpremote.post("images/"+fingerprint+"/secret", nil, Async)
+			imageinfo, err := tmpremote.GetImageInfo(target)
 			if err != nil {
 				return nil, err
 			}
 
-			toScan := strings.Replace(resp.Operation, "/", " ", -1)
-			version := ""
-			count, err := fmt.Sscanf(toScan, " %s operations %s", &version, &operation)
-			if err != nil || count != 2 {
-				return nil, err
+			if len(architectures) != 0 && !shared.StringInSlice(imageinfo.Architecture, architectures) {
+				return nil, fmt.Errorf("The image architecture is incompatible with the target server")
 			}
 
-			md := secretMd{}
-			if err := json.Unmarshal(resp.Metadata, &md); err != nil {
-				return nil, err
-			}
+			if !imageinfo.Public {
+				var secret string
 
-			source["secret"] = md.Secret
+				image = target
+
+				resp, err := tmpremote.post("images/"+image+"/secret", nil, Async)
+				if err != nil {
+					return nil, err
+				}
+
+				op, err := resp.MetadataAsOperation()
+				if err != nil {
+					return nil, err
+				}
+
+				secret, err = op.Metadata.GetString("secret")
+				if err != nil {
+					return nil, err
+				}
+
+				source["secret"] = secret
+			}
 		}
 
 		source["server"] = tmpremote.BaseURL
-		source["fingerprint"] = fingerprint
+		source["protocol"] = tmpremote.Remote.Protocol
+		source["certificate"] = tmpremote.Certificate
+		source["fingerprint"] = image
 	} else {
 		fingerprint := c.GetAlias(image)
 		if fingerprint == "" {
@@ -1119,11 +1274,11 @@ func (c *Client) Init(name string, imgremote string, image string, profiles *[]s
 
 		imageinfo, err := c.GetImageInfo(fingerprint)
 		if err != nil {
-			return nil, fmt.Errorf(gettext.Gettext("can't get info for image '%s': %s"), image, err)
+			return nil, fmt.Errorf("can't get info for image '%s': %s", image, err)
 		}
 
-		if len(architectures) != 0 && !shared.IntInSlice(imageinfo.Architecture, architectures) {
-			return nil, fmt.Errorf(gettext.Gettext("The image architecture is incompatible with the target server"))
+		if len(architectures) != 0 && !shared.StringInSlice(imageinfo.Architecture, architectures) {
+			return nil, fmt.Errorf("The image architecture is incompatible with the target server")
 		}
 		source["fingerprint"] = fingerprint
 	}
@@ -1142,13 +1297,17 @@ func (c *Client) Init(name string, imgremote string, image string, profiles *[]s
 		body["config"] = config
 	}
 
+	if devices != nil {
+		body["devices"] = devices
+	}
+
 	if ephem {
 		body["ephemeral"] = ephem
 	}
 
 	var resp *Response
 
-	if imgremote != c.name {
+	if imgremote != c.Name {
 		var addresses []string
 		addresses, err = tmpremote.Addresses()
 		if err != nil {
@@ -1169,10 +1328,6 @@ func (c *Client) Init(name string, imgremote string, image string, profiles *[]s
 		resp, err = c.post("containers", body, Async)
 	}
 
-	if operation != "" {
-		_, _ = tmpremote.delete("operations/"+operation, nil, Sync)
-	}
-
 	if err != nil {
 		if LXDErrors[http.StatusNotFound] == err {
 			return nil, fmt.Errorf("image doesn't exist")
@@ -1184,6 +1339,10 @@ func (c *Client) Init(name string, imgremote string, image string, profiles *[]s
 }
 
 func (c *Client) LocalCopy(source string, name string, config map[string]string, profiles []string, ephemeral bool) (*Response, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	body := shared.Jmap{
 		"source": shared.Jmap{
 			"type":   "copy",
@@ -1198,12 +1357,37 @@ func (c *Client) LocalCopy(source string, name string, config map[string]string,
 	return c.post("containers", body, Async)
 }
 
-type execMd struct {
-	FDs map[string]string `json:"fds"`
-}
+func (c *Client) Monitor(types []string, handler func(interface{})) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
 
-type secretMd struct {
-	Secret string `json:"secret"`
+	url := c.BaseWSURL + path.Join("/", "1.0", "events")
+	if len(types) != 0 {
+		url += "?type=" + strings.Join(types, ",")
+	}
+
+	conn, err := WebsocketDial(c.websocketDialer, url)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	for {
+		message := make(map[string]interface{})
+
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return err
+		}
+
+		err = json.Unmarshal(data, &message)
+		if err != nil {
+			return err
+		}
+
+		handler(message)
+	}
 }
 
 // Exec runs a command inside the LXD container. For "interactive" use such as
@@ -1213,7 +1397,12 @@ type secretMd struct {
 // output is sent to the output buffers.
 func (c *Client) Exec(name string, cmd []string, env map[string]string,
 	stdin io.ReadCloser, stdout io.WriteCloser,
-	stderr io.WriteCloser, controlHandler func(*Client, *websocket.Conn)) (int, error) {
+	stderr io.WriteCloser, controlHandler func(*Client, *websocket.Conn),
+	width int, height int) (int, error) {
+
+	if c.Remote.Public {
+		return -1, fmt.Errorf("This function isn't supported by public remotes.")
+	}
 
 	body := shared.Jmap{
 		"command":            cmd,
@@ -1222,47 +1411,69 @@ func (c *Client) Exec(name string, cmd []string, env map[string]string,
 		"environment":        env,
 	}
 
+	if width > 0 && height > 0 {
+		body["width"] = width
+		body["height"] = height
+	}
+
 	resp, err := c.post(fmt.Sprintf("containers/%s/exec", name), body, Async)
 	if err != nil {
 		return -1, err
 	}
 
-	md := execMd{}
-	if err := json.Unmarshal(resp.Metadata, &md); err != nil {
+	var fds shared.Jmap
+
+	op, err := resp.MetadataAsOperation()
+	if err != nil {
+		return -1, err
+	}
+
+	fds, err = op.Metadata.GetMap("fds")
+	if err != nil {
 		return -1, err
 	}
 
 	if controlHandler != nil {
-		if wsControl, ok := md.FDs["control"]; ok {
-			control, err := c.websocket(resp.Operation, wsControl)
+		var control *websocket.Conn
+		if wsControl, ok := fds["control"]; ok {
+			control, err = c.websocket(resp.Operation, wsControl.(string))
 			if err != nil {
 				return -1, err
 			}
+			defer control.Close()
+
 			go controlHandler(c, control)
 		}
 
-		conn, err := c.websocket(resp.Operation, md.FDs["0"])
+		conn, err := c.websocket(resp.Operation, fds["0"].(string))
 		if err != nil {
 			return -1, err
 		}
+
 		shared.WebsocketSendStream(conn, stdin)
 		<-shared.WebsocketRecvStream(stdout, conn)
+		conn.Close()
+
 	} else {
 		conns := make([]*websocket.Conn, 3)
 		dones := make([]chan bool, 3)
 
-		conns[0], err = c.websocket(resp.Operation, md.FDs[strconv.Itoa(0)])
+		conns[0], err = c.websocket(resp.Operation, fds[strconv.Itoa(0)].(string))
 		if err != nil {
 			return -1, err
 		}
+		defer conns[0].Close()
+
 		dones[0] = shared.WebsocketSendStream(conns[0], stdin)
 
 		outputs := []io.WriteCloser{stdout, stderr}
 		for i := 1; i < 3; i++ {
-			conns[i], err = c.websocket(resp.Operation, md.FDs[strconv.Itoa(i)])
+			conns[i], err = c.websocket(resp.Operation, fds[strconv.Itoa(i)].(string))
 			if err != nil {
 				return -1, err
 			}
+			defer conns[i].Close()
+
 			dones[i] = shared.WebsocketRecvStream(outputs[i-1], conns[i])
 		}
 
@@ -1287,40 +1498,48 @@ func (c *Client) Exec(name string, cmd []string, env map[string]string,
 	}
 
 	// Now, get the operation's status too.
-	op, err := c.WaitFor(resp.Operation)
+	op, err = c.WaitFor(resp.Operation)
 	if err != nil {
 		return -1, err
 	}
 
 	if op.StatusCode == shared.Failure {
-		return -1, op.GetError()
+		return -1, fmt.Errorf(op.Err)
 	}
 
 	if op.StatusCode != shared.Success {
-		return -1, fmt.Errorf(gettext.Gettext("got bad op status %s"), op.Status)
+		return -1, fmt.Errorf("got bad op status %s", op.Status)
 	}
 
-	opMd, err := op.MetadataAsMap()
-	if err != nil {
-		return -1, err
+	if op.Metadata == nil {
+		return -1, fmt.Errorf("no metadata received")
 	}
 
-	return opMd.GetInt("return")
+	return op.Metadata.GetInt("return")
 }
 
-func (c *Client) Action(name string, action shared.ContainerAction, timeout int, force bool) (*Response, error) {
-	if action == "start" {
-		current, err := c.ContainerStatus(name)
-		if err == nil && current.Status.StatusCode == shared.Frozen {
-			action = "unfreeze"
-		}
+func (c *Client) Action(name string, action shared.ContainerAction, timeout int, force bool, stateful bool) (*Response, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
 	}
 
-	body := shared.Jmap{"action": action, "timeout": timeout, "force": force}
+	body := shared.Jmap{
+		"action":  action,
+		"timeout": timeout,
+		"force":   force}
+
+	if shared.StringInSlice(string(action), []string{"start", "stop"}) {
+		body["stateful"] = stateful
+	}
+
 	return c.put(fmt.Sprintf("containers/%s/state", name), body, Async)
 }
 
 func (c *Client) Delete(name string) (*Response, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	var url string
 	s := strings.SplitN(name, "/", 2)
 	if len(s) == 2 {
@@ -1347,8 +1566,12 @@ func (c *Client) ServerStatus() (*shared.ServerState, error) {
 	return &ss, nil
 }
 
-func (c *Client) ContainerStatus(name string) (*shared.ContainerState, error) {
-	ct := shared.ContainerState{}
+func (c *Client) ContainerInfo(name string) (*shared.ContainerInfo, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	ct := shared.ContainerInfo{}
 
 	resp, err := c.get(fmt.Sprintf("containers/%s", name))
 	if err != nil {
@@ -1362,7 +1585,30 @@ func (c *Client) ContainerStatus(name string) (*shared.ContainerState, error) {
 	return &ct, nil
 }
 
+func (c *Client) ContainerState(name string) (*shared.ContainerState, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	ct := shared.ContainerState{}
+
+	resp, err := c.get(fmt.Sprintf("containers/%s/state", name))
+	if err != nil {
+		return nil, err
+	}
+
+	if err := json.Unmarshal(resp.Metadata, &ct); err != nil {
+		return nil, err
+	}
+
+	return &ct, nil
+}
+
 func (c *Client) GetLog(container string, log string) (io.Reader, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	uri := c.url(shared.APIVersion, "containers", container, "logs", log)
 	resp, err := c.getRaw(uri)
 	if err != nil {
@@ -1373,6 +1619,10 @@ func (c *Client) GetLog(container string, log string) (io.Reader, error) {
 }
 
 func (c *Client) ProfileConfig(name string) (*shared.ProfileConfig, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	ct := shared.ProfileConfig{}
 
 	resp, err := c.get(fmt.Sprintf("profiles/%s", name))
@@ -1388,6 +1638,10 @@ func (c *Client) ProfileConfig(name string) (*shared.ProfileConfig, error) {
 }
 
 func (c *Client) PushFile(container string, p string, gid int, uid int, mode os.FileMode, buf io.ReadSeeker) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	query := url.Values{"path": []string{p}}
 	uri := c.url(shared.APIVersion, "containers", container, "files") + "?" + query.Encode()
 
@@ -1397,11 +1651,11 @@ func (c *Client) PushFile(container string, p string, gid int, uid int, mode os.
 	}
 	req.Header.Set("User-Agent", shared.UserAgent)
 
-	req.Header.Set("X-LXD-mode", fmt.Sprintf("%04o", mode))
+	req.Header.Set("X-LXD-mode", fmt.Sprintf("%04o", mode.Perm()))
 	req.Header.Set("X-LXD-uid", strconv.FormatUint(uint64(uid), 10))
 	req.Header.Set("X-LXD-gid", strconv.FormatUint(uint64(gid), 10))
 
-	raw, err := c.http.Do(req)
+	raw, err := c.Http.Do(req)
 	if err != nil {
 		return err
 	}
@@ -1410,7 +1664,11 @@ func (c *Client) PushFile(container string, p string, gid int, uid int, mode os.
 	return err
 }
 
-func (c *Client) PullFile(container string, p string) (int, int, os.FileMode, io.ReadCloser, error) {
+func (c *Client) PullFile(container string, p string) (int, int, int, io.ReadCloser, error) {
+	if c.Remote.Public {
+		return 0, 0, 0, nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	uri := c.url(shared.APIVersion, "containers", container, "files")
 	query := url.Values{"path": []string{p}}
 
@@ -1425,30 +1683,55 @@ func (c *Client) PullFile(container string, p string) (int, int, os.FileMode, io
 }
 
 func (c *Client) GetMigrationSourceWS(container string) (*Response, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	body := shared.Jmap{"migration": true}
-	return c.post(fmt.Sprintf("containers/%s", container), body, Async)
+	url := fmt.Sprintf("containers/%s", container)
+	if shared.IsSnapshot(container) {
+		pieces := strings.SplitN(container, shared.SnapshotDelimiter, 2)
+		if len(pieces) != 2 {
+			return nil, fmt.Errorf("invalid snapshot name %s", container)
+		}
+
+		url = fmt.Sprintf("containers/%s/snapshots/%s", pieces[0], pieces[1])
+	}
+
+	return c.post(url, body, Async)
 }
 
-func (c *Client) MigrateFrom(name string, operation string, secrets map[string]string, config map[string]string, profiles []string, baseImage string, ephemeral bool) (*Response, error) {
+func (c *Client) MigrateFrom(name string, operation string, certificate string, secrets map[string]string, architecture string, config map[string]string, devices shared.Devices, profiles []string, baseImage string, ephemeral bool) (*Response, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	source := shared.Jmap{
-		"type":       "migration",
-		"mode":       "pull",
-		"operation":  operation,
-		"secrets":    secrets,
-		"base-image": baseImage,
+		"type":        "migration",
+		"mode":        "pull",
+		"operation":   operation,
+		"certificate": certificate,
+		"secrets":     secrets,
+		"base-image":  baseImage,
 	}
 	body := shared.Jmap{
-		"source":    source,
-		"name":      name,
-		"config":    config,
-		"profiles":  profiles,
-		"ephemeral": ephemeral,
+		"architecture": architecture,
+		"config":       config,
+		"devices":      devices,
+		"ephemeral":    ephemeral,
+		"name":         name,
+		"profiles":     profiles,
+		"source":       source,
 	}
 
 	return c.post("containers", body, Async)
 }
 
 func (c *Client) Rename(name string, newName string) (*Response, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	oldNameParts := strings.SplitN(name, "/", 2)
 	newNameParts := strings.SplitN(newName, "/", 2)
 	if len(oldNameParts) != len(newNameParts) {
@@ -1468,7 +1751,7 @@ func (c *Client) Rename(name string, newName string) (*Response, error) {
 /* Wait for an operation */
 func (c *Client) WaitFor(waitURL string) (*shared.Operation, error) {
 	if len(waitURL) < 1 {
-		return nil, fmt.Errorf(gettext.Gettext("invalid wait url %s"), waitURL)
+		return nil, fmt.Errorf("invalid wait url %s", waitURL)
 	}
 
 	/* For convenience, waitURL is expected to be in the form of a
@@ -1495,48 +1778,76 @@ func (c *Client) WaitForSuccess(waitURL string) error {
 		return nil
 	}
 
-	return op.GetError()
+	return fmt.Errorf(op.Err)
 }
 
 func (c *Client) RestoreSnapshot(container string, snapshotName string, stateful bool) (*Response, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	body := shared.Jmap{"restore": snapshotName, "stateful": stateful}
 	return c.put(fmt.Sprintf("containers/%s", container), body, Async)
 }
 
 func (c *Client) Snapshot(container string, snapshotName string, stateful bool) (*Response, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	body := shared.Jmap{"name": snapshotName, "stateful": stateful}
 	return c.post(fmt.Sprintf("containers/%s/snapshots", container), body, Async)
 }
 
-func (c *Client) ListSnapshots(container string) ([]string, error) {
+func (c *Client) ListSnapshots(container string) ([]shared.SnapshotInfo, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	qUrl := fmt.Sprintf("containers/%s/snapshots?recursion=1", container)
 	resp, err := c.get(qUrl)
 	if err != nil {
 		return nil, err
 	}
 
-	var result []shared.Jmap
+	var result []shared.SnapshotInfo
 
 	if err := json.Unmarshal(resp.Metadata, &result); err != nil {
 		return nil, err
 	}
 
-	names := []string{}
+	return result, nil
+}
 
-	for _, snapjmap := range result {
-		name, err := snapjmap.GetString("name")
-		if err != nil {
-			continue
-		}
-		names = append(names, name)
+func (c *Client) SnapshotInfo(snapName string) (*shared.SnapshotInfo, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
 	}
 
-	return names, nil
+	pieces := strings.SplitN(snapName, shared.SnapshotDelimiter, 2)
+	if len(pieces) != 2 {
+		return nil, fmt.Errorf("invalid snapshot name %s", snapName)
+	}
+
+	qUrl := fmt.Sprintf("containers/%s/snapshots/%s", pieces[0], pieces[1])
+	resp, err := c.get(qUrl)
+	if err != nil {
+		return nil, err
+	}
+
+	var result shared.SnapshotInfo
+
+	if err := json.Unmarshal(resp.Metadata, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
 }
 
 func (c *Client) GetServerConfigString() ([]string, error) {
-	ss, err := c.ServerStatus()
 	var resp []string
+
+	ss, err := c.ServerStatus()
 	if err != nil {
 		return resp, err
 	}
@@ -1557,16 +1868,39 @@ func (c *Client) GetServerConfigString() ([]string, error) {
 }
 
 func (c *Client) SetServerConfig(key string, value string) (*Response, error) {
-	body := shared.Jmap{"config": shared.Jmap{key: value}}
-	return c.put("", body, Sync)
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	ss, err := c.ServerStatus()
+	if err != nil {
+		return nil, err
+	}
+
+	ss.Config[key] = value
+
+	return c.put("", ss, Sync)
+}
+
+func (c *Client) UpdateServerConfig(ss shared.BriefServerState) (*Response, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	return c.put("", ss, Sync)
 }
 
 /*
  * return string array representing a container's full configuration
  */
 func (c *Client) GetContainerConfig(container string) ([]string, error) {
-	st, err := c.ContainerStatus(container)
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	var resp []string
+
+	st, err := c.ContainerInfo(container)
 	if err != nil {
 		return resp, err
 	}
@@ -1584,7 +1918,11 @@ func (c *Client) GetContainerConfig(container string) ([]string, error) {
 }
 
 func (c *Client) SetContainerConfig(container, key, value string) error {
-	st, err := c.ContainerStatus(container)
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	st, err := c.ContainerInfo(container)
 	if err != nil {
 		return err
 	}
@@ -1595,13 +1933,12 @@ func (c *Client) SetContainerConfig(container, key, value string) error {
 		st.Config[key] = value
 	}
 
-	body := shared.Jmap{"config": st.Config, "profiles": st.Profiles, "name": container, "devices": st.Devices}
 	/*
 	 * Although container config is an async operation (we PUT to restore a
 	 * snapshot), we expect config to be a sync operation, so let's just
 	 * handle it here.
 	 */
-	resp, err := c.put(fmt.Sprintf("containers/%s", container), body, Async)
+	resp, err := c.put(fmt.Sprintf("containers/%s", container), st, Async)
 	if err != nil {
 		return err
 	}
@@ -1609,13 +1946,12 @@ func (c *Client) SetContainerConfig(container, key, value string) error {
 	return c.WaitForSuccess(resp.Operation)
 }
 
-func (c *Client) UpdateContainerConfig(container string, st shared.BriefContainerState) error {
-	body := shared.Jmap{"name": container,
-		"profiles":  st.Profiles,
-		"config":    st.Config,
-		"devices":   st.Devices,
-		"ephemeral": st.Ephemeral}
-	resp, err := c.put(fmt.Sprintf("containers/%s", container), body, Async)
+func (c *Client) UpdateContainerConfig(container string, st shared.BriefContainerInfo) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	resp, err := c.put(fmt.Sprintf("containers/%s", container), st, Async)
 	if err != nil {
 		return err
 	}
@@ -1624,6 +1960,10 @@ func (c *Client) UpdateContainerConfig(container string, st shared.BriefContaine
 }
 
 func (c *Client) ProfileCreate(p string) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	body := shared.Jmap{"name": p}
 
 	_, err := c.post("profiles", body, Sync)
@@ -1631,11 +1971,19 @@ func (c *Client) ProfileCreate(p string) error {
 }
 
 func (c *Client) ProfileDelete(p string) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	_, err := c.delete(fmt.Sprintf("profiles/%s", p), nil, Sync)
 	return err
 }
 
 func (c *Client) GetProfileConfig(profile string) (map[string]string, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	st, err := c.ProfileConfig(profile)
 	if err != nil {
 		return nil, err
@@ -1645,6 +1993,10 @@ func (c *Client) GetProfileConfig(profile string) (map[string]string, error) {
 }
 
 func (c *Client) SetProfileConfigItem(profile, key, value string) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	st, err := c.ProfileConfig(profile)
 	if err != nil {
 		shared.Debugf("Error getting profile %s to update", profile)
@@ -1657,21 +2009,28 @@ func (c *Client) SetProfileConfigItem(profile, key, value string) error {
 		st.Config[key] = value
 	}
 
-	body := shared.Jmap{"name": profile, "config": st.Config, "devices": st.Devices}
-	_, err = c.put(fmt.Sprintf("profiles/%s", profile), body, Sync)
+	_, err = c.put(fmt.Sprintf("profiles/%s", profile), st, Sync)
 	return err
 }
 
 func (c *Client) PutProfile(name string, profile shared.ProfileConfig) error {
-	if profile.Name != name {
-		return fmt.Errorf(gettext.Gettext("Cannot change profile name"))
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
 	}
-	body := shared.Jmap{"name": name, "config": profile.Config, "devices": profile.Devices}
-	_, err := c.put(fmt.Sprintf("profiles/%s", name), body, Sync)
+
+	if profile.Name != name {
+		return fmt.Errorf("Cannot change profile name")
+	}
+
+	_, err := c.put(fmt.Sprintf("profiles/%s", name), profile, Sync)
 	return err
 }
 
 func (c *Client) ListProfiles() ([]string, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	resp, err := c.get("profiles")
 	if err != nil {
 		return nil, err
@@ -1695,11 +2054,11 @@ func (c *Client) ListProfiles() ([]string, error) {
 		}
 
 		if count != 2 {
-			return nil, fmt.Errorf(gettext.Gettext("bad profile url %s"), url)
+			return nil, fmt.Errorf("bad profile url %s", url)
 		}
 
 		if version != shared.APIVersion {
-			return nil, fmt.Errorf(gettext.Gettext("bad version in profile url"))
+			return nil, fmt.Errorf("bad version in profile url")
 		}
 
 		names = append(names, name)
@@ -1709,30 +2068,41 @@ func (c *Client) ListProfiles() ([]string, error) {
 }
 
 func (c *Client) ApplyProfile(container, profile string) (*Response, error) {
-	st, err := c.ContainerStatus(container)
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	st, err := c.ContainerInfo(container)
 	if err != nil {
 		return nil, err
 	}
-	profiles := strings.Split(profile, ",")
-	body := shared.Jmap{"config": st.Config, "profiles": profiles, "name": st.Name, "devices": st.Devices}
 
-	return c.put(fmt.Sprintf("containers/%s", container), body, Async)
+	st.Profiles = strings.Split(profile, ",")
+
+	return c.put(fmt.Sprintf("containers/%s", container), st, Async)
 }
 
 func (c *Client) ContainerDeviceDelete(container, devname string) (*Response, error) {
-	st, err := c.ContainerStatus(container)
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	st, err := c.ContainerInfo(container)
 	if err != nil {
 		return nil, err
 	}
 
 	delete(st.Devices, devname)
 
-	body := shared.Jmap{"config": st.Config, "profiles": st.Profiles, "name": st.Name, "devices": st.Devices}
-	return c.put(fmt.Sprintf("containers/%s", container), body, Async)
+	return c.put(fmt.Sprintf("containers/%s", container), st, Async)
 }
 
 func (c *Client) ContainerDeviceAdd(container, devname, devtype string, props []string) (*Response, error) {
-	st, err := c.ContainerStatus(container)
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	st, err := c.ContainerInfo(container)
 	if err != nil {
 		return nil, err
 	}
@@ -1741,27 +2111,33 @@ func (c *Client) ContainerDeviceAdd(container, devname, devtype string, props []
 	for _, p := range props {
 		results := strings.SplitN(p, "=", 2)
 		if len(results) != 2 {
-			return nil, fmt.Errorf(gettext.Gettext("no value found in %q"), p)
+			return nil, fmt.Errorf("no value found in %q", p)
 		}
 		k := results[0]
 		v := results[1]
 		newdev[k] = v
 	}
+
 	if st.Devices != nil && st.Devices.ContainsName(devname) {
-		return nil, fmt.Errorf(gettext.Gettext("device already exists"))
+		return nil, fmt.Errorf("device already exists")
 	}
+
 	newdev["type"] = devtype
 	if st.Devices == nil {
 		st.Devices = shared.Devices{}
 	}
+
 	st.Devices[devname] = newdev
 
-	body := shared.Jmap{"config": st.Config, "profiles": st.Profiles, "name": st.Name, "devices": st.Devices}
-	return c.put(fmt.Sprintf("containers/%s", container), body, Async)
+	return c.put(fmt.Sprintf("containers/%s", container), st, Async)
 }
 
 func (c *Client) ContainerListDevices(container string) ([]string, error) {
-	st, err := c.ContainerStatus(container)
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
+	st, err := c.ContainerInfo(container)
 	if err != nil {
 		return nil, err
 	}
@@ -1773,6 +2149,10 @@ func (c *Client) ContainerListDevices(container string) ([]string, error) {
 }
 
 func (c *Client) ProfileDeviceDelete(profile, devname string) (*Response, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	st, err := c.ProfileConfig(profile)
 	if err != nil {
 		return nil, err
@@ -1784,11 +2164,14 @@ func (c *Client) ProfileDeviceDelete(profile, devname string) (*Response, error)
 		}
 	}
 
-	body := shared.Jmap{"config": st.Config, "name": st.Name, "devices": st.Devices}
-	return c.put(fmt.Sprintf("profiles/%s", profile), body, Sync)
+	return c.put(fmt.Sprintf("profiles/%s", profile), st, Sync)
 }
 
 func (c *Client) ProfileDeviceAdd(profile, devname, devtype string, props []string) (*Response, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	st, err := c.ProfileConfig(profile)
 	if err != nil {
 		return nil, err
@@ -1798,14 +2181,14 @@ func (c *Client) ProfileDeviceAdd(profile, devname, devtype string, props []stri
 	for _, p := range props {
 		results := strings.SplitN(p, "=", 2)
 		if len(results) != 2 {
-			return nil, fmt.Errorf(gettext.Gettext("no value found in %q"), p)
+			return nil, fmt.Errorf("no value found in %q", p)
 		}
 		k := results[0]
 		v := results[1]
 		newdev[k] = v
 	}
 	if st.Devices != nil && st.Devices.ContainsName(devname) {
-		return nil, fmt.Errorf(gettext.Gettext("device already exists"))
+		return nil, fmt.Errorf("device already exists")
 	}
 	newdev["type"] = devtype
 	if st.Devices == nil {
@@ -1813,11 +2196,14 @@ func (c *Client) ProfileDeviceAdd(profile, devname, devtype string, props []stri
 	}
 	st.Devices[devname] = newdev
 
-	body := shared.Jmap{"config": st.Config, "name": st.Name, "devices": st.Devices}
-	return c.put(fmt.Sprintf("profiles/%s", profile), body, Sync)
+	return c.put(fmt.Sprintf("profiles/%s", profile), st, Sync)
 }
 
 func (c *Client) ProfileListDevices(profile string) ([]string, error) {
+	if c.Remote.Public {
+		return nil, fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	st, err := c.ProfileConfig(profile)
 	if err != nil {
 		return nil, err
@@ -1827,7 +2213,6 @@ func (c *Client) ProfileListDevices(profile string) ([]string, error) {
 		devs = append(devs, fmt.Sprintf("%s: %s", n, d["type"]))
 	}
 	return devs, nil
-
 }
 
 // WebsocketDial attempts to dial a websocket to a LXD instance, parsing
@@ -1848,6 +2233,10 @@ func WebsocketDial(dialer websocket.Dialer, url string) (*websocket.Conn, error)
 }
 
 func (c *Client) ProfileCopy(name, newname string, dest *Client) error {
+	if c.Remote.Public {
+		return fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	st, err := c.ProfileConfig(name)
 	if err != nil {
 		return err
@@ -1858,19 +2247,40 @@ func (c *Client) ProfileCopy(name, newname string, dest *Client) error {
 	return err
 }
 
+func (c *Client) AsyncWaitMeta(resp *Response) (*shared.Jmap, error) {
+	op, err := c.WaitFor(resp.Operation)
+	if err != nil {
+		return nil, err
+	}
+
+	if op.StatusCode == shared.Failure {
+		return nil, fmt.Errorf(op.Err)
+	}
+
+	if op.StatusCode != shared.Success {
+		return nil, fmt.Errorf("got bad op status %s", op.Status)
+	}
+
+	return op.Metadata, nil
+}
+
 func (c *Client) ImageFromContainer(cname string, public bool, aliases []string, properties map[string]string) (string, error) {
+	if c.Remote.Public {
+		return "", fmt.Errorf("This function isn't supported by public remotes.")
+	}
+
 	source := shared.Jmap{"type": "container", "name": cname}
 	if shared.IsSnapshot(cname) {
 		source["type"] = "snapshot"
 	}
 	body := shared.Jmap{"public": public, "source": source, "properties": properties}
 
-	resp, err := c.post("images", body, Sync)
+	resp, err := c.post("images", body, Async)
 	if err != nil {
 		return "", err
 	}
 
-	jmap, err := resp.MetadataAsMap()
+	jmap, err := c.AsyncWaitMeta(resp)
 	if err != nil {
 		return "", err
 	}
@@ -1885,7 +2295,7 @@ func (c *Client) ImageFromContainer(cname string, public bool, aliases []string,
 		c.DeleteAlias(alias)
 		err = c.PostAlias(alias, alias, fingerprint)
 		if err != nil {
-			fmt.Printf(gettext.Gettext("Error adding alias %s")+"\n", alias)
+			return "", fmt.Errorf("Error adding alias %s: %s", alias, err)
 		}
 	}
 

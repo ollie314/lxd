@@ -7,22 +7,31 @@ POTFILE=po/$(DOMAIN).pot
 # dist is primarily for use when packaging; for development we still manage
 # dependencies via `go get` explicitly.
 # TODO: use git describe for versioning
-VERSION=$(shell grep "var Version" shared/flex.go | sed -r -e 's/.*"([0-9\.]*)"/\1/')
+VERSION=$(shell grep "var Version" shared/flex.go | cut -d'"' -f2)
 ARCHIVE=lxd-$(VERSION).tar
 
 .PHONY: default
 default:
+	# Must run twice due to go get race
 	-go get -t -v -d ./...
 	-go get -t -v -d ./...
-	go install -v ./...
-	@echo "LXD built succesfuly"
+	go install -v $(DEBUG) ./...
+	@echo "LXD built successfully"
 
 .PHONY: client
 client:
+	# Must run twice due to go get race
 	-go get -t -v -d ./...
 	-go get -t -v -d ./...
-	go install -v ./lxc
-	@echo "LXD client built succesfuly"
+	go install -v $(DEBUG) ./lxc
+	@echo "LXD client built successfully"
+
+.PHONY: update
+update:
+	# Must run twice due to go get race
+	-go get -t -v -d -u ./...
+	go get -t -v -d -u ./...
+	@echo "Dependencies updated"
 
 # This only needs to be done when migrate.proto is actually changed; since we
 # commit the .pb.go in the tree and it's not expected to change very often,
@@ -33,12 +42,13 @@ protobuf:
 
 .PHONY: check
 check: default
+	go get -v -x github.com/remyoudompheng/go-misc/deadcode
 	go test -v ./...
 	cd test && ./main.sh
 
 gccgo:
 	go build -compiler gccgo ./...
-	@echo "LXD built succesfuly with gccgo"
+	@echo "LXD built successfully with gccgo"
 
 .PHONY: dist
 dist:
@@ -69,8 +79,8 @@ update-po:
 	done
 
 update-pot:
-	go get -v -x launchpad.net/~snappy-dev/snappy/snappy/i18n/xgettext-go/
-	xgettext-go -o po/$(DOMAIN).pot --add-comments-tag=TRANSLATORS: --sort-output --package-name=$(DOMAIN) --msgid-bugs-address=lxc-devel@lists.linuxcontainers.org --keyword=gettext.Gettext --keyword-plural=gettext.NGettext *.go shared/*.go lxc/*.go lxd/*.go
+	go get -v -x github.com/ubuntu-core/snappy/i18n/xgettext-go/
+	xgettext-go -o po/$(DOMAIN).pot --add-comments-tag=TRANSLATORS: --sort-output --package-name=$(DOMAIN) --msgid-bugs-address=lxc-devel@lists.linuxcontainers.org --keyword=i18n.G --keyword-plural=i18n.NG *.go shared/*.go lxc/*.go lxd/*.go
 
 
 build-mo: $(MOFILES)
@@ -78,5 +88,5 @@ build-mo: $(MOFILES)
 static-analysis:
 	/bin/bash -x -c ". test/static_analysis.sh; static_analysis"
 
-tags:
+tags: *.go lxd/*.go shared/*.go lxc/*.go
 	find . | grep \.go | grep -v git | grep -v .swp | grep -v vagrant | xargs gotags > tags

@@ -3,18 +3,19 @@ package shared
 type StatusCode int
 
 const (
-	OK         StatusCode = 100
-	Started    StatusCode = 101
-	Stopped    StatusCode = 102
-	Running    StatusCode = 103
-	Cancelling StatusCode = 104
-	Pending    StatusCode = 105
-	Starting   StatusCode = 106
-	Stopping   StatusCode = 107
-	Aborting   StatusCode = 108
-	Freezing   StatusCode = 109
-	Frozen     StatusCode = 110
-	Thawed     StatusCode = 111
+	OperationCreated StatusCode = 100
+	Started          StatusCode = 101
+	Stopped          StatusCode = 102
+	Running          StatusCode = 103
+	Cancelling       StatusCode = 104
+	Pending          StatusCode = 105
+	Starting         StatusCode = 106
+	Stopping         StatusCode = 107
+	Aborting         StatusCode = 108
+	Freezing         StatusCode = 109
+	Frozen           StatusCode = 110
+	Thawed           StatusCode = 111
+	Error            StatusCode = 112
 
 	Success StatusCode = 200
 
@@ -24,21 +25,22 @@ const (
 
 func (o StatusCode) String() string {
 	return map[StatusCode]string{
-		OK:         "OK",
-		Started:    "Started",
-		Stopped:    "Stopped",
-		Running:    "Running",
-		Cancelling: "Cancelling",
-		Pending:    "Pending",
-		Success:    "Success",
-		Failure:    "Failure",
-		Cancelled:  "Cancelled",
-		Starting:   "Starting",
-		Stopping:   "Stopping",
-		Aborting:   "Aborting",
-		Freezing:   "Freezing",
-		Frozen:     "Frozen",
-		Thawed:     "Thawed",
+		OperationCreated: "Operation created",
+		Started:          "Started",
+		Stopped:          "Stopped",
+		Running:          "Running",
+		Cancelling:       "Cancelling",
+		Pending:          "Pending",
+		Success:          "Success",
+		Failure:          "Failure",
+		Cancelled:        "Cancelled",
+		Starting:         "Starting",
+		Stopping:         "Stopping",
+		Aborting:         "Aborting",
+		Freezing:         "Freezing",
+		Frozen:           "Frozen",
+		Thawed:           "Thawed",
+		Error:            "Error",
 	}[o]
 }
 
@@ -61,5 +63,6 @@ func FromLXCState(state int) StatusCode {
 		6: Freezing,
 		7: Frozen,
 		8: Thawed,
+		9: Error,
 	}[state]
 }

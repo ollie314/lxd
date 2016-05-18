@@ -5,18 +5,17 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 
-	"github.com/chai2010/gettext-go/gettext"
-	"golang.org/x/crypto/ssh/terminal"
-
 	"github.com/lxc/lxd"
+	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/gnuflag"
+	"github.com/lxc/lxd/shared/i18n"
+	"github.com/lxc/lxd/shared/termios"
 )
 
 type fileCmd struct {
@@ -30,21 +29,20 @@ func (c *fileCmd) showByDefault() bool {
 }
 
 func (c *fileCmd) usage() string {
-	return gettext.Gettext(
+	return i18n.G(
 		`Manage files on a container.
 
 lxc file pull <source> [<source>...] <target>
 lxc file push [--uid=UID] [--gid=GID] [--mode=MODE] <source> [<source>...] <target>
 lxc file edit <file>
 
-<source> in the case of pull, <target> in the case of push and <file> in the case of edit are <container name>/<path>
-This operation is only supported on containers that are currently running`)
+<source> in the case of pull, <target> in the case of push and <file> in the case of edit are <container name>/<path>`)
 }
 
 func (c *fileCmd) flags() {
-	gnuflag.IntVar(&c.uid, "uid", -1, gettext.Gettext("Set the file's uid on push"))
-	gnuflag.IntVar(&c.gid, "gid", -1, gettext.Gettext("Set the file's gid on push"))
-	gnuflag.StringVar(&c.mode, "mode", "0644", gettext.Gettext("Set the file's perms on push"))
+	gnuflag.IntVar(&c.uid, "uid", -1, i18n.G("Set the file's uid on push"))
+	gnuflag.IntVar(&c.gid, "gid", -1, i18n.G("Set the file's gid on push"))
+	gnuflag.StringVar(&c.mode, "mode", "", i18n.G("Set the file's perms on push"))
 }
 
 func (c *fileCmd) push(config *lxd.Config, args []string) error {
@@ -53,10 +51,10 @@ func (c *fileCmd) push(config *lxd.Config, args []string) error {
 	}
 
 	target := args[len(args)-1]
-	pathSpec := strings.SplitAfterN(target, "/", 2)
+	pathSpec := strings.SplitN(target, "/", 2)
 
 	if len(pathSpec) != 2 {
-		return fmt.Errorf(gettext.Gettext("Invalid target %s"), target)
+		return fmt.Errorf(i18n.G("Invalid target %s"), target)
 	}
 
 	targetPath := pathSpec[1]
@@ -69,6 +67,10 @@ func (c *fileCmd) push(config *lxd.Config, args []string) error {
 
 	mode := os.FileMode(0755)
 	if c.mode != "" {
+		if len(c.mode) == 3 {
+			c.mode = "0" + c.mode
+		}
+
 		m, err := strconv.ParseInt(c.mode, 0, 0)
 		if err != nil {
 			return err
@@ -122,7 +124,27 @@ func (c *fileCmd) push(config *lxd.Config, args []string) error {
 		if targetfilename == "" {
 			fpath = path.Join(fpath, path.Base(f.Name()))
 		}
-		err := d.PushFile(container, fpath, gid, uid, mode, f)
+
+		if c.mode == "" || c.uid == -1 || c.gid == -1 {
+			fMode, fUid, fGid, err := c.getOwner(f)
+			if err != nil {
+				return err
+			}
+
+			if c.mode == "" {
+				mode = fMode
+			}
+
+			if c.uid == -1 {
+				uid = fUid
+			}
+
+			if c.gid == -1 {
+				gid = fGid
+			}
+		}
+
+		err = d.PushFile(container, fpath, gid, uid, mode, f)
 		if err != nil {
 			return err
 		}
@@ -153,7 +175,7 @@ func (c *fileCmd) pull(config *lxd.Config, args []string) error {
 	if err == nil {
 		targetIsDir = sb.IsDir()
 		if !targetIsDir && len(args)-1 > 1 {
-			return fmt.Errorf(gettext.Gettext("More than one file to download, but target is not a directory"))
+			return fmt.Errorf(i18n.G("More than one file to download, but target is not a directory"))
 		}
 	} else if strings.HasSuffix(target, string(os.PathSeparator)) || len(args)-1 > 1 {
 		if err := os.MkdirAll(target, 0755); err != nil {
@@ -165,7 +187,7 @@ func (c *fileCmd) pull(config *lxd.Config, args []string) error {
 	for _, f := range args[:len(args)-1] {
 		pathSpec := strings.SplitN(f, "/", 2)
 		if len(pathSpec) != 2 {
-			return fmt.Errorf(gettext.Gettext("Invalid source %s"), f)
+			return fmt.Errorf(i18n.G("Invalid source %s"), f)
 		}
 
 		remote, container := config.ParseRemoteAndContainer(pathSpec[0])
@@ -211,37 +233,25 @@ func (c *fileCmd) edit(config *lxd.Config, args []string) error {
 		return errArgs
 	}
 
-	if !terminal.IsTerminal(syscall.Stdin) {
-		_, err := ioutil.ReadAll(os.Stdin)
-		if err != nil {
-			return err
-		}
+	// If stdin isn't a terminal, read text from it
+	if !termios.IsTerminal(int(syscall.Stdin)) {
+		return c.push(config, append([]string{os.Stdin.Name()}, args[0]))
 	}
 
+	// Create temp file
 	f, err := ioutil.TempFile("", "lxd_file_edit_")
 	fname := f.Name()
 	f.Close()
 	os.Remove(fname)
 	defer os.Remove(fname)
+
+	// Extract current value
 	err = c.pull(config, append([]string{args[0]}, fname))
 	if err != nil {
 		return err
 	}
 
-	editor := os.Getenv("VISUAL")
-	if editor == "" {
-		editor = os.Getenv("EDITOR")
-		if editor == "" {
-			editor = "vi"
-		}
-	}
-
-	cmdParts := strings.Fields(editor)
-	cmd := exec.Command(cmdParts[0], append(cmdParts[1:], fname)...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err = cmd.Run()
+	_, err = shared.TextEditor(fname, []byte{})
 	if err != nil {
 		return err
 	}
@@ -251,7 +261,7 @@ func (c *fileCmd) edit(config *lxd.Config, args []string) error {
 		return err
 	}
 
-	return err
+	return nil
 }
 
 func (c *fileCmd) run(config *lxd.Config, args []string) error {
@@ -267,6 +277,6 @@ func (c *fileCmd) run(config *lxd.Config, args []string) error {
 	case "edit":
 		return c.edit(config, args[1:])
 	default:
-		return fmt.Errorf(gettext.Gettext("invalid argument %s"), args[0])
+		return errArgs
 	}
 }

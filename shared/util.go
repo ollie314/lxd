@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
-	"crypto/tls"
 	"encoding/gob"
 	"encoding/hex"
 	"encoding/json"
@@ -16,35 +15,14 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
 )
 
 const SnapshotDelimiter = "/"
 const DefaultPort = "8443"
-
-func GetFileStat(p string) (uid int, gid int, major int, minor int,
-	inode uint64, nlink int, err error) {
-	var stat syscall.Stat_t
-	err = syscall.Lstat(p, &stat)
-	if err != nil {
-		return
-	}
-	uid = int(stat.Uid)
-	gid = int(stat.Gid)
-	inode = uint64(stat.Ino)
-	nlink = int(stat.Nlink)
-	major = -1
-	minor = -1
-	if stat.Mode&syscall.S_IFBLK != 0 || stat.Mode&syscall.S_IFCHR != 0 {
-		major = int(stat.Rdev / 256)
-		minor = int(stat.Rdev % 256)
-	}
-
-	return
-}
 
 // AddSlash adds a slash to the end of paths if they don't already have one.
 // This can be useful for rsyncing things, since rsync has behavior present on
@@ -118,24 +96,26 @@ func LogPath(path ...string) string {
 	return filepath.Join(items...)
 }
 
-func ParseLXDFileHeaders(headers http.Header) (uid int, gid int, mode os.FileMode) {
+func ParseLXDFileHeaders(headers http.Header) (uid int, gid int, mode int) {
 	uid, err := strconv.Atoi(headers.Get("X-LXD-uid"))
 	if err != nil {
-		uid = 0
+		uid = -1
 	}
 
 	gid, err = strconv.Atoi(headers.Get("X-LXD-gid"))
 	if err != nil {
-		gid = 0
+		gid = -1
 	}
 
-	/* Allow people to send stuff with a leading 0 for octal or a regular
-	 * int that represents the perms when redered in octal. */
-	rawMode, err := strconv.ParseInt(headers.Get("X-LXD-mode"), 0, 0)
+	mode, err = strconv.Atoi(headers.Get("X-LXD-mode"))
 	if err != nil {
-		rawMode = 0644
+		mode = -1
+	} else {
+		rawMode, err := strconv.ParseInt(headers.Get("X-LXD-mode"), 0, 0)
+		if err == nil {
+			mode = int(os.FileMode(rawMode) & os.ModePerm)
+		}
 	}
-	mode = os.FileMode(rawMode)
 
 	return uid, gid, mode
 }
@@ -207,29 +187,6 @@ func ReadStdin() ([]byte, error) {
 		return nil, err
 	}
 	return line, nil
-}
-
-func GetTLSConfig(certf string, keyf string) (*tls.Config, error) {
-	cert, err := tls.LoadX509KeyPair(certf, keyf)
-	if err != nil {
-		return nil, err
-	}
-
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
-		ClientAuth:         tls.RequireAnyClientCert,
-		Certificates:       []tls.Certificate{cert},
-		MinVersion:         tls.VersionTLS12,
-		MaxVersion:         tls.VersionTLS12,
-		CipherSuites: []uint16{
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
-		PreferServerCipherSuites: true,
-	}
-
-	tlsConfig.BuildNameToCertificate()
-
-	return tlsConfig, nil
 }
 
 func WriteAll(w io.Writer, buf []byte) error {
@@ -307,6 +264,10 @@ func (r BytesReadCloser) Close() error {
 
 func IsSnapshot(name string) bool {
 	return strings.Contains(name, SnapshotDelimiter)
+}
+
+func ExtractSnapshotName(name string) string {
+	return strings.SplitN(name, SnapshotDelimiter, 2)[1]
 }
 
 func ReadDir(p string) ([]string, error) {
@@ -392,67 +353,48 @@ func IntInSlice(key int, list []int) bool {
 	return false
 }
 
-/*
- * returns 1 if path is mounted shared:
- * returns 0 if path is not listed
- * returns -1 if path is explicitly mounted as not-shared
- */
-func isSharedMount(file *os.File, pathName string) int {
-	_, err := file.Seek(0, 0)
-	if err != nil {
-		Debugf("Error rewinding mountinfo file: %s\n", err)
-		return 0
+func IsTrue(value string) bool {
+	if StringInSlice(strings.ToLower(value), []string{"true", "1", "yes", "on"}) {
+		return true
 	}
+
+	return false
+}
+
+func IsOnSharedMount(pathName string) (bool, error) {
+	file, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+
+	absPath, err := filepath.Abs(pathName)
+	if err != nil {
+		return false, err
+	}
+
+	expPath, err := os.Readlink(absPath)
+	if err != nil {
+		expPath = absPath
+	}
+
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
 		rows := strings.Fields(line)
-		if !strings.HasSuffix(pathName, rows[3]) || rows[4] != pathName {
+
+		if rows[4] != expPath {
 			continue
 		}
+
 		if strings.HasPrefix(rows[6], "shared:") {
-			return 1
+			return true, nil
 		} else {
-			return -1
+			return false, nil
 		}
 	}
-	return 0
-}
 
-func IsSharedMount(pathName string) bool {
-	file, err := os.Open("/proc/self/mountinfo")
-	if err != nil {
-		return false
-	}
-	defer file.Close()
-
-	switch isSharedMount(file, pathName) {
-	case 1:
-		return true
-	default:
-		return false
-	}
-}
-
-func IsOnSharedMount(pathName string) bool {
-	file, err := os.Open("/proc/self/mountinfo")
-	if err != nil {
-		return false
-	}
-	defer file.Close()
-
-	for {
-		switch isSharedMount(file, pathName) {
-		case 1:
-			return true
-		case -1:
-			return false
-		}
-		if pathName == "/" || pathName == "." {
-			return false
-		}
-		pathName = filepath.Dir(pathName)
-	}
+	return false, nil
 }
 
 func IsBlockdev(fm os.FileMode) bool {
@@ -471,12 +413,15 @@ func IsBlockdevPath(pathName string) bool {
 
 func BlockFsDetect(dev string) (string, error) {
 	out, err := exec.Command("blkid", "-s", "TYPE", "-o", "value", dev).Output()
-	return strings.TrimSpace(string(out)), err
+	if err != nil {
+		return "", fmt.Errorf("Failed to run blkid on: %s", dev)
+	}
+
+	return strings.TrimSpace(string(out)), nil
 }
 
 // DeepCopy copies src to dest by using encoding/gob so its not that fast.
 func DeepCopy(src, dest interface{}) error {
-
 	buff := new(bytes.Buffer)
 	enc := gob.NewEncoder(buff)
 	dec := gob.NewDecoder(buff)
@@ -542,17 +487,234 @@ func ValidHostname(name string) bool {
 	return true
 }
 
-func InterfaceToBool(value interface{}) bool {
-	switch t := value.(type) {
-	case bool:
-		return t
-	case float32:
-		return t == 1
-	case float64:
-		return t == 1
-	case int:
-		return t == 1
-	default:
-		return false
+func TextEditor(inPath string, inContent []byte) ([]byte, error) {
+	var f *os.File
+	var err error
+	var path string
+
+	// Detect the text editor to use
+	editor := os.Getenv("VISUAL")
+	if editor == "" {
+		editor = os.Getenv("EDITOR")
+		if editor == "" {
+			for _, p := range []string{"editor", "vi", "emacs", "nano"} {
+				_, err := exec.LookPath(p)
+				if err == nil {
+					editor = p
+					break
+				}
+			}
+			if editor == "" {
+				return []byte{}, fmt.Errorf("No text editor found, please set the EDITOR environment variable.")
+			}
+		}
 	}
+
+	if inPath == "" {
+		// If provided input, create a new file
+		f, err = ioutil.TempFile("", "lxd_editor_")
+		if err != nil {
+			return []byte{}, err
+		}
+
+		if err = f.Chmod(0600); err != nil {
+			f.Close()
+			os.Remove(f.Name())
+			return []byte{}, err
+		}
+
+		f.Write(inContent)
+		f.Close()
+
+		path = f.Name()
+		defer os.Remove(path)
+	} else {
+		path = inPath
+	}
+
+	cmdParts := strings.Fields(editor)
+	cmd := exec.Command(cmdParts[0], append(cmdParts[1:], path)...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err = cmd.Run()
+	if err != nil {
+		return []byte{}, err
+	}
+
+	content, err := ioutil.ReadFile(path)
+	if err != nil {
+		return []byte{}, err
+	}
+
+	return content, nil
+}
+
+func ParseMetadata(metadata interface{}) (map[string]interface{}, error) {
+	newMetadata := make(map[string]interface{})
+	s := reflect.ValueOf(metadata)
+	if !s.IsValid() {
+		return nil, nil
+	}
+
+	if s.Kind() == reflect.Map {
+		for _, k := range s.MapKeys() {
+			if k.Kind() != reflect.String {
+				return nil, fmt.Errorf("Invalid metadata provided (key isn't a string).")
+			}
+			newMetadata[k.String()] = s.MapIndex(k).Interface()
+		}
+	} else if s.Kind() == reflect.Ptr && !s.Elem().IsValid() {
+		return nil, nil
+	} else {
+		return nil, fmt.Errorf("Invalid metadata provided (type isn't a map).")
+	}
+
+	return newMetadata, nil
+}
+
+// Parse a size string in bytes (e.g. 200kB or 5GB) into the number of bytes it
+// represents. Supports suffixes up to EB. "" == 0.
+func ParseByteSizeString(input string) (int64, error) {
+	if input == "" {
+		return 0, nil
+	}
+
+	if len(input) < 3 {
+		return -1, fmt.Errorf("Invalid value: %s", input)
+	}
+
+	// Extract the suffix
+	suffix := input[len(input)-2:]
+
+	// Extract the value
+	value := input[0 : len(input)-2]
+	valueInt, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return -1, fmt.Errorf("Invalid integer: %s", input)
+	}
+
+	if valueInt < 0 {
+		return -1, fmt.Errorf("Invalid value: %d", valueInt)
+	}
+
+	// Figure out the multiplicator
+	multiplicator := int64(0)
+	switch suffix {
+	case "kB":
+		multiplicator = 1024
+	case "MB":
+		multiplicator = 1024 * 1024
+	case "GB":
+		multiplicator = 1024 * 1024 * 1024
+	case "TB":
+		multiplicator = 1024 * 1024 * 1024 * 1024
+	case "PB":
+		multiplicator = 1024 * 1024 * 1024 * 1024 * 1024
+	case "EB":
+		multiplicator = 1024 * 1024 * 1024 * 1024 * 1024 * 1024
+	default:
+		return -1, fmt.Errorf("Unsupported suffix: %s", suffix)
+	}
+
+	return valueInt * multiplicator, nil
+}
+
+// Parse a size string in bits (e.g. 200kbit or 5Gbit) into the number of bits
+// it represents. Supports suffixes up to Ebit. "" == 0.
+func ParseBitSizeString(input string) (int64, error) {
+	if input == "" {
+		return 0, nil
+	}
+
+	if len(input) < 5 {
+		return -1, fmt.Errorf("Invalid value: %s", input)
+	}
+
+	// Extract the suffix
+	suffix := input[len(input)-4:]
+
+	// Extract the value
+	value := input[0 : len(input)-4]
+	valueInt, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return -1, fmt.Errorf("Invalid integer: %s", input)
+	}
+
+	if valueInt < 0 {
+		return -1, fmt.Errorf("Invalid value: %d", valueInt)
+	}
+
+	// Figure out the multiplicator
+	multiplicator := int64(0)
+	switch suffix {
+	case "kbit":
+		multiplicator = 1000
+	case "Mbit":
+		multiplicator = 1000 * 1000
+	case "Gbit":
+		multiplicator = 1000 * 1000 * 1000
+	case "Tbit":
+		multiplicator = 1000 * 1000 * 1000 * 1000
+	case "Pbit":
+		multiplicator = 1000 * 1000 * 1000 * 1000 * 1000
+	case "Ebit":
+		multiplicator = 1000 * 1000 * 1000 * 1000 * 1000 * 1000
+	default:
+		return -1, fmt.Errorf("Unsupported suffix: %s", suffix)
+	}
+
+	return valueInt * multiplicator, nil
+}
+
+func GetByteSizeString(input int64) string {
+	if input < 1024 {
+		return fmt.Sprintf("%d bytes", input)
+	}
+
+	value := float64(input)
+
+	for _, unit := range []string{"kB", "MB", "GB", "TB", "PB", "EB"} {
+		value = value / 1024
+		if value < 1024 {
+			return fmt.Sprintf("%.2f%s", value, unit)
+		}
+	}
+
+	return fmt.Sprintf("%.2fEB", value)
+}
+
+type TransferProgress struct {
+	io.Reader
+	percentage float64
+	total      int64
+
+	Length  int64
+	Handler func(int)
+}
+
+func (pt *TransferProgress) Read(p []byte) (int, error) {
+	n, err := pt.Reader.Read(p)
+
+	if pt.Handler == nil {
+		return n, err
+	}
+
+	if n > 0 {
+		pt.total += int64(n)
+		percentage := float64(pt.total) / float64(pt.Length) * float64(100)
+
+		if percentage-pt.percentage > 0.9 {
+			pt.percentage = percentage
+
+			progressInt := 1 - (int(percentage) % 1) + int(percentage)
+			if progressInt > 100 {
+				progressInt = 100
+			}
+
+			pt.Handler(progressInt)
+		}
+	}
+
+	return n, err
 }

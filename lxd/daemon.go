@@ -2,15 +2,17 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
 	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -22,25 +24,36 @@ import (
 
 	"golang.org/x/crypto/scrypt"
 
+	"github.com/coreos/go-systemd/activation"
 	"github.com/gorilla/mux"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/stgraber/lxd-go-systemd/activation"
 	"github.com/syndtr/gocapability/capability"
 	"gopkg.in/tomb.v2"
 
 	"github.com/lxc/lxd"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/logging"
 
 	log "gopkg.in/inconshreveable/log15.v2"
 )
 
-var aaEnabled = true
-var runningInUserns = false
+// AppArmor
+var aaAdmin = true
+var aaAvailable = true
+var aaConfined = false
 
-const (
-	pwSaltBytes = 32
-	pwHashBytes = 64
-)
+// CGroup
+var cgBlkioController = false
+var cgCpuController = false
+var cgCpusetController = false
+var cgDevicesController = false
+var cgMemoryController = false
+var cgNetPrioController = false
+var cgPidsController = false
+var cgSwapAccounting = false
+
+// UserNS
+var runningInUserns = false
 
 type Socket struct {
 	Socket      net.Listener
@@ -49,32 +62,36 @@ type Socket struct {
 
 // A Daemon can respond to requests from a shared client.
 type Daemon struct {
-	architectures []int
-	BackingFs     string
-	certf         string
-	clientCerts   []x509.Certificate
-	db            *sql.DB
-	IdmapSet      *shared.IdmapSet
-	keyf          string
-	lxcpath       string
-	mux           *mux.Router
-	tomb          tomb.Tomb
-	pruneChan     chan bool
+	architectures       []int
+	BackingFs           string
+	clientCerts         []x509.Certificate
+	db                  *sql.DB
+	group               string
+	IdmapSet            *shared.IdmapSet
+	lxcpath             string
+	mux                 *mux.Router
+	tomb                tomb.Tomb
+	readyChan           chan bool
+	pruneChan           chan bool
+	shutdownChan        chan bool
+	resetAutoUpdateChan chan bool
 
 	Storage storage
 
-	Sockets []Socket
-
-	tlsconfig *tls.Config
+	TCPSocket  *Socket
+	UnixSocket *Socket
 
 	devlxd *net.UnixListener
 
-	configValues map[string]string
-
-	IsMock bool
+	MockMode  bool
+	SetupMode bool
 
 	imagesDownloading     map[string]chan bool
 	imagesDownloadingLock sync.RWMutex
+
+	tlsConfig *tls.Config
+
+	proxy func(req *http.Request) (*url.URL, error)
 }
 
 // Command is the basic structure for every API call.
@@ -88,18 +105,30 @@ type Command struct {
 	delete        func(d *Daemon, r *http.Request) Response
 }
 
-func (d *Daemon) httpGetSync(url string) (*lxd.Response, error) {
+func (d *Daemon) httpGetSync(url string, certificate string) (*lxd.Response, error) {
 	var err error
-	if d.tlsconfig == nil {
-		d.tlsconfig, err = shared.GetTLSConfig(d.certf, d.keyf)
+
+	var cert *x509.Certificate
+	if certificate != "" {
+		certBlock, _ := pem.Decode([]byte(certificate))
+
+		cert, err = x509.ParseCertificate(certBlock.Bytes)
 		if err != nil {
 			return nil, err
 		}
 	}
-	tr := &http.Transport{
-		TLSClientConfig: d.tlsconfig,
-		Dial:            shared.RFC3493Dialer,
+
+	tlsConfig, err := shared.GetTLSConfig("", "", cert)
+	if err != nil {
+		return nil, err
 	}
+
+	tr := &http.Transport{
+		TLSClientConfig: tlsConfig,
+		Dial:            shared.RFC3493Dialer,
+		Proxy:           d.proxy,
+	}
+
 	myhttp := http.Client{
 		Transport: tr,
 	}
@@ -128,17 +157,28 @@ func (d *Daemon) httpGetSync(url string) (*lxd.Response, error) {
 	return resp, nil
 }
 
-func (d *Daemon) httpGetFile(url string) (*http.Response, error) {
+func (d *Daemon) httpGetFile(url string, certificate string) (*http.Response, error) {
 	var err error
-	if d.tlsconfig == nil {
-		d.tlsconfig, err = shared.GetTLSConfig(d.certf, d.keyf)
+
+	var cert *x509.Certificate
+	if certificate != "" {
+		certBlock, _ := pem.Decode([]byte(certificate))
+
+		cert, err = x509.ParseCertificate(certBlock.Bytes)
 		if err != nil {
 			return nil, err
 		}
 	}
+
+	tlsConfig, err := shared.GetTLSConfig("", "", cert)
+	if err != nil {
+		return nil, err
+	}
+
 	tr := &http.Transport{
-		TLSClientConfig: d.tlsconfig,
+		TLSClientConfig: tlsConfig,
 		Dial:            shared.RFC3493Dialer,
+		Proxy:           d.proxy,
 	}
 	myhttp := http.Client{
 		Transport: tr,
@@ -246,7 +286,7 @@ func (d *Daemon) createCmd(version string, c Command) {
 			return
 		}
 
-		if *debug && r.Method != "GET" && isJSONRequest(r) {
+		if debug && r.Method != "GET" && isJSONRequest(r) {
 			newBody := &bytes.Buffer{}
 			captured := &bytes.Buffer{}
 			multiW := io.MultiWriter(newBody, captured)
@@ -305,15 +345,10 @@ func (d *Daemon) createCmd(version string, c Command) {
 }
 
 func (d *Daemon) SetupStorageDriver() error {
-	lvmVgName, err := d.ConfigValueGet("storage.lvm_vg_name")
-	if err != nil {
-		return fmt.Errorf("Couldn't read config: %s", err)
-	}
+	var err error
 
-	zfsPoolName, err := d.ConfigValueGet("storage.zfs_pool_name")
-	if err != nil {
-		return fmt.Errorf("Couldn't read config: %s", err)
-	}
+	lvmVgName := daemonConfig["storage.lvm_vg_name"].Get()
+	zfsPoolName := daemonConfig["storage.zfs_pool_name"].Get()
 
 	if lvmVgName != "" {
 		d.Storage, err = newStorage(d, storageTypeLvm)
@@ -343,34 +378,55 @@ func (d *Daemon) SetupStorageDriver() error {
 	return err
 }
 
+// have we setup shared mounts?
+var sharedMounted bool
+var sharedMountsLock sync.Mutex
+
 func setupSharedMounts() error {
-	path := shared.VarPath("shmounts")
-	if shared.IsOnSharedMount(path) {
-		// / may already be ms-shared, or shmounts may have
-		// been mounted by a previous lxd run
+	if sharedMounted {
 		return nil
 	}
-	if !shared.PathExists(path) {
-		if err := os.Mkdir(path, 0755); err != nil {
-			return err
-		}
+
+	sharedMountsLock.Lock()
+	defer sharedMountsLock.Unlock()
+
+	if sharedMounted {
+		return nil
 	}
+
+	path := shared.VarPath("shmounts")
+
+	isShared, err := shared.IsOnSharedMount(path)
+	if err != nil {
+		return err
+	}
+
+	if isShared {
+		// / may already be ms-shared, or shmounts may have
+		// been mounted by a previous lxd run
+		sharedMounted = true
+		return nil
+	}
+
 	if err := syscall.Mount(path, path, "none", syscall.MS_BIND, ""); err != nil {
 		return err
 	}
+
 	var flags uintptr = syscall.MS_SHARED | syscall.MS_REC
 	if err := syscall.Mount(path, path, "none", flags, ""); err != nil {
 		return err
 	}
+
+	sharedMounted = true
 	return nil
 }
 
 func (d *Daemon) ListenAddresses() ([]string, error) {
 	addresses := make([]string, 0)
 
-	value, err := d.ConfigValueGet("core.https_address")
-	if err != nil || value == "" {
-		return addresses, err
+	value := daemonConfig["core.https_address"].Get()
+	if value == "" {
+		return addresses, nil
 	}
 
 	localHost, localPort, err := net.SplitHostPort(value)
@@ -415,99 +471,25 @@ func (d *Daemon) ListenAddresses() ([]string, error) {
 			}
 		}
 	} else {
-		addresses = append(addresses, value)
+		if strings.Contains(localHost, ":") {
+			addresses = append(addresses, fmt.Sprintf("[%s]:%s", localHost, localPort))
+		} else {
+			addresses = append(addresses, fmt.Sprintf("%s:%s", localHost, localPort))
+		}
 	}
 
 	return addresses, nil
 }
 
-func bytesZero(x []byte) bool {
-	for _, b := range x {
-		if b != 0 {
-			return false
-		}
-	}
-	return true
-}
-
-func bytesEqual(x, y []byte) bool {
-	if len(x) != len(y) {
-		return false
-	}
-	for i, b := range x {
-		if y[i] != b {
-			return false
-		}
-	}
-	return true
-}
-
-func isZeroIP(x []byte) bool {
-	if x == nil {
-		return false
-	}
-
-	if bytesZero(x) {
-		return true
-	}
-
-	if len(x) != net.IPv6len {
-		return false
-	}
-
-	var v4InV6Prefix = []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff}
-	return bytesEqual(x[0:12], v4InV6Prefix) && bytesZero(x[12:])
-}
-
-func IpsEqual(ip1 net.IP, ip2 net.IP) bool {
-	if ip1.Equal(ip2) {
-		return true
-	}
-
-	/* the go std library Equal doesn't recognize [::] == 0.0.0.0, since it
-	 * tests for the ipv4 prefix, which isn't present in [::]. However,
-	 * they are in fact equal. Let's test for this case too.
-	 */
-	return isZeroIP(ip1) && isZeroIP(ip2)
-}
-
-func (d *Daemon) UpdateHTTPsPort(oldAddress string, newAddress string) error {
-	var sockets []Socket
+func (d *Daemon) UpdateHTTPsPort(newAddress string) error {
+	oldAddress := daemonConfig["core.https_address"].Get()
 
 	if oldAddress == newAddress {
 		return nil
 	}
 
-	if oldAddress != "" {
-		oldHost, oldPort, err := net.SplitHostPort(oldAddress)
-		if err != nil {
-			oldHost = oldAddress
-			oldPort = shared.DefaultPort
-		}
-
-		// Strip brackets around IPv6 once we've gotten rid of the port
-		oldHost = strings.TrimLeft(oldHost, "[")
-		oldHost = strings.TrimRight(oldHost, "]")
-
-		for _, socket := range d.Sockets {
-			host, port, err := net.SplitHostPort(socket.Socket.Addr().String())
-			if err != nil {
-				host = socket.Socket.Addr().String()
-				port = shared.DefaultPort
-			}
-
-			// Strip brackets around IPv6 once we've gotten rid of the port
-			host = strings.TrimLeft(host, "[")
-			host = strings.TrimRight(host, "]")
-
-			if !shared.PathExists(host) && IpsEqual(net.ParseIP(host), net.ParseIP(oldHost)) && port == oldPort {
-				socket.Socket.Close()
-			} else {
-				sockets = append(sockets, socket)
-			}
-		}
-	} else {
-		sockets = d.Sockets
+	if d.TCPSocket != nil {
+		d.TCPSocket.Socket.Close()
 	}
 
 	if newAddress != "" {
@@ -521,66 +503,25 @@ func (d *Daemon) UpdateHTTPsPort(oldAddress string, newAddress string) error {
 			}
 		}
 
-		tlsConfig, err := shared.GetTLSConfig(d.certf, d.keyf)
-		if err != nil {
-			return err
+		var tcpl net.Listener
+		for i := 0; i < 10; i++ {
+			tcpl, err = tls.Listen("tcp", newAddress, d.tlsConfig)
+			if err == nil {
+				break
+			}
+
+			time.Sleep(100 * time.Millisecond)
 		}
 
-		tcpl, err := tls.Listen("tcp", newAddress, tlsConfig)
 		if err != nil {
 			return fmt.Errorf("cannot listen on https socket: %v", err)
 		}
 
 		d.tomb.Go(func() error { return http.Serve(tcpl, d.mux) })
-		sockets = append(sockets, Socket{Socket: tcpl, CloseOnExit: true})
+		d.TCPSocket = &Socket{Socket: tcpl, CloseOnExit: true}
 	}
 
-	d.Sockets = sockets
 	return nil
-}
-
-func (d *Daemon) pruneExpiredImages() {
-	shared.Debugf("Pruning expired images")
-	expiry, err := dbImageExpiryGet(d.db)
-	if err != nil { // no expiry
-		shared.Debugf("Failed getting the cached image expiry timeout")
-		return
-	}
-
-	q := `
-SELECT fingerprint FROM images WHERE cached=1 AND last_use_date<=strftime('%s', 'now', '-` + expiry + ` day')`
-	inargs := []interface{}{}
-	var fingerprint string
-	outfmt := []interface{}{fingerprint}
-
-	result, err := dbQueryScan(d.db, q, inargs, outfmt)
-	if err != nil {
-		shared.Debugf("Error making cache expiry query: %s", err)
-		return
-	}
-	shared.Debugf("Found %d expired images", len(result))
-
-	for _, r := range result {
-		if err := doDeleteImage(d, r[0].(string)); err != nil {
-			shared.Debugf("Error deleting image: %s", err)
-		}
-	}
-	shared.Debugf("Done pruning expired images")
-}
-
-// StartDaemon starts the shared daemon with the provided configuration.
-func startDaemon() (*Daemon, error) {
-	d := &Daemon{
-		IsMock:                false,
-		imagesDownloading:     map[string]chan bool{},
-		imagesDownloadingLock: sync.RWMutex{},
-	}
-
-	if err := d.Init(); err != nil {
-		return nil, err
-	}
-
-	return d, nil
 }
 
 func haveMacAdmin() bool {
@@ -595,63 +536,129 @@ func haveMacAdmin() bool {
 }
 
 func (d *Daemon) Init() error {
-	/* Setup logging */
-	if shared.Log == nil {
-		shared.SetLogger("", "", true, true)
+	/* Initialize some variables */
+	d.imagesDownloading = map[string]chan bool{}
+
+	d.readyChan = make(chan bool)
+	d.shutdownChan = make(chan bool)
+
+	/* Set the executable path */
+	/* Set the LVM environment */
+	err := os.Setenv("LVM_SUPPRESS_FD_WARNINGS", "1")
+	if err != nil {
+		return err
 	}
 
-	if !d.IsMock {
-		shared.Log.Info("LXD is starting",
+	/* Setup logging if that wasn't done before */
+	if shared.Log == nil {
+		shared.Log, err = logging.GetLogger("", "", true, true, nil)
+		if err != nil {
+			return err
+		}
+	}
+
+	/* Print welcome message */
+	if d.MockMode {
+		shared.Log.Info("LXD is starting in mock mode",
+			log.Ctx{"path": shared.VarPath("")})
+	} else if d.SetupMode {
+		shared.Log.Info("LXD is starting in setup mode",
 			log.Ctx{"path": shared.VarPath("")})
 	} else {
-		shared.Log.Info("Mock LXD is starting",
+		shared.Log.Info("LXD is starting in normal mode",
 			log.Ctx{"path": shared.VarPath("")})
 	}
 
 	/* Detect user namespaces */
 	runningInUserns = shared.RunningInUserNS()
 
-	/* Detect apparmor support */
-	if aaEnabled && os.Getenv("LXD_SECURITY_APPARMOR") == "false" {
-		aaEnabled = false
-		shared.Log.Warn("Per-container AppArmor profiles have been manually disabled")
+	/* Detect AppArmor support */
+	if aaAvailable && os.Getenv("LXD_SECURITY_APPARMOR") == "false" {
+		aaAvailable = false
+		aaAdmin = false
+		shared.Log.Warn("AppArmor support has been manually disabled")
 	}
 
-	if aaEnabled && !shared.IsDir("/sys/kernel/security/apparmor") {
-		aaEnabled = false
-		shared.Log.Warn("Per-container AppArmor profiles disabled because of lack of kernel support")
+	if aaAvailable && !shared.IsDir("/sys/kernel/security/apparmor") {
+		aaAvailable = false
+		aaAdmin = false
+		shared.Log.Warn("AppArmor support has been disabled because of lack of kernel support")
 	}
 
-	if aaEnabled && !haveMacAdmin() {
-		shared.Log.Warn("Per-container AppArmor profiles are disabled because mac_admin capability is missing.")
-		aaEnabled = false
+	_, err = exec.LookPath("apparmor_parser")
+	if aaAvailable && err != nil {
+		aaAvailable = false
+		aaAdmin = false
+		shared.Log.Warn("AppArmor support has been disabled because 'apparmor_parser' couldn't be found")
 	}
 
-	_, err := exec.LookPath("apparmor_parser")
-	if aaEnabled && err != nil {
-		aaEnabled = false
-		shared.Log.Warn("Per-container AppArmor profiles disabled because 'apparmor_parser' couldn't be found")
+	/* Detect AppArmor admin support */
+	if aaAdmin && !haveMacAdmin() {
+		aaAdmin = false
+		shared.Log.Warn("Per-container AppArmor profiles are disabled because the mac_admin capability is missing.")
 	}
 
-	if aaEnabled && runningInUserns {
-		aaEnabled = false
-		shared.Log.Warn("Per-container AppArmor profiles disabled because LXD is running inside a user namespace")
+	if aaAdmin && runningInUserns {
+		aaAdmin = false
+		shared.Log.Warn("Per-container AppArmor profiles are disabled because LXD is running in an unprivileged container.")
+	}
+
+	/* Detect AppArmor confinment */
+	if !aaConfined {
+		profile := aaProfile()
+		if profile != "unconfined" && profile != "" {
+			aaConfined = true
+			shared.Log.Warn("Per-container AppArmor profiles are disabled because LXD is already protected by AppArmor.")
+		}
+	}
+
+	/* Detect CGroup support */
+	cgBlkioController = shared.PathExists("/sys/fs/cgroup/blkio/")
+	if !cgBlkioController {
+		shared.Log.Warn("Couldn't find the CGroup blkio controller, I/O limits will be ignored.")
+	}
+
+	cgCpuController = shared.PathExists("/sys/fs/cgroup/cpu/")
+	if !cgCpuController {
+		shared.Log.Warn("Couldn't find the CGroup CPU controller, CPU time limits will be ignored.")
+	}
+
+	cgCpusetController = shared.PathExists("/sys/fs/cgroup/cpuset/")
+	if !cgCpusetController {
+		shared.Log.Warn("Couldn't find the CGroup CPUset controller, CPU pinning will be ignored.")
+	}
+
+	cgDevicesController = shared.PathExists("/sys/fs/cgroup/devices/")
+	if !cgDevicesController {
+		shared.Log.Warn("Couldn't find the CGroup devices controller, device access control won't work.")
+	}
+
+	cgMemoryController = shared.PathExists("/sys/fs/cgroup/memory/")
+	if !cgMemoryController {
+		shared.Log.Warn("Couldn't find the CGroup memory controller, memory limits will be ignored.")
+	}
+
+	cgNetPrioController = shared.PathExists("/sys/fs/cgroup/net_prio/")
+	if !cgNetPrioController {
+		shared.Log.Warn("Couldn't find the CGroup network class controller, network limits will be ignored.")
+	}
+
+	cgPidsController = shared.PathExists("/sys/fs/cgroup/pids/")
+	if !cgPidsController {
+		shared.Log.Warn("Couldn't find the CGroup pids controller, process limits will be ignored.")
+	}
+
+	cgSwapAccounting = shared.PathExists("/sys/fs/cgroup/memory/memory.memsw.limit_in_bytes")
+	if !cgSwapAccounting {
+		shared.Log.Warn("CGroup memory swap accounting is disabled, swap limits will be ignored.")
 	}
 
 	/* Get the list of supported architectures */
 	var architectures = []int{}
 
-	uname := syscall.Utsname{}
-	if err := syscall.Uname(&uname); err != nil {
+	architectureName, err := shared.ArchitectureGetLocal()
+	if err != nil {
 		return err
-	}
-
-	architectureName := ""
-	for _, c := range uname.Machine {
-		if c == 0 {
-			break
-		}
-		architectureName += string(byte(c))
 	}
 
 	architecture, err := shared.ArchitectureId(architectureName)
@@ -669,21 +676,32 @@ func (d *Daemon) Init() error {
 	}
 	d.architectures = architectures
 
-	/* Create required paths */
+	/* Set container path */
 	d.lxcpath = shared.VarPath("containers")
-	err = os.MkdirAll(d.lxcpath, 0755)
-	if err != nil {
-		return err
-	}
 
-	// Create default directories
-	if err := os.MkdirAll(shared.VarPath("images"), 0700); err != nil {
+	/* Make sure all our directories are available */
+	if err := os.MkdirAll(shared.VarPath("containers"), 0711); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(shared.VarPath("snapshots"), 0700); err != nil {
+	if err := os.MkdirAll(shared.VarPath("devices"), 0711); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(shared.VarPath("devlxd"), 0755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(shared.VarPath("images"), 0700); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(shared.LogPath(), 0700); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(shared.VarPath("security"), 0700); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(shared.VarPath("shmounts"), 0711); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(shared.VarPath("snapshots"), 0700); err != nil {
 		return err
 	}
 
@@ -711,34 +729,42 @@ func (d *Daemon) Init() error {
 		return err
 	}
 
-	/* Prune images */
-	d.pruneChan = make(chan bool)
+	/* Load all config values from the database */
+	err = daemonConfigInit(d.db)
+	if err != nil {
+		return err
+	}
+
+	/* Setup the storage driver */
+	if !d.MockMode {
+		err = d.SetupStorageDriver()
+		if err != nil {
+			return fmt.Errorf("Failed to setup storage: %s", err)
+		}
+	}
+
+	/* Log expiry */
 	go func() {
+		t := time.NewTicker(24 * time.Hour)
 		for {
-			expiryStr, err := dbImageExpiryGet(d.db)
-			var expiry int
+			shared.Debugf("Expiring log files")
+
+			err := d.ExpireLogs()
 			if err != nil {
-				expiry = 10
-			} else {
-				expiry, err = strconv.Atoi(expiryStr)
-				if err != nil {
-					expiry = 10
-				}
-				if expiry <= 0 {
-					expiry = 1
-				}
+				shared.Log.Error("Failed to expire logs", log.Ctx{"err": err})
 			}
-			timer := time.NewTimer(time.Duration(expiry) * 24 * time.Hour)
-			timeChan := timer.C
-			select {
-			case <-timeChan:
-				d.pruneExpiredImages()
-			case <-d.pruneChan:
-				d.pruneExpiredImages()
-				timer.Stop()
-			}
+
+			shared.Debugf("Done expiring log files")
+			<-t.C
 		}
 	}()
+
+	/* set the initial proxy function based on config values in the DB */
+	d.proxy = shared.ProxyFromConfig(
+		daemonConfig["core.proxy_https"].Get(),
+		daemonConfig["core.proxy_http"].Get(),
+		daemonConfig["core.proxy_ignore_hosts"].Get(),
+	)
 
 	/* Setup /dev/lxd */
 	d.devlxd, err = createAndBindDevLxd()
@@ -746,40 +772,42 @@ func (d *Daemon) Init() error {
 		return err
 	}
 
-	if err := setupSharedMounts(); err != nil {
-		return err
-	}
-
-	var tlsConfig *tls.Config
-	if !d.IsMock {
-		err = d.SetupStorageDriver()
-		if err != nil {
-			return fmt.Errorf("Failed to setup storage: %s", err)
-		}
-
-		/* Restart containers */
-		go func() {
-			containersWatch(d)
-			containersRestart(d)
-		}()
+	if !d.MockMode {
+		/* Start the scheduler */
+		go deviceEventListener(d)
 
 		/* Setup the TLS authentication */
 		certf, keyf, err := readMyCert()
 		if err != nil {
 			return err
 		}
-		d.certf = certf
-		d.keyf = keyf
-		readSavedClientCAList(d)
 
-		tlsConfig, err = shared.GetTLSConfig(d.certf, d.keyf)
+		cert, err := tls.LoadX509KeyPair(certf, keyf)
 		if err != nil {
 			return err
 		}
+
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: true,
+			ClientAuth:         tls.RequestClientCert,
+			Certificates:       []tls.Certificate{cert},
+			MinVersion:         tls.VersionTLS12,
+			MaxVersion:         tls.VersionTLS12,
+			CipherSuites: []uint16{
+				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
+			PreferServerCipherSuites: true,
+		}
+		tlsConfig.BuildNameToCertificate()
+
+		d.tlsConfig = tlsConfig
+
+		readSavedClientCAList(d)
 	}
 
 	/* Setup the web server */
 	d.mux = mux.NewRouter()
+	d.mux.StrictSlash(false)
 
 	d.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -788,6 +816,10 @@ func (d *Daemon) Init() error {
 
 	for _, c := range api10 {
 		d.createCmd("1.0", c)
+	}
+
+	for _, c := range apiInternal {
+		d.createCmd("internal", c)
 	}
 
 	d.mux.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -801,17 +833,15 @@ func (d *Daemon) Init() error {
 		return err
 	}
 
-	var sockets []Socket
-
 	if len(listeners) > 0 {
 		shared.Log.Info("LXD is socket activated")
 
 		for _, listener := range listeners {
 			if shared.PathExists(listener.Addr().String()) {
-				sockets = append(sockets, Socket{Socket: listener, CloseOnExit: false})
+				d.UnixSocket = &Socket{Socket: listener, CloseOnExit: false}
 			} else {
-				tlsListener := tls.NewListener(listener, tlsConfig)
-				sockets = append(sockets, Socket{Socket: tlsListener, CloseOnExit: false})
+				tlsListener := tls.NewListener(listener, d.tlsConfig)
+				d.TCPSocket = &Socket{Socket: tlsListener, CloseOnExit: false}
 			}
 		}
 	} else {
@@ -822,8 +852,7 @@ func (d *Daemon) Init() error {
 		// If the socket exists, let's try to connect to it and see if there's
 		// a lxd running.
 		if shared.PathExists(localSocketPath) {
-			c := &lxd.Config{Remotes: map[string]lxd.RemoteConfig{}}
-			_, err := lxd.NewClient(c, "")
+			_, err := lxd.NewClient(&lxd.DefaultConfig, "local")
 			if err != nil {
 				shared.Log.Debug("Detected stale unix socket, deleting")
 				// Connecting failed, so let's delete the socket and
@@ -832,6 +861,8 @@ func (d *Daemon) Init() error {
 				if err != nil {
 					return err
 				}
+			} else {
+				return fmt.Errorf("LXD is already running.")
 			}
 		}
 
@@ -849,49 +880,52 @@ func (d *Daemon) Init() error {
 			return err
 		}
 
-		gid, err := shared.GroupId(*group)
-		if err != nil {
-			return err
+		var gid int
+		if d.group != "" {
+			gid, err = shared.GroupId(d.group)
+			if err != nil {
+				return err
+			}
+		} else {
+			gid = os.Getgid()
 		}
 
 		if err := os.Chown(localSocketPath, os.Getuid(), gid); err != nil {
 			return err
 		}
 
-		sockets = append(sockets, Socket{Socket: unixl, CloseOnExit: true})
+		d.UnixSocket = &Socket{Socket: unixl, CloseOnExit: true}
 	}
 
-	listenAddr, err := d.ConfigValueGet("core.https_address")
-	if err != nil {
-		return err
-	}
-
+	listenAddr := daemonConfig["core.https_address"].Get()
 	if listenAddr != "" {
 		_, _, err := net.SplitHostPort(listenAddr)
 		if err != nil {
 			listenAddr = fmt.Sprintf("%s:%s", listenAddr, shared.DefaultPort)
 		}
 
-		tcpl, err := tls.Listen("tcp", listenAddr, tlsConfig)
+		tcpl, err := tls.Listen("tcp", listenAddr, d.tlsConfig)
 		if err != nil {
 			shared.Log.Error("cannot listen on https socket, skipping...", log.Ctx{"err": err})
 		} else {
-			sockets = append(sockets, Socket{Socket: tcpl, CloseOnExit: true})
+			if d.TCPSocket != nil {
+				shared.Log.Info("Replacing systemd TCP socket by configure one")
+				d.TCPSocket.Socket.Close()
+			}
+			d.TCPSocket = &Socket{Socket: tcpl, CloseOnExit: true}
 		}
-	}
-
-	if !d.IsMock {
-		d.Sockets = sockets
-	} else {
-		d.Sockets = []Socket{}
 	}
 
 	d.tomb.Go(func() error {
 		shared.Log.Info("REST API daemon:")
-		for _, socket := range d.Sockets {
-			shared.Log.Info(" - binding socket", log.Ctx{"socket": socket.Socket.Addr()})
-			current_socket := socket
-			d.tomb.Go(func() error { return http.Serve(current_socket.Socket, d.mux) })
+		if d.UnixSocket != nil {
+			shared.Log.Info(" - binding Unix socket", log.Ctx{"socket": d.UnixSocket.Socket.Addr()})
+			d.tomb.Go(func() error { return http.Serve(d.UnixSocket.Socket, &lxdHttpServer{d.mux, d}) })
+		}
+
+		if d.TCPSocket != nil {
+			shared.Log.Info(" - binding TCP socket", log.Ctx{"socket": d.TCPSocket.Socket.Addr()})
+			d.tomb.Go(func() error { return http.Serve(d.TCPSocket.Socket, &lxdHttpServer{d.mux, d}) })
 		}
 
 		d.tomb.Go(func() error {
@@ -900,6 +934,70 @@ func (d *Daemon) Init() error {
 		})
 		return nil
 	})
+
+	if !d.MockMode && !d.SetupMode {
+		err := d.Ready()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (d *Daemon) Ready() error {
+	/* Prune images */
+	d.pruneChan = make(chan bool)
+	go func() {
+		pruneExpiredImages(d)
+		for {
+			timer := time.NewTimer(24 * time.Hour)
+			timeChan := timer.C
+			select {
+			case <-timeChan:
+				/* run once per day */
+				pruneExpiredImages(d)
+			case <-d.pruneChan:
+				/* run when image.remote_cache_expiry is changed */
+				pruneExpiredImages(d)
+				timer.Stop()
+			}
+		}
+	}()
+
+	/* Auto-update images */
+	d.resetAutoUpdateChan = make(chan bool)
+	go func() {
+		autoUpdateImages(d)
+
+		for {
+			interval := daemonConfig["images.auto_update_interval"].GetInt64()
+			if interval > 0 {
+				timer := time.NewTimer(time.Duration(interval) * time.Hour)
+				timeChan := timer.C
+
+				select {
+				case <-timeChan:
+					autoUpdateImages(d)
+				case <-d.resetAutoUpdateChan:
+					timer.Stop()
+				}
+			} else {
+				select {
+				case <-d.resetAutoUpdateChan:
+					continue
+				}
+			}
+		}
+	}()
+
+	/* Restore containers */
+	go containersRestart(d)
+
+	/* Re-balance in case things changed while LXD was down */
+	deviceTaskBalance(d)
+
+	close(d.readyChan)
 
 	return nil
 }
@@ -924,7 +1022,7 @@ func (d *Daemon) numRunningContainers() (int, error) {
 
 	count := 0
 	for _, r := range results {
-		container, err := containerLXDLoad(d, r)
+		container, err := containerLoadByName(d, r)
 		if err != nil {
 			continue
 		}
@@ -945,7 +1043,11 @@ func (d *Daemon) Stop() error {
 
 	d.tomb.Kill(errStop)
 	shared.Log.Info("Stopping REST API handler:")
-	for _, socket := range d.Sockets {
+	for _, socket := range []*Socket{d.TCPSocket, d.UnixSocket} {
+		if socket == nil {
+			continue
+		}
+
 		if socket.CloseOnExit {
 			shared.Log.Info(" - closing socket", log.Ctx{"socket": socket.Socket.Addr()})
 			socket.Socket.Close()
@@ -959,7 +1061,6 @@ func (d *Daemon) Stop() error {
 		shared.Log.Debug("Unmounting shmounts")
 
 		syscall.Unmount(shared.VarPath("shmounts"), syscall.MNT_DETACH)
-		os.RemoveAll(shared.VarPath("shmounts"))
 	} else {
 		shared.Debugf("Not unmounting shmounts (containers are still running)")
 	}
@@ -970,7 +1071,7 @@ func (d *Daemon) Stop() error {
 	shared.Log.Debug("Stopping /dev/lxd handler")
 	d.devlxd.Close()
 
-	if d.IsMock || forceStop {
+	if d.MockMode || forceStop {
 		return nil
 	}
 
@@ -982,136 +1083,142 @@ func (d *Daemon) Stop() error {
 	return err
 }
 
-// ConfigKeyIsValid returns if the given key is a known config value.
-func (d *Daemon) ConfigKeyIsValid(key string) bool {
-	switch key {
-	case "core.https_address":
-		return true
-	case "core.trust_password":
-		return true
-	case "storage.lvm_vg_name":
-		return true
-	case "storage.lvm_thinpool_name":
-		return true
-	case "storage.zfs_pool_name":
-		return true
-	case "images.remote_cache_expiry":
-		return true
-	}
-
-	return false
-}
-
-// ConfigValueGet returns a config value from the memory,
-// calls ConfigValuesGet if required.
-// It returns a empty result if the config key isn't given.
-func (d *Daemon) ConfigValueGet(key string) (string, error) {
-	if d.configValues == nil {
-		if _, err := d.ConfigValuesGet(); err != nil {
-			return "", err
-		}
-	}
-
-	if val, ok := d.configValues[key]; ok {
-		return val, nil
-	}
-
-	return "", nil
-}
-
-// ConfigValuesGet fetches all config values and stores them in memory.
-func (d *Daemon) ConfigValuesGet() (map[string]string, error) {
-	if d.configValues == nil {
-		var err error
-		d.configValues, err = dbConfigValuesGet(d.db)
-		if err != nil {
-			return d.configValues, err
-		}
-	}
-
-	return d.configValues, nil
-}
-
-// ConfigValueSet sets a new or updates a config value,
-// it updates the value in the DB and in memory.
-func (d *Daemon) ConfigValueSet(key string, value string) error {
-	if err := dbConfigValueSet(d.db, key, value); err != nil {
-		return err
-	}
-
-	if d.configValues == nil {
-		if _, err := d.ConfigValuesGet(); err != nil {
-			return err
-		}
-	}
-
-	if value == "" {
-		delete(d.configValues, key)
-	} else {
-		d.configValues[key] = value
-	}
-
-	return nil
-}
-
-// PasswordSet sets the password to the new value.
-func (d *Daemon) PasswordSet(password string) error {
-	shared.Log.Info("Setting new https password")
-	var value = password
-	if password != "" {
-		buf := make([]byte, pwSaltBytes)
-		_, err := io.ReadFull(rand.Reader, buf)
-		if err != nil {
-			return err
-		}
-
-		hash, err := scrypt.Key([]byte(password), buf, 1<<14, 8, 1, pwHashBytes)
-		if err != nil {
-			return err
-		}
-
-		buf = append(buf, hash...)
-		value = hex.EncodeToString(buf)
-	}
-
-	err := d.ConfigValueSet("core.trust_password", value)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// PasswordCheck checks if the given password is the same
-// as we have in the DB.
-func (d *Daemon) PasswordCheck(password string) bool {
-	value, err := d.ConfigValueGet("core.trust_password")
-	if err != nil {
-		shared.Log.Error("verifyAdminPwd", log.Ctx{"err": err})
-		return false
-	}
+func (d *Daemon) PasswordCheck(password string) error {
+	value := daemonConfig["core.trust_password"].Get()
 
 	// No password set
 	if value == "" {
-		return false
+		return fmt.Errorf("No password is set")
 	}
 
+	// Compare the password
 	buff, err := hex.DecodeString(value)
 	if err != nil {
-		shared.Log.Error("hex decode failed", log.Ctx{"err": err})
-		return false
+		return err
 	}
 
-	salt := buff[0:pwSaltBytes]
-	hash, err := scrypt.Key([]byte(password), salt, 1<<14, 8, 1, pwHashBytes)
+	salt := buff[0:32]
+	hash, err := scrypt.Key([]byte(password), salt, 1<<14, 8, 1, 64)
 	if err != nil {
-		shared.Log.Error("Failed to create hash to check", log.Ctx{"err": err})
-		return false
+		return err
 	}
-	if !bytes.Equal(hash, buff[pwSaltBytes:]) {
-		shared.Log.Error("Bad password received", log.Ctx{"err": err})
-		return false
+
+	if !bytes.Equal(hash, buff[32:]) {
+		return fmt.Errorf("Bad password provided")
 	}
-	shared.Log.Debug("Verified the admin password")
-	return true
+
+	return nil
+}
+
+func (d *Daemon) ExpireLogs() error {
+	entries, err := ioutil.ReadDir(shared.LogPath())
+	if err != nil {
+		return err
+	}
+
+	result, err := dbContainersList(d.db, cTypeRegular)
+	if err != nil {
+		return err
+	}
+
+	newestFile := func(path string, dir os.FileInfo) time.Time {
+		newest := dir.ModTime()
+
+		entries, err := ioutil.ReadDir(path)
+		if err != nil {
+			return newest
+		}
+
+		for _, entry := range entries {
+			if entry.ModTime().After(newest) {
+				newest = entry.ModTime()
+			}
+		}
+
+		return newest
+	}
+
+	for _, entry := range entries {
+		// Check if the container still exists
+		if shared.StringInSlice(entry.Name(), result) {
+			// Remove any log file which wasn't modified in the past 48 hours
+			logs, err := ioutil.ReadDir(shared.LogPath(entry.Name()))
+			if err != nil {
+				return err
+			}
+
+			for _, logfile := range logs {
+				path := shared.LogPath(entry.Name(), logfile.Name())
+
+				// Always keep the LXC config
+				if logfile.Name() == "lxc.conf" {
+					continue
+				}
+
+				// Deal with directories (snapshots)
+				if logfile.IsDir() {
+					newest := newestFile(path, logfile)
+					if time.Since(newest).Hours() >= 48 {
+						os.RemoveAll(path)
+						if err != nil {
+							return err
+						}
+					}
+
+					continue
+				}
+
+				// Individual files
+				if time.Since(logfile.ModTime()).Hours() >= 48 {
+					err := os.Remove(path)
+					if err != nil {
+						return err
+					}
+				}
+			}
+		} else {
+			// Empty directory if unchanged in the past 24 hours
+			path := shared.LogPath(entry.Name())
+			newest := newestFile(path, entry)
+			if time.Since(newest).Hours() >= 24 {
+				err := os.RemoveAll(path)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+type lxdHttpServer struct {
+	r *mux.Router
+	d *Daemon
+}
+
+func (s *lxdHttpServer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	allowedOrigin := daemonConfig["core.https_allowed_origin"].Get()
+	origin := req.Header.Get("Origin")
+	if allowedOrigin != "" && origin != "" {
+		rw.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+	}
+
+	allowedMethods := daemonConfig["core.https_allowed_methods"].Get()
+	if allowedMethods != "" && origin != "" {
+		rw.Header().Set("Access-Control-Allow-Methods", allowedMethods)
+	}
+
+	allowedHeaders := daemonConfig["core.https_allowed_headers"].Get()
+	if allowedHeaders != "" && origin != "" {
+		rw.Header().Set("Access-Control-Allow-Headers", allowedHeaders)
+	}
+
+	// OPTIONS request don't need any further processing
+	if req.Method == "OPTIONS" {
+		return
+	}
+
+	// Call the original server
+	s.r.ServeHTTP(rw, req)
 }

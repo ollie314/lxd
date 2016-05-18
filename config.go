@@ -25,40 +25,74 @@ type Config struct {
 	// The implicit "local" remote is always available and communicates
 	// with the local daemon over a unix socket.
 	Remotes map[string]RemoteConfig `yaml:"remotes"`
+
+	// Command line aliases for `lxc`
+	Aliases map[string]string `yaml:"aliases"`
+
+	// This is the path to the config directory, so the client can find
+	// previously stored server certs, give good error messages, and save
+	// new server certs, etc.
+	//
+	// We don't need to store it, because of course once we've loaded this
+	// structure we already know where it is :)
+	ConfigDir string `yaml:"-"`
 }
 
 // RemoteConfig holds details for communication with a remote daemon.
 type RemoteConfig struct {
-	Addr   string `yaml:"addr"`
-	Public bool   `yaml:"public"`
+	Addr     string `yaml:"addr"`
+	Public   bool   `yaml:"public"`
+	Protocol string `yaml:"protocol,omitempty"`
+	Static   bool   `yaml:"-"`
 }
 
 var LocalRemote = RemoteConfig{
 	Addr:   "unix://",
+	Static: true,
 	Public: false}
-var defaultRemote = map[string]RemoteConfig{"local": LocalRemote}
+
+var ImagesRemote = RemoteConfig{
+	Addr:   "https://images.linuxcontainers.org",
+	Public: true}
+
+var UbuntuRemote = RemoteConfig{
+	Addr:     "https://cloud-images.ubuntu.com/releases",
+	Static:   true,
+	Public:   true,
+	Protocol: "simplestreams"}
+
+var UbuntuDailyRemote = RemoteConfig{
+	Addr:     "https://cloud-images.ubuntu.com/daily",
+	Static:   true,
+	Public:   true,
+	Protocol: "simplestreams"}
+
+var StaticRemotes = map[string]RemoteConfig{
+	"local":        LocalRemote,
+	"ubuntu":       UbuntuRemote,
+	"ubuntu-daily": UbuntuDailyRemote}
+
+var DefaultRemotes = map[string]RemoteConfig{
+	"images":       ImagesRemote,
+	"local":        LocalRemote,
+	"ubuntu":       UbuntuRemote,
+	"ubuntu-daily": UbuntuDailyRemote}
 
 var DefaultConfig = Config{
-	Remotes:       defaultRemote,
-	DefaultRemote: "local"}
-
-var ConfigDir = "$HOME/.config/lxc"
-var configFileName = "config.yml"
-
-func ConfigPath(file string) string {
-	return os.ExpandEnv(path.Join(ConfigDir, file))
+	Remotes:       DefaultRemotes,
+	DefaultRemote: "local",
+	Aliases:       map[string]string{},
 }
 
-func ServerCertPath(name string) string {
-	return path.Join(ConfigPath("servercerts"), fmt.Sprintf("%s.crt", name))
-}
-
-// LoadConfig reads the configuration from the config path.
-func LoadConfig() (*Config, error) {
-	data, err := ioutil.ReadFile(ConfigPath(configFileName))
+// LoadConfig reads the configuration from the config path; if the path does
+// not exist, it returns a default configuration.
+func LoadConfig(path string) (*Config, error) {
+	data, err := ioutil.ReadFile(path)
 	if os.IsNotExist(err) {
 		// A missing file is equivalent to the default configuration.
-		return &DefaultConfig, nil
+		withPath := DefaultConfig
+		withPath.ConfigDir = filepath.Dir(path)
+		return &withPath, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("cannot read config file: %v", err)
@@ -72,13 +106,20 @@ func LoadConfig() (*Config, error) {
 	if c.Remotes == nil {
 		c.Remotes = make(map[string]RemoteConfig)
 	}
+	c.ConfigDir = filepath.Dir(path)
+
+	for k, v := range StaticRemotes {
+		c.Remotes[k] = v
+	}
 
 	return &c, nil
 }
 
 // SaveConfig writes the provided configuration to the config file.
-func SaveConfig(c *Config) error {
-	fname := ConfigPath(configFileName)
+func SaveConfig(c *Config, fname string) error {
+	for k, _ := range StaticRemotes {
+		delete(c.Remotes, k)
+	}
 
 	// Ignore errors on these two calls. Create will report any problems.
 	os.Remove(fname + ".new")
@@ -116,4 +157,12 @@ func (c *Config) ParseRemoteAndContainer(raw string) (string, string) {
 
 func (c *Config) ParseRemote(raw string) string {
 	return strings.SplitN(raw, ":", 2)[0]
+}
+
+func (c *Config) ConfigPath(file string) string {
+	return path.Join(c.ConfigDir, file)
+}
+
+func (c *Config) ServerCertPath(name string) string {
+	return path.Join(c.ConfigDir, "servercerts", fmt.Sprintf("%s.crt", name))
 }

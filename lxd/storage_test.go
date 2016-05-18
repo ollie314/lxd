@@ -1,6 +1,12 @@
 package main
 
-import log "gopkg.in/inconshreveable/log15.v2"
+import (
+	"fmt"
+
+	"github.com/gorilla/websocket"
+
+	log "gopkg.in/inconshreveable/log15.v2"
+)
 
 type storageMock struct {
 	d     *Daemon
@@ -39,6 +45,10 @@ func (s *storageMock) ContainerCreateFromImage(
 	return nil
 }
 
+func (s *storageMock) ContainerCanRestore(container container, sourceContainer container) error {
+	return nil
+}
+
 func (s *storageMock) ContainerDelete(container container) error {
 	return nil
 }
@@ -69,6 +79,17 @@ func (s *storageMock) ContainerRestore(
 	return nil
 }
 
+func (s *storageMock) ContainerSetQuota(
+	container container, size int64) error {
+
+	return nil
+}
+
+func (s *storageMock) ContainerGetUsage(
+	container container) (int64, error) {
+
+	return 0, nil
+}
 func (s *storageMock) ContainerSnapshotCreate(
 	snapshotContainer container, sourceContainer container) error {
 
@@ -86,10 +107,33 @@ func (s *storageMock) ContainerSnapshotRename(
 	return nil
 }
 
+func (s *storageMock) ContainerSnapshotStart(container container) error {
+	return nil
+}
+
+func (s *storageMock) ContainerSnapshotStop(container container) error {
+	return nil
+}
+
+func (s *storageMock) ContainerSnapshotCreateEmpty(snapshotContainer container) error {
+	return nil
+}
+
 func (s *storageMock) ImageCreate(fingerprint string) error {
 	return nil
 }
 
 func (s *storageMock) ImageDelete(fingerprint string) error {
+	return nil
+}
+
+func (s *storageMock) MigrationType() MigrationFSType {
+	return MigrationFSType_RSYNC
+}
+
+func (s *storageMock) MigrationSource(container container) (MigrationStorageSourceDriver, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+func (s *storageMock) MigrationSink(live bool, container container, snapshots []container, conn *websocket.Conn) error {
 	return nil
 }

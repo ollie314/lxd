@@ -6,29 +6,36 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"os/exec"
+	"sort"
 	"strings"
 	"syscall"
 
-	"github.com/chai2010/gettext-go/gettext"
 	"github.com/olekukonko/tablewriter"
-	"golang.org/x/crypto/ssh/terminal"
 	"gopkg.in/yaml.v2"
 
 	"github.com/lxc/lxd"
 	"github.com/lxc/lxd/shared"
+	"github.com/lxc/lxd/shared/gnuflag"
+	"github.com/lxc/lxd/shared/i18n"
+	"github.com/lxc/lxd/shared/termios"
 )
 
 type configCmd struct {
 	httpAddr string
+	expanded bool
 }
 
 func (c *configCmd) showByDefault() bool {
 	return true
 }
 
-var configEditHelp string = gettext.Gettext(
-	`### This is a yaml representation of the configuration.
+func (c *configCmd) flags() {
+	gnuflag.BoolVar(&c.expanded, "expanded", false, i18n.G("Whether to show the expanded configuration"))
+}
+
+func (c *configCmd) configEditHelp() string {
+	return i18n.G(
+		`### This is a yaml representation of the configuration.
 ### Any line starting with a '# will be ignored.
 ###
 ### A sample configuration looks like:
@@ -45,22 +52,29 @@ var configEditHelp string = gettext.Gettext(
 ### ephemeral: false
 ###
 ### Note that the name is shown but cannot be changed`)
+}
 
 func (c *configCmd) usage() string {
-	return gettext.Gettext(
+	return i18n.G(
 		`Manage configuration.
 
 lxc config device add <[remote:]container> <name> <type> [key=value]...     Add a device to a container.
-lxc config device list [remote:]<container>                                 List devices for container.
-lxc config device show [remote:]<container>                                 Show full device details for container.
-lxc config device remove [remote:]<container> <name>                        Remove device from container.
-lxc config edit [remote:]<container>                                        Edit container configuration in external editor.
-lxc config get [remote:]<container> key                                     Get configuration key.
-lxc config set [remote:]<container> key value                               Set container configuration key.
-lxc config unset [remote:]<container> key                                   Unset container configuration key.
-lxc config set key value                                                    Set server configuration key.
-lxc config unset key                                                        Unset server configuration key.
-lxc config show [remote:]<container>                                        Show container configuration.
+lxc config device get <[remote:]container> <name> <key>                     Get a device property.
+lxc config device set <[remote:]container> <name> <key> <value>             Set a device property.
+lxc config device unset <[remote:]container> <name> <key>                   Unset a device property.
+lxc config device list <[remote:]container>                                 List devices for container.
+lxc config device show <[remote:]container>                                 Show full device details for container.
+lxc config device remove <[remote:]container> <name>                        Remove device from container.
+
+lxc config get [remote:][container] <key>                                   Get container or server configuration key.
+lxc config set [remote:][container] <key> <value>                           Set container or server configuration key.
+lxc config unset [remote:][container] <key>                                 Unset container or server configuration key.
+lxc config show [remote:][container] [--expanded]                           Show container or server configuration.
+lxc config edit [remote:][container]                                        Edit container or server configuration in external editor.
+    Edit configuration, either by launching external editor or reading STDIN.
+    Example: lxc config edit <container> # launch editor
+             cat config.yml | lxc config edit <config> # read from config.yml
+
 lxc config trust list [remote]                                              List all trusted certs.
 lxc config trust add [remote] <certfile.crt>                                Add certfile.crt to trusted hosts.
 lxc config trust remove [remote] [hostname|fingerprint]                     Remove the cert from trusted hosts.
@@ -79,9 +93,7 @@ To set the server trust password:
     lxc config set core.trust_password blah`)
 }
 
-func (c *configCmd) flags() {}
-
-func doSet(config *lxd.Config, args []string) error {
+func (c *configCmd) doSet(config *lxd.Config, args []string, unset bool) error {
 	if len(args) != 4 {
 		return errArgs
 	}
@@ -96,12 +108,24 @@ func doSet(config *lxd.Config, args []string) error {
 	key := args[2]
 	value := args[3]
 
-	if !terminal.IsTerminal(syscall.Stdin) && value == "-" {
+	if !termios.IsTerminal(int(syscall.Stdin)) && value == "-" {
 		buf, err := ioutil.ReadAll(os.Stdin)
 		if err != nil {
-			return fmt.Errorf("Can't read from stdin: %s", err)
+			return fmt.Errorf(i18n.G("Can't read from stdin: %s"), err)
 		}
 		value = string(buf[:])
+	}
+
+	if unset {
+		st, err := d.ContainerInfo(container)
+		if err != nil {
+			return err
+		}
+
+		_, ok := st.Config[key]
+		if !ok {
+			return fmt.Errorf(i18n.G("Can't unset key '%s', it's not currently set."), key)
+		}
 	}
 
 	return d.SetContainerConfig(container, key, value)
@@ -119,39 +143,83 @@ func (c *configCmd) run(config *lxd.Config, args []string) error {
 			return errArgs
 		}
 
-		// 2 args means we're unsetting a server key
+		// Deal with local server
 		if len(args) == 2 {
-			key := args[1]
 			c, err := lxd.NewClient(config, config.DefaultRemote)
 			if err != nil {
 				return err
 			}
-			_, err = c.SetServerConfig(key, "")
+
+			ss, err := c.ServerStatus()
+			if err != nil {
+				return err
+			}
+
+			_, ok := ss.Config[args[1]]
+			if !ok {
+				return fmt.Errorf(i18n.G("Can't unset key '%s', it's not currently set."), args[1])
+			}
+
+			_, err = c.SetServerConfig(args[1], "")
 			return err
 		}
 
-		// 3 args is a container config key
+		// Deal with remote server
+		remote, container := config.ParseRemoteAndContainer(args[1])
+		if container == "" {
+			c, err := lxd.NewClient(config, remote)
+			if err != nil {
+				return err
+			}
+
+			ss, err := c.ServerStatus()
+			if err != nil {
+				return err
+			}
+
+			_, ok := ss.Config[args[1]]
+			if !ok {
+				return fmt.Errorf(i18n.G("Can't unset key '%s', it's not currently set."), args[1])
+			}
+
+			_, err = c.SetServerConfig(args[2], "")
+			return err
+		}
+
+		// Deal with container
 		args = append(args, "")
-		return doSet(config, args)
+		return c.doSet(config, args, true)
 
 	case "set":
 		if len(args) < 3 {
 			return errArgs
 		}
 
-		// 3 args means we're setting a server key
+		// Deal with local server
 		if len(args) == 3 {
-			key := args[1]
 			c, err := lxd.NewClient(config, config.DefaultRemote)
 			if err != nil {
 				return err
 			}
-			_, err = c.SetServerConfig(key, args[2])
+
+			_, err = c.SetServerConfig(args[1], args[2])
 			return err
 		}
 
-		// 4 args is a container config key
-		return doSet(config, args)
+		// Deal with remote server
+		remote, container := config.ParseRemoteAndContainer(args[1])
+		if container == "" {
+			c, err := lxd.NewClient(config, remote)
+			if err != nil {
+				return err
+			}
+
+			_, err = c.SetServerConfig(args[2], args[3])
+			return err
+		}
+
+		// Deal with container
+		return c.doSet(config, args, false)
 
 	case "trust":
 		if len(args) < 2 {
@@ -194,22 +262,23 @@ func (c *configCmd) run(config *lxd.Config, args []string) error {
 			}
 
 			table := tablewriter.NewWriter(os.Stdout)
+			table.SetAutoWrapText(false)
+			table.SetAlignment(tablewriter.ALIGN_LEFT)
+			table.SetRowLine(true)
 			table.SetHeader([]string{
-				gettext.Gettext("FINGERPRINT"),
-				gettext.Gettext("COMMON NAME"),
-				gettext.Gettext("ISSUE DATE"),
-				gettext.Gettext("EXPIRY DATE")})
-
-			for _, v := range data {
-				table.Append(v)
-			}
+				i18n.G("FINGERPRINT"),
+				i18n.G("COMMON NAME"),
+				i18n.G("ISSUE DATE"),
+				i18n.G("EXPIRY DATE")})
+			sort.Sort(SortImage(data))
+			table.AppendBulk(data)
 			table.Render()
 
 			return nil
 		case "add":
 			var remote string
 			if len(args) < 3 {
-				return fmt.Errorf(gettext.Gettext("No cert provided to add"))
+				return fmt.Errorf(i18n.G("No certificate provided to add"))
 			} else if len(args) == 4 {
 				remote = config.ParseRemote(args[2])
 			} else {
@@ -232,7 +301,7 @@ func (c *configCmd) run(config *lxd.Config, args []string) error {
 		case "remove":
 			var remote string
 			if len(args) < 3 {
-				return fmt.Errorf(gettext.Gettext("No fingerprint specified."))
+				return fmt.Errorf(i18n.G("No fingerprint specified."))
 			} else if len(args) == 4 {
 				remote = config.ParseRemote(args[2])
 			} else {
@@ -246,7 +315,7 @@ func (c *configCmd) run(config *lxd.Config, args []string) error {
 
 			return d.CertificateRemove(args[len(args)-1])
 		default:
-			return fmt.Errorf(gettext.Gettext("Unkonwn config trust command %s"), args[1])
+			return errArgs
 		}
 
 	case "show":
@@ -269,16 +338,46 @@ func (c *configCmd) run(config *lxd.Config, args []string) error {
 				return err
 			}
 
-			brief := config.BriefState()
+			brief := config.Brief()
 			data, err = yaml.Marshal(&brief)
 		} else {
-			config, err := d.ContainerStatus(container)
+			var brief shared.BriefContainerInfo
+			if shared.IsSnapshot(container) {
+				config, err := d.SnapshotInfo(container)
+				if err != nil {
+					return err
+				}
+
+				brief = shared.BriefContainerInfo{
+					Profiles:  config.Profiles,
+					Config:    config.Config,
+					Devices:   config.Devices,
+					Ephemeral: config.Ephemeral,
+				}
+				if c.expanded {
+					brief = shared.BriefContainerInfo{
+						Profiles:  config.Profiles,
+						Config:    config.ExpandedConfig,
+						Devices:   config.ExpandedDevices,
+						Ephemeral: config.Ephemeral,
+					}
+				}
+			} else {
+				config, err := d.ContainerInfo(container)
+				if err != nil {
+					return err
+				}
+
+				brief = config.Brief()
+				if c.expanded {
+					brief = config.BriefExpanded()
+				}
+			}
+
+			data, err = yaml.Marshal(&brief)
 			if err != nil {
 				return err
 			}
-
-			brief := config.BriefState()
-			data, err = yaml.Marshal(&brief)
 		}
 
 		fmt.Printf("%s", data)
@@ -286,21 +385,46 @@ func (c *configCmd) run(config *lxd.Config, args []string) error {
 		return nil
 
 	case "get":
-		if len(args) != 3 {
+		if len(args) > 3 || len(args) < 2 {
 			return errArgs
 		}
 
-		remote, container := config.ParseRemoteAndContainer(args[1])
+		remote := config.DefaultRemote
+		container := ""
+		key := args[1]
+		if len(args) > 2 {
+			remote, container = config.ParseRemoteAndContainer(args[1])
+			key = args[2]
+		}
+
 		d, err := lxd.NewClient(config, remote)
 		if err != nil {
 			return err
 		}
 
-		resp, err := d.ContainerStatus(container)
-		if err != nil {
-			return err
+		if container != "" {
+			resp, err := d.ContainerInfo(container)
+			if err != nil {
+				return err
+			}
+			fmt.Println(resp.Config[key])
+		} else {
+			resp, err := d.ServerStatus()
+			if err != nil {
+				return err
+			}
+
+			value := resp.Config[key]
+			if value == nil {
+				value = ""
+			} else if value == true {
+				value = "true"
+			} else if value == false {
+				value = "false"
+			}
+
+			fmt.Println(value)
 		}
-		fmt.Printf("%s: %s\n", args[2], resp.Config[args[2]])
 		return nil
 
 	case "profile":
@@ -310,29 +434,44 @@ func (c *configCmd) run(config *lxd.Config, args []string) error {
 		}
 		switch args[1] {
 		case "list":
-			return deviceList(config, "container", args)
+			return c.deviceList(config, "container", args)
 		case "add":
-			return deviceAdd(config, "container", args)
+			return c.deviceAdd(config, "container", args)
 		case "remove":
-			return deviceRm(config, "container", args)
+			return c.deviceRm(config, "container", args)
+		case "get":
+			return c.deviceGet(config, "container", args)
+		case "set":
+			return c.deviceSet(config, "container", args)
+		case "unset":
+			return c.deviceUnset(config, "container", args)
 		case "show":
-			return deviceShow(config, "container", args)
+			return c.deviceShow(config, "container", args)
 		default:
 			return errArgs
 		}
 
 	case "edit":
-		if len(args) != 2 {
+		if len(args) < 1 {
 			return errArgs
 		}
 
-		remote, container := config.ParseRemoteAndContainer(args[1])
+		remote := config.DefaultRemote
+		container := ""
+		if len(args) > 1 {
+			remote, container = config.ParseRemoteAndContainer(args[1])
+		}
+
 		d, err := lxd.NewClient(config, remote)
 		if err != nil {
 			return err
 		}
 
-		return doConfigEdit(d, container)
+		if len(args) == 1 || container == "" {
+			return c.doDaemonConfigEdit(d)
+		}
+
+		return c.doContainerConfigEdit(d, container)
 
 	default:
 		return errArgs
@@ -341,14 +480,15 @@ func (c *configCmd) run(config *lxd.Config, args []string) error {
 	return errArgs
 }
 
-func doConfigEdit(client *lxd.Client, cont string) error {
-	if !terminal.IsTerminal(syscall.Stdin) {
+func (c *configCmd) doContainerConfigEdit(client *lxd.Client, cont string) error {
+	// If stdin isn't a terminal, read text from it
+	if !termios.IsTerminal(int(syscall.Stdin)) {
 		contents, err := ioutil.ReadAll(os.Stdin)
 		if err != nil {
 			return err
 		}
 
-		newdata := shared.BriefContainerState{}
+		newdata := shared.BriefContainerInfo{}
 		err = yaml.Unmarshal(contents, &newdata)
 		if err != nil {
 			return err
@@ -356,66 +496,46 @@ func doConfigEdit(client *lxd.Client, cont string) error {
 		return client.UpdateContainerConfig(cont, newdata)
 	}
 
-	config, err := client.ContainerStatus(cont)
+	// Extract the current value
+	config, err := client.ContainerInfo(cont)
 	if err != nil {
 		return err
 	}
 
-	brief := config.BriefState()
-
-	editor := os.Getenv("VISUAL")
-	if editor == "" {
-		editor = os.Getenv("EDITOR")
-		if editor == "" {
-			editor = "vi"
-		}
-	}
+	brief := config.Brief()
 	data, err := yaml.Marshal(&brief)
-	f, err := ioutil.TempFile("", "lxd_lxc_config_")
 	if err != nil {
 		return err
 	}
-	fname := f.Name()
-	if err = f.Chmod(0600); err != nil {
-		f.Close()
-		os.Remove(fname)
+
+	// Spawn the editor
+	content, err := shared.TextEditor("", []byte(c.configEditHelp()+"\n\n"+string(data)))
+	if err != nil {
 		return err
 	}
-	f.Write([]byte(configEditHelp + "\n"))
-	f.Write(data)
-	f.Close()
-	defer os.Remove(fname)
 
 	for {
-		var err error
-		cmdParts := strings.Fields(editor)
-		cmd := exec.Command(cmdParts[0], append(cmdParts[1:], fname)...)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		err = cmd.Run()
-		if err != nil {
-			return err
-		}
-		contents, err := ioutil.ReadFile(fname)
-		if err != nil {
-			return err
-		}
-		newdata := shared.BriefContainerState{}
-
-		err = yaml.Unmarshal(contents, &newdata)
+		// Parse the text received from the editor
+		newdata := shared.BriefContainerInfo{}
+		err = yaml.Unmarshal(content, &newdata)
 		if err == nil {
 			err = client.UpdateContainerConfig(cont, newdata)
 		}
 
+		// Respawn the editor
 		if err != nil {
-			fmt.Fprintf(os.Stderr, gettext.Gettext("Config parsing error: %s")+"\n", err)
-			fmt.Println(gettext.Gettext("Press enter to start the editor again"))
+			fmt.Fprintf(os.Stderr, i18n.G("Config parsing error: %s")+"\n", err)
+			fmt.Println(i18n.G("Press enter to start the editor again"))
+
 			_, err := os.Stdin.Read(make([]byte, 1))
 			if err != nil {
 				return err
 			}
 
+			content, err = shared.TextEditor("", content)
+			if err != nil {
+				return err
+			}
 			continue
 		}
 		break
@@ -423,7 +543,72 @@ func doConfigEdit(client *lxd.Client, cont string) error {
 	return nil
 }
 
-func deviceAdd(config *lxd.Config, which string, args []string) error {
+func (c *configCmd) doDaemonConfigEdit(client *lxd.Client) error {
+	// If stdin isn't a terminal, read text from it
+	if !termios.IsTerminal(int(syscall.Stdin)) {
+		contents, err := ioutil.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+
+		newdata := shared.BriefServerState{}
+		err = yaml.Unmarshal(contents, &newdata)
+		if err != nil {
+			return err
+		}
+
+		_, err = client.UpdateServerConfig(newdata)
+		return err
+	}
+
+	// Extract the current value
+	config, err := client.ServerStatus()
+	if err != nil {
+		return err
+	}
+
+	brief := config.Brief()
+	data, err := yaml.Marshal(&brief)
+	if err != nil {
+		return err
+	}
+
+	// Spawn the editor
+	content, err := shared.TextEditor("", []byte(c.configEditHelp()+"\n\n"+string(data)))
+	if err != nil {
+		return err
+	}
+
+	for {
+		// Parse the text received from the editor
+		newdata := shared.BriefServerState{}
+		err = yaml.Unmarshal(content, &newdata)
+		if err == nil {
+			_, err = client.UpdateServerConfig(newdata)
+		}
+
+		// Respawn the editor
+		if err != nil {
+			fmt.Fprintf(os.Stderr, i18n.G("Config parsing error: %s")+"\n", err)
+			fmt.Println(i18n.G("Press enter to start the editor again"))
+
+			_, err := os.Stdin.Read(make([]byte, 1))
+			if err != nil {
+				return err
+			}
+
+			content, err = shared.TextEditor("", content)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		break
+	}
+	return nil
+}
+
+func (c *configCmd) deviceAdd(config *lxd.Config, which string, args []string) error {
 	if len(args) < 5 {
 		return errArgs
 	}
@@ -452,14 +637,173 @@ func deviceAdd(config *lxd.Config, which string, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf(gettext.Gettext("Device %s added to %s")+"\n", devname, name)
-	if which == "profile" {
-		return nil
+	if which != "profile" {
+		err = client.WaitForSuccess(resp.Operation)
 	}
-	return client.WaitForSuccess(resp.Operation)
+	if err == nil {
+		fmt.Printf(i18n.G("Device %s added to %s")+"\n", devname, name)
+	}
+	return err
 }
 
-func deviceRm(config *lxd.Config, which string, args []string) error {
+func (c *configCmd) deviceGet(config *lxd.Config, which string, args []string) error {
+	if len(args) < 5 {
+		return errArgs
+	}
+
+	remote, name := config.ParseRemoteAndContainer(args[2])
+
+	client, err := lxd.NewClient(config, remote)
+	if err != nil {
+		return err
+	}
+
+	devname := args[3]
+	key := args[4]
+
+	if which == "profile" {
+		st, err := client.ProfileConfig(name)
+		if err != nil {
+			return err
+		}
+
+		dev, ok := st.Devices[devname]
+		if !ok {
+			return fmt.Errorf(i18n.G("The device doesn't exist"))
+		}
+
+		fmt.Println(dev[key])
+	} else {
+		st, err := client.ContainerInfo(name)
+		if err != nil {
+			return err
+		}
+
+		dev, ok := st.Devices[devname]
+		if !ok {
+			return fmt.Errorf(i18n.G("The device doesn't exist"))
+		}
+
+		fmt.Println(dev[key])
+	}
+
+	return nil
+}
+
+func (c *configCmd) deviceSet(config *lxd.Config, which string, args []string) error {
+	if len(args) < 6 {
+		return errArgs
+	}
+
+	remote, name := config.ParseRemoteAndContainer(args[2])
+
+	client, err := lxd.NewClient(config, remote)
+	if err != nil {
+		return err
+	}
+
+	devname := args[3]
+	key := args[4]
+	value := args[5]
+
+	if which == "profile" {
+		st, err := client.ProfileConfig(name)
+		if err != nil {
+			return err
+		}
+
+		dev, ok := st.Devices[devname]
+		if !ok {
+			return fmt.Errorf(i18n.G("The device doesn't exist"))
+		}
+
+		dev[key] = value
+		st.Devices[devname] = dev
+
+		err = client.PutProfile(name, *st)
+		if err != nil {
+			return err
+		}
+	} else {
+		st, err := client.ContainerInfo(name)
+		if err != nil {
+			return err
+		}
+
+		dev, ok := st.Devices[devname]
+		if !ok {
+			return fmt.Errorf(i18n.G("The device doesn't exist"))
+		}
+
+		dev[key] = value
+		st.Devices[devname] = dev
+
+		err = client.UpdateContainerConfig(name, st.Brief())
+		if err != nil {
+			return err
+		}
+	}
+
+	return err
+}
+
+func (c *configCmd) deviceUnset(config *lxd.Config, which string, args []string) error {
+	if len(args) < 5 {
+		return errArgs
+	}
+
+	remote, name := config.ParseRemoteAndContainer(args[2])
+
+	client, err := lxd.NewClient(config, remote)
+	if err != nil {
+		return err
+	}
+
+	devname := args[3]
+	key := args[4]
+
+	if which == "profile" {
+		st, err := client.ProfileConfig(name)
+		if err != nil {
+			return err
+		}
+
+		dev, ok := st.Devices[devname]
+		if !ok {
+			return fmt.Errorf(i18n.G("The device doesn't exist"))
+		}
+
+		delete(dev, key)
+		st.Devices[devname] = dev
+
+		err = client.PutProfile(name, *st)
+		if err != nil {
+			return err
+		}
+	} else {
+		st, err := client.ContainerInfo(name)
+		if err != nil {
+			return err
+		}
+
+		dev, ok := st.Devices[devname]
+		if !ok {
+			return fmt.Errorf(i18n.G("The device doesn't exist"))
+		}
+
+		delete(dev, key)
+		st.Devices[devname] = dev
+
+		err = client.UpdateContainerConfig(name, st.Brief())
+		if err != nil {
+			return err
+		}
+	}
+
+	return err
+}
+
+func (c *configCmd) deviceRm(config *lxd.Config, which string, args []string) error {
 	if len(args) < 4 {
 		return errArgs
 	}
@@ -480,14 +824,16 @@ func deviceRm(config *lxd.Config, which string, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf(gettext.Gettext("Device %s removed from %s")+"\n", devname, name)
-	if which == "profile" {
-		return nil
+	if which != "profile" {
+		err = client.WaitForSuccess(resp.Operation)
 	}
-	return client.WaitForSuccess(resp.Operation)
+	if err == nil {
+		fmt.Printf(i18n.G("Device %s removed from %s")+"\n", devname, name)
+	}
+	return err
 }
 
-func deviceList(config *lxd.Config, which string, args []string) error {
+func (c *configCmd) deviceList(config *lxd.Config, which string, args []string) error {
 	if len(args) < 3 {
 		return errArgs
 	}
@@ -512,7 +858,7 @@ func deviceList(config *lxd.Config, which string, args []string) error {
 	return nil
 }
 
-func deviceShow(config *lxd.Config, which string, args []string) error {
+func (c *configCmd) deviceShow(config *lxd.Config, which string, args []string) error {
 	if len(args) < 3 {
 		return errArgs
 	}
@@ -532,7 +878,7 @@ func deviceShow(config *lxd.Config, which string, args []string) error {
 
 		devices = resp.Devices
 	} else {
-		resp, err := client.ContainerStatus(name)
+		resp, err := client.ContainerInfo(name)
 		if err != nil {
 			return err
 		}
@@ -540,12 +886,12 @@ func deviceShow(config *lxd.Config, which string, args []string) error {
 		devices = resp.Devices
 	}
 
-	for n, d := range devices {
-		fmt.Printf("%s\n", n)
-		for attr, val := range d {
-			fmt.Printf("  %s: %s\n", attr, val)
-		}
+	data, err := yaml.Marshal(&devices)
+	if err != nil {
+		return err
 	}
+
+	fmt.Printf(string(data))
 
 	return nil
 }

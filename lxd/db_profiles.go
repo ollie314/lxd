@@ -9,26 +9,8 @@ import (
 	"github.com/lxc/lxd/shared"
 )
 
-func dbProfileIDGet(db *sql.DB, profile string) (int64, error) {
-	id := int64(-1)
-
-	rows, err := dbQuery(db, "SELECT id FROM profiles WHERE name=?", profile)
-	if err != nil {
-		return id, err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var xID int64
-		rows.Scan(&xID)
-		id = xID
-	}
-
-	return id, nil
-}
-
-// dbProfilesGet returns a string list of profiles.
-func dbProfilesGet(db *sql.DB) ([]string, error) {
+// dbProfiles returns a string list of profiles.
+func dbProfiles(db *sql.DB) ([]string, error) {
 	q := fmt.Sprintf("SELECT name FROM profiles")
 	inargs := []interface{}{}
 	var name string
@@ -46,14 +28,44 @@ func dbProfilesGet(db *sql.DB) ([]string, error) {
 	return response, nil
 }
 
-func dbProfileCreate(db *sql.DB, profile string, config map[string]string,
+func dbProfileGet(db *sql.DB, profile string) (int64, *shared.ProfileConfig, error) {
+	id := int64(-1)
+	description := sql.NullString{}
+
+	q := "SELECT id, description FROM profiles WHERE name=?"
+	arg1 := []interface{}{profile}
+	arg2 := []interface{}{&id, &description}
+	err := dbQueryRowScan(db, q, arg1, arg2)
+	if err != nil {
+		return -1, nil, err
+	}
+
+	config, err := dbProfileConfig(db, profile)
+	if err != nil {
+		return -1, nil, err
+	}
+
+	devices, err := dbDevices(db, profile, true)
+	if err != nil {
+		return -1, nil, err
+	}
+
+	return id, &shared.ProfileConfig{
+		Name:        profile,
+		Config:      config,
+		Description: description.String,
+		Devices:     devices,
+	}, nil
+}
+
+func dbProfileCreate(db *sql.DB, profile string, description string, config map[string]string,
 	devices shared.Devices) (int64, error) {
 
 	tx, err := dbBegin(db)
 	if err != nil {
 		return -1, err
 	}
-	result, err := tx.Exec("INSERT INTO profiles (name) VALUES (?)", profile)
+	result, err := tx.Exec("INSERT INTO profiles (name, description) VALUES (?, ?)", profile, description)
 	if err != nil {
 		tx.Rollback()
 		return -1, err
@@ -85,23 +97,21 @@ func dbProfileCreate(db *sql.DB, profile string, config map[string]string,
 }
 
 func dbProfileCreateDefault(db *sql.DB) error {
-	id, err := dbProfileIDGet(db, "default")
-	if err != nil {
-		return err
-	}
+	id, _, _ := dbProfileGet(db, "default")
 
 	if id != -1 {
 		// default profile already exists
 		return nil
 	}
 
-	// TODO: We should the scan for bridges and use the best available as default.
+	// TODO: We should scan for bridges and use the best available as default.
 	devices := shared.Devices{
 		"eth0": shared.Device{
+			"name":    "eth0",
 			"type":    "nic",
 			"nictype": "bridged",
-			"parent":  "lxcbr0"}}
-	id, err = dbProfileCreate(db, "default", map[string]string{}, devices)
+			"parent":  "lxdbr0"}}
+	id, err := dbProfileCreate(db, "default", "Default LXD profile", map[string]string{}, devices)
 	if err != nil {
 		return err
 	}
@@ -109,30 +119,34 @@ func dbProfileCreateDefault(db *sql.DB) error {
 	return nil
 }
 
-func dbProfileCreateMigratable(db *sql.DB) error {
-	id, err := dbProfileIDGet(db, "migratable")
-	if err != nil {
-		return err
-	}
+func dbProfileCreateDocker(db *sql.DB) error {
+	id, _, err := dbProfileGet(db, "docker")
 
 	if id != -1 {
-		// migratable profile already exists
+		// docker profile already exists
 		return nil
 	}
 
 	config := map[string]string{
-		"security.privileged": "true",
-		"raw.lxc": `lxc.console = none
-lxc.cgroup.devices.deny = c 5:1 rwm
-lxc.seccomp =`,
+		"security.nesting":     "true",
+		"linux.kernel_modules": "overlay, nf_nat"}
+	fusedev := map[string]string{
+		"path": "/dev/fuse",
+		"type": "unix-char",
 	}
+	aadisable := map[string]string{
+		"path":   "/sys/module/apparmor/parameters/enabled",
+		"type":   "disk",
+		"source": "/dev/null",
+	}
+	devices := map[string]shared.Device{"fuse": fusedev, "aadisable": aadisable}
 
-	_, err = dbProfileCreate(db, "migratable", config, shared.Devices{})
+	_, err = dbProfileCreate(db, "docker", "Profile supporting docker in containers", config, devices)
 	return err
 }
 
 // Get the profile configuration map from the DB
-func dbProfileConfigGet(db *sql.DB, name string) (map[string]string, error) {
+func dbProfileConfig(db *sql.DB, name string) (map[string]string, error) {
 	var key, value string
 	query := `
         SELECT
@@ -192,6 +206,28 @@ func dbProfileDelete(db *sql.DB, name string) error {
 	return err
 }
 
+func dbProfileUpdate(db *sql.DB, name string, newName string) error {
+	tx, err := dbBegin(db)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.Exec("UPDATE profiles SET name=? WHERE name=?", newName, name)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	err = txCommit(tx)
+
+	return err
+}
+
+func dbProfileDescriptionUpdate(tx *sql.Tx, id int64, description string) error {
+	_, err := tx.Exec("UPDATE profiles SET description=? WHERE id=?", description, id)
+	return err
+}
+
 func dbProfileConfigClear(tx *sql.Tx, id int64) error {
 	_, err := tx.Exec("DELETE FROM profiles_config WHERE profile_id=?", id)
 	if err != nil {
@@ -219,16 +255,6 @@ func dbProfileConfigAdd(tx *sql.Tx, id int64, config map[string]string) error {
 	defer stmt.Close()
 
 	for k, v := range config {
-		if k == "raw.lxc" {
-			err := validateRawLxc(config["raw.lxc"])
-			if err != nil {
-				return err
-			}
-		}
-
-		if !ValidContainerConfigKey(k) {
-			return fmt.Errorf("Bad key: %s", k)
-		}
 		_, err = stmt.Exec(id, k, v)
 		if err != nil {
 			return err

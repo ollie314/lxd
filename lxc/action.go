@@ -3,11 +3,10 @@ package main
 import (
 	"fmt"
 
-	"github.com/chai2010/gettext-go/gettext"
-
 	"github.com/lxc/lxd"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/gnuflag"
+	"github.com/lxc/lxd/shared/i18n"
 )
 
 type actionCmd struct {
@@ -15,32 +14,42 @@ type actionCmd struct {
 	hasTimeout bool
 	visible    bool
 	name       string
+	timeout    int
+	force      bool
+	stateful   bool
+	stateless  bool
 }
 
 func (c *actionCmd) showByDefault() bool {
 	return c.visible
 }
 
-var timeout = -1
-var force = false
-
 func (c *actionCmd) usage() string {
-	return fmt.Sprintf(gettext.Gettext(
-		`Changes one or more containers state to %s.
+	return fmt.Sprintf(i18n.G(
+		`Changes state of one or more containers to %s.
 
 lxc %s <name> [<name>...]`), c.name, c.name)
 }
 
 func (c *actionCmd) flags() {
 	if c.hasTimeout {
-		gnuflag.IntVar(&timeout, "timeout", -1, gettext.Gettext("Time to wait for the container before killing it."))
-		gnuflag.BoolVar(&force, "force", false, gettext.Gettext("Force the container to shutdown."))
+		gnuflag.IntVar(&c.timeout, "timeout", -1, i18n.G("Time to wait for the container before killing it."))
+		gnuflag.BoolVar(&c.force, "force", false, i18n.G("Force the container to shutdown."))
 	}
+	gnuflag.BoolVar(&c.stateful, "stateful", false, i18n.G("Store the container state (only for stop)."))
+	gnuflag.BoolVar(&c.stateless, "stateless", false, i18n.G("Ignore the container state (only for start)."))
 }
 
 func (c *actionCmd) run(config *lxd.Config, args []string) error {
 	if len(args) == 0 {
 		return errArgs
+	}
+
+	state := false
+
+	// Only store state if asked to
+	if c.action == "stop" && c.stateful {
+		state = true
 	}
 
 	for _, nameArg := range args {
@@ -50,17 +59,38 @@ func (c *actionCmd) run(config *lxd.Config, args []string) error {
 			return err
 		}
 
-		resp, err := d.Action(name, c.action, timeout, force)
+		if name == "" {
+			return fmt.Errorf(i18n.G("Must supply container name for: ")+"\"%s\"", nameArg)
+		}
+
+		if c.action == shared.Start || c.action == shared.Stop {
+			current, err := d.ContainerInfo(name)
+			if err != nil {
+				return err
+			}
+
+			// "start" for a frozen container means "unfreeze"
+			if current.StatusCode == shared.Frozen {
+				c.action = shared.Unfreeze
+			}
+
+			// Always restore state (if present) unless asked not to
+			if c.action == shared.Start && current.Stateful && !c.stateless {
+				state = true
+			}
+		}
+
+		resp, err := d.Action(name, c.action, c.timeout, c.force, state)
 		if err != nil {
 			return err
 		}
 
 		if resp.Type != lxd.Async {
-			return fmt.Errorf(gettext.Gettext("bad result type from action"))
+			return fmt.Errorf(i18n.G("bad result type from action"))
 		}
 
 		if err := d.WaitForSuccess(resp.Operation); err != nil {
-			return fmt.Errorf("%s\n"+gettext.Gettext("Try `lxc info --show-log %s` for more info"), err, name)
+			return fmt.Errorf("%s\n"+i18n.G("Try `lxc info --show-log %s` for more info"), err, name)
 		}
 	}
 	return nil

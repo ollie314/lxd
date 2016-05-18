@@ -1,9 +1,8 @@
 package main
 
 import (
-	"github.com/chai2010/gettext-go/gettext"
-
 	"github.com/lxc/lxd"
+	"github.com/lxc/lxd/shared/i18n"
 )
 
 type fingerCmd struct {
@@ -15,7 +14,7 @@ func (c *fingerCmd) showByDefault() bool {
 }
 
 func (c *fingerCmd) usage() string {
-	return gettext.Gettext(
+	return i18n.G(
 		`Fingers the LXD instance to check if it is up and working.
 
 lxc finger <remote>`)
@@ -35,7 +34,13 @@ func (c *fingerCmd) run(config *lxd.Config, args []string) error {
 		remote = config.DefaultRemote
 	}
 
-	// NewClient will finger the server to test the connection before returning.
-	_, err := lxd.NewClient(config, remote)
+	// New client may or may not need to connect to the remote host, but
+	// client.ServerStatus will at least request the basic information from
+	// the server.
+	client, err := lxd.NewClient(config, remote)
+	if err != nil {
+		return err
+	}
+	_, err = client.ServerStatus()
 	return err
 }

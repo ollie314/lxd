@@ -7,12 +7,216 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/lxc/lxd/shared"
 
 	log "gopkg.in/inconshreveable/log15.v2"
 )
+
+func dbUpdateFromV28(db *sql.DB) error {
+	stmt := `
+INSERT INTO profiles_devices (profile_id, name, type) SELECT id, "aadisable", 2 FROM profiles WHERE name="docker";
+INSERT INTO profiles_devices_config (profile_device_id, key, value) SELECT profiles_devices.id, "source", "/dev/null" FROM profiles_devices LEFT JOIN profiles WHERE profiles_devices.profile_id = profiles.id AND profiles.name = "docker" AND profiles_devices.name = "aadisable";
+INSERT INTO profiles_devices_config (profile_device_id, key, value) SELECT profiles_devices.id, "path", "/sys/module/apparmor/parameters/enabled" FROM profiles_devices LEFT JOIN profiles WHERE profiles_devices.profile_id = profiles.id AND profiles.name = "docker" AND profiles_devices.name = "aadisable";`
+	db.Exec(stmt)
+
+	stmt = `INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
+	_, err := db.Exec(stmt, 29)
+	return err
+}
+
+func dbUpdateFromV27(db *sql.DB) error {
+	stmt := `
+UPDATE profiles_devices SET type=3 WHERE type='unix-char';
+INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
+	_, err := db.Exec(stmt, 28)
+	return err
+}
+
+func dbUpdateFromV26(db *sql.DB) error {
+	stmt := `
+ALTER TABLE images ADD COLUMN auto_update INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS images_source (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    image_id INTEGER NOT NULL,
+    server TEXT NOT NULL,
+    protocol INTEGER NOT NULL,
+    certificate TEXT NOT NULL,
+    alias VARCHAR(255) NOT NULL,
+    FOREIGN KEY (image_id) REFERENCES images (id) ON DELETE CASCADE
+);
+INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
+	_, err := db.Exec(stmt, 27)
+	return err
+}
+
+func dbUpdateFromV25(db *sql.DB) error {
+	stmt := `
+INSERT INTO profiles (name, description) VALUES ("docker", "Profile supporting docker in containers");
+INSERT INTO profiles_config (profile_id, key, value) SELECT id, "security.nesting", "true" FROM profiles WHERE name="docker";
+INSERT INTO profiles_config (profile_id, key, value) SELECT id, "linux.kernel_modules", "overlay, nf_nat" FROM profiles WHERE name="docker";
+INSERT INTO profiles_devices (profile_id, name, type) SELECT id, "fuse", "unix-char" FROM profiles WHERE name="docker";
+INSERT INTO profiles_devices_config (profile_device_id, key, value) SELECT profiles_devices.id, "path", "/dev/fuse" FROM profiles_devices LEFT JOIN profiles WHERE profiles_devices.profile_id = profiles.id AND profiles.name = "docker";`
+	db.Exec(stmt)
+
+	stmt = `INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
+	_, err := db.Exec(stmt, 26)
+	return err
+}
+
+func dbUpdateFromV24(db *sql.DB) error {
+	stmt := `
+ALTER TABLE containers ADD COLUMN stateful INTEGER NOT NULL DEFAULT 0;
+INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
+	_, err := db.Exec(stmt, 25)
+	return err
+}
+
+func dbUpdateFromV23(db *sql.DB) error {
+	stmt := `
+ALTER TABLE profiles ADD COLUMN description TEXT;
+INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
+	_, err := db.Exec(stmt, 24)
+	return err
+}
+
+func dbUpdateFromV22(db *sql.DB) error {
+	stmt := `
+DELETE FROM containers_devices_config WHERE key='type';
+DELETE FROM profiles_devices_config WHERE key='type';
+INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
+	_, err := db.Exec(stmt, 23)
+	return err
+}
+
+func dbUpdateFromV21(db *sql.DB) error {
+	stmt := `
+ALTER TABLE containers ADD COLUMN creation_date DATETIME NOT NULL DEFAULT 0;
+INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
+	_, err := db.Exec(stmt, 22)
+	return err
+}
+
+func dbUpdateFromV20(db *sql.DB) error {
+	stmt := `
+UPDATE containers_devices SET name='__lxd_upgrade_root' WHERE name='root';
+UPDATE profiles_devices SET name='__lxd_upgrade_root' WHERE name='root';
+
+INSERT INTO containers_devices (container_id, name, type) SELECT id, "root", 2 FROM containers;
+INSERT INTO containers_devices_config (container_device_id, key, value) SELECT id, "path", "/" FROM containers_devices WHERE name='root';
+
+INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
+	_, err := db.Exec(stmt, 21)
+
+	return err
+}
+
+func dbUpdateFromV19(db *sql.DB) error {
+	stmt := `
+DELETE FROM containers_config WHERE container_id NOT IN (SELECT id FROM containers);
+DELETE FROM containers_devices_config WHERE container_device_id NOT IN (SELECT id FROM containers_devices WHERE container_id IN (SELECT id FROM containers));
+DELETE FROM containers_devices WHERE container_id NOT IN (SELECT id FROM containers);
+DELETE FROM containers_profiles WHERE container_id NOT IN (SELECT id FROM containers);
+DELETE FROM images_aliases WHERE image_id NOT IN (SELECT id FROM images);
+DELETE FROM images_properties WHERE image_id NOT IN (SELECT id FROM images);
+INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
+	_, err := db.Exec(stmt, 20)
+	return err
+}
+
+func dbUpdateFromV18(db *sql.DB) error {
+	var id int
+	var value string
+
+	// Update container config
+	rows, err := dbQueryScan(db, "SELECT id, value FROM containers_config WHERE key='limits.memory'", nil, []interface{}{id, value})
+	if err != nil {
+		return err
+	}
+
+	for _, row := range rows {
+		id = row[0].(int)
+		value = row[1].(string)
+
+		// If already an integer, don't touch
+		_, err := strconv.Atoi(value)
+		if err == nil {
+			continue
+		}
+
+		// Generate the new value
+		value = strings.ToUpper(value)
+		value += "B"
+
+		// Deal with completely broken values
+		_, err = shared.ParseByteSizeString(value)
+		if err != nil {
+			shared.Debugf("Invalid container memory limit, id=%d value=%s, removing.", id, value)
+			_, err = db.Exec("DELETE FROM containers_config WHERE id=?;", id)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Set the new value
+		_, err = db.Exec("UPDATE containers_config SET value=? WHERE id=?", value, id)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Update profiles config
+	rows, err = dbQueryScan(db, "SELECT id, value FROM profiles_config WHERE key='limits.memory'", nil, []interface{}{id, value})
+	if err != nil {
+		return err
+	}
+
+	for _, row := range rows {
+		id = row[0].(int)
+		value = row[1].(string)
+
+		// If already an integer, don't touch
+		_, err := strconv.Atoi(value)
+		if err == nil {
+			continue
+		}
+
+		// Generate the new value
+		value = strings.ToUpper(value)
+		value += "B"
+
+		// Deal with completely broken values
+		_, err = shared.ParseByteSizeString(value)
+		if err != nil {
+			shared.Debugf("Invalid profile memory limit, id=%d value=%s, removing.", id, value)
+			_, err = db.Exec("DELETE FROM profiles_config WHERE id=?;", id)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Set the new value
+		_, err = db.Exec("UPDATE profiles_config SET value=? WHERE id=?", value, id)
+		if err != nil {
+			return err
+		}
+	}
+
+	_, err = db.Exec("INSERT INTO schema (version, updated_at) VALUES (?, strftime(\"%s\"));", 19)
+	return err
+}
+
+func dbUpdateFromV17(db *sql.DB) error {
+	stmt := `
+DELETE FROM profiles_config WHERE key LIKE 'volatile.%';
+UPDATE containers_config SET key='limits.cpu' WHERE key='limits.cpus';
+UPDATE profiles_config SET key='limits.cpu' WHERE key='limits.cpus';
+INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
+	_, err := db.Exec(stmt, 18)
+	return err
+}
 
 func dbUpdateFromV16(db *sql.DB) error {
 	stmt := `
@@ -32,10 +236,12 @@ func dbUpdateFromV15(d *Daemon) error {
 		return err
 	}
 
-	vgName, err := d.ConfigValueGet("storage.lvm_vg_name")
+	err = daemonConfigInit(d.db)
 	if err != nil {
-		return fmt.Errorf("Error checking server config: %v", err)
+		return err
 	}
+
+	vgName := daemonConfig["storage.lvm_vg_name"].Get()
 
 	for _, cName := range cNames {
 		var lvLinkPath string
@@ -130,7 +336,7 @@ INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
 }
 
 func dbUpdateFromV11(d *Daemon) error {
-	if d.IsMock {
+	if d.MockMode {
 		// No need to move snapshots no mock runs,
 		// dbUpdateFromV12 will then set the db version to 13
 		return nil
@@ -208,7 +414,7 @@ INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
 }
 
 func dbUpdateFromV10(d *Daemon) error {
-	if d.IsMock {
+	if d.MockMode {
 		// No need to move lxc to containers in mock runs,
 		// dbUpdateFromV12 will then set the db version to 13
 		return nil
@@ -504,11 +710,16 @@ INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
 }
 
 func dbUpdateFromV3(db *sql.DB) error {
-	err := dbProfileCreateDefault(db)
-	if err != nil {
-		return err
-	}
-	_, err = db.Exec(`INSERT INTO schema (version, updated_at) values (?, strftime("%s"));`, 4)
+	// Attempt to create a default profile (but don't fail if already there)
+	stmt := `INSERT INTO profiles (name) VALUES ("default");
+INSERT INTO profiles_devices (profile_id, name, type) SELECT id, "eth0", "nic" FROM profiles WHERE profiles.name="default";
+INSERT INTO profiles_devices_config (profile_device_id, key, value) SELECT profiles_devices.id, "nictype", "bridged" FROM profiles_devices LEFT JOIN profiles ON profiles.id=profiles_devices.profile_id WHERE profiles.name == "default";
+INSERT INTO profiles_devices_config (profile_device_id, key, value) SELECT profiles_devices.id, 'name', "eth0" FROM profiles_devices LEFT JOIN profiles ON profiles.id=profiles_devices.profile_id WHERE profiles.name == "default";
+INSERT INTO profiles_devices_config (profile_device_id, key, value) SELECT profiles_devices.id, "parent", "lxdbr0" FROM profiles_devices LEFT JOIN profiles ON profiles.id=profiles_devices.profile_id WHERE profiles.name == "default";`
+	db.Exec(stmt)
+
+	stmt = `INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
+	_, err := db.Exec(stmt, 4)
 	return err
 }
 
@@ -568,7 +779,7 @@ CREATE TABLE IF NOT EXISTS profiles_devices_config (
     UNIQUE (profile_device_id, key),
     FOREIGN KEY (profile_device_id) REFERENCES profiles_devices (id)
 );
-INSERT INTO schema (version, updated_at) values (?, strftime("%s"));`
+INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
 	_, err := db.Exec(stmt, 3)
 	return err
 }
@@ -585,7 +796,7 @@ CREATE TABLE IF NOT EXISTS images_aliases (
     FOREIGN KEY (image_id) REFERENCES images (id) ON DELETE CASCADE,
     UNIQUE (name)
 );
-INSERT INTO schema (version, updated_at) values (?, strftime("%s"));`
+INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
 	_, err := db.Exec(stmt, 2)
 	return err
 }
@@ -599,7 +810,7 @@ CREATE TABLE IF NOT EXISTS schema (
     updated_at DATETIME NOT NULL,
     UNIQUE (version)
 );
-INSERT INTO schema (version, updated_at) values (?, strftime("%s"));`
+INSERT INTO schema (version, updated_at) VALUES (?, strftime("%s"));`
 	_, err := db.Exec(stmt, 1)
 	return err
 }
@@ -712,6 +923,78 @@ func dbUpdate(d *Daemon, prevVersion int) error {
 	}
 	if prevVersion < 17 {
 		err = dbUpdateFromV16(db)
+		if err != nil {
+			return err
+		}
+	}
+	if prevVersion < 18 {
+		err = dbUpdateFromV17(db)
+		if err != nil {
+			return err
+		}
+	}
+	if prevVersion < 19 {
+		err = dbUpdateFromV18(db)
+		if err != nil {
+			return err
+		}
+	}
+	if prevVersion < 20 {
+		err = dbUpdateFromV19(db)
+		if err != nil {
+			return err
+		}
+	}
+	if prevVersion < 21 {
+		err = dbUpdateFromV20(db)
+		if err != nil {
+			return err
+		}
+	}
+	if prevVersion < 22 {
+		err = dbUpdateFromV21(db)
+		if err != nil {
+			return err
+		}
+	}
+	if prevVersion < 23 {
+		err = dbUpdateFromV22(db)
+		if err != nil {
+			return err
+		}
+	}
+	if prevVersion < 24 {
+		err = dbUpdateFromV23(db)
+		if err != nil {
+			return err
+		}
+	}
+	if prevVersion < 25 {
+		err = dbUpdateFromV24(db)
+		if err != nil {
+			return err
+		}
+	}
+	if prevVersion < 26 {
+		err = dbUpdateFromV25(db)
+		if err != nil {
+			return err
+		}
+	}
+	if prevVersion < 27 {
+		err = dbUpdateFromV26(db)
+		if err != nil {
+			return err
+		}
+	}
+	if prevVersion < 28 {
+		err = dbUpdateFromV27(db)
+		if err != nil {
+			return err
+		}
+	}
+	if prevVersion < 29 {
+		err = dbUpdateFromV28(db)
 		if err != nil {
 			return err
 		}

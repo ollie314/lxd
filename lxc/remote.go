@@ -1,20 +1,26 @@
 package main
 
 import (
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
-	"github.com/chai2010/gettext-go/gettext"
 	"github.com/olekukonko/tablewriter"
+
 	"golang.org/x/crypto/ssh/terminal"
 
 	"github.com/lxc/lxd"
 	"github.com/lxc/lxd/shared"
 	"github.com/lxc/lxd/shared/gnuflag"
+	"github.com/lxc/lxd/shared/i18n"
 )
 
 type remoteCmd struct {
@@ -22,6 +28,7 @@ type remoteCmd struct {
 	acceptCert bool
 	password   string
 	public     bool
+	protocol   string
 }
 
 func (c *remoteCmd) showByDefault() bool {
@@ -29,99 +36,147 @@ func (c *remoteCmd) showByDefault() bool {
 }
 
 func (c *remoteCmd) usage() string {
-	return gettext.Gettext(
+	return i18n.G(
 		`Manage remote LXD servers.
 
-lxc remote add <name> <url> [--accept-certificate] [--password=PASSWORD] [--public]    Add the remote <name> at <url>.
-lxc remote remove <name>                                                               Remove the remote <name>.
-lxc remote list                                                                        List all remotes.
-lxc remote rename <old> <new>                                                          Rename remote <old> to <new>.
-lxc remote set-url <name> <url>                                                        Update <name>'s url to <url>.
-lxc remote set-default <name>                                                          Set the default remote.
-lxc remote get-default                                                                 Print the default remote.`)
+lxc remote add <name> <url> [--accept-certificate] [--password=PASSWORD]
+                            [--public] [--protocol=PROTOCOL]                Add the remote <name> at <url>.
+lxc remote remove <name>                                                    Remove the remote <name>.
+lxc remote list                                                             List all remotes.
+lxc remote rename <old> <new>                                               Rename remote <old> to <new>.
+lxc remote set-url <name> <url>                                             Update <name>'s url to <url>.
+lxc remote set-default <name>                                               Set the default remote.
+lxc remote get-default                                                      Print the default remote.`)
 }
 
 func (c *remoteCmd) flags() {
-	gnuflag.BoolVar(&c.acceptCert, "accept-certificate", false, gettext.Gettext("Accept certificate"))
-	gnuflag.StringVar(&c.password, "password", "", gettext.Gettext("Remote admin password"))
-	gnuflag.BoolVar(&c.public, "public", false, gettext.Gettext("Public image server"))
+	gnuflag.BoolVar(&c.acceptCert, "accept-certificate", false, i18n.G("Accept certificate"))
+	gnuflag.StringVar(&c.password, "password", "", i18n.G("Remote admin password"))
+	gnuflag.StringVar(&c.protocol, "protocol", "", i18n.G("Server protocol (lxd or simplestreams)"))
+	gnuflag.BoolVar(&c.public, "public", false, i18n.G("Public image server"))
 }
 
-func addServer(config *lxd.Config, server string, addr string, acceptCert bool, password string, public bool) error {
-	var r_scheme string
-	var r_host string
-	var r_port string
-
-	/* Complex remote URL parsing */
-	remote_url, err := url.Parse(addr)
+func getRemoteCertificate(address string) (*x509.Certificate, error) {
+	// Setup a permissive TLS config
+	tlsConfig, err := shared.GetTLSConfig("", "", nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	if remote_url.Scheme != "" {
-		if remote_url.Scheme != "unix" && remote_url.Scheme != "https" {
-			r_scheme = "https"
-		} else {
-			r_scheme = remote_url.Scheme
-		}
-	} else if addr[0] == '/' {
-		r_scheme = "unix"
-	} else {
-		if !shared.PathExists(addr) {
-			r_scheme = "https"
-		} else {
-			r_scheme = "unix"
-		}
+	tlsConfig.InsecureSkipVerify = true
+	tr := &http.Transport{
+		TLSClientConfig: tlsConfig,
+		Dial:            shared.RFC3493Dialer,
+		Proxy:           shared.ProxyFromEnvironment,
 	}
 
-	if remote_url.Host != "" {
-		r_host = remote_url.Host
-	} else {
-		r_host = addr
+	// Connect
+	client := &http.Client{Transport: tr}
+	resp, err := client.Get(address)
+	if err != nil {
+		return nil, err
 	}
 
-	host, port, err := net.SplitHostPort(r_host)
-	if err == nil {
-		r_host = host
-		r_port = port
-	} else {
-		r_port = shared.DefaultPort
+	// Retrieve the certificate
+	if resp.TLS == nil || len(resp.TLS.PeerCertificates) == 0 {
+		return nil, fmt.Errorf(i18n.G("Unable to read remote TLS certificate"))
 	}
 
-	if r_scheme == "unix" {
-		if addr[0:5] == "unix:" {
-			if addr[0:7] == "unix://" {
-				if len(addr) > 8 {
-					r_host = addr[8:]
-				} else {
-					r_host = ""
-				}
-			} else {
-				r_host = addr[6:]
-			}
-		}
-		r_port = ""
-	}
+	return resp.TLS.PeerCertificates[0], nil
+}
 
-	if strings.Contains(r_host, ":") && !strings.HasPrefix(r_host, "[") {
-		r_host = fmt.Sprintf("[%s]", r_host)
-	}
+func (c *remoteCmd) addServer(config *lxd.Config, server string, addr string, acceptCert bool, password string, public bool, protocol string) error {
+	var rScheme string
+	var rHost string
+	var rPort string
 
-	if r_port != "" {
-		addr = r_scheme + "://" + r_host + ":" + r_port
-	} else {
-		addr = r_scheme + "://" + r_host
-	}
-
+	// Setup the remotes list
 	if config.Remotes == nil {
 		config.Remotes = make(map[string]lxd.RemoteConfig)
 	}
 
+	/* Complex remote URL parsing */
+	remoteURL, err := url.Parse(addr)
+	if err != nil {
+		return err
+	}
+
+	// Fast track simplestreams
+	if protocol == "simplestreams" {
+		if remoteURL.Scheme != "https" {
+			return fmt.Errorf(i18n.G("Only https URLs are supported for simplestreams"))
+		}
+
+		config.Remotes[server] = lxd.RemoteConfig{Addr: addr, Public: true, Protocol: protocol}
+		return nil
+	}
+
+	// Fix broken URL parser
+	if !strings.Contains(addr, "://") && remoteURL.Scheme != "" && remoteURL.Scheme != "unix" && remoteURL.Host == "" {
+		remoteURL.Host = remoteURL.Scheme
+		remoteURL.Scheme = ""
+	}
+
+	if remoteURL.Scheme != "" {
+		if remoteURL.Scheme != "unix" && remoteURL.Scheme != "https" {
+			return fmt.Errorf(i18n.G("Invalid URL scheme \"%s\" in \"%s\""), remoteURL.Scheme, addr)
+		}
+
+		rScheme = remoteURL.Scheme
+	} else if addr[0] == '/' {
+		rScheme = "unix"
+	} else {
+		if !shared.PathExists(addr) {
+			rScheme = "https"
+		} else {
+			rScheme = "unix"
+		}
+	}
+
+	if remoteURL.Host != "" {
+		rHost = remoteURL.Host
+	} else {
+		rHost = addr
+	}
+
+	host, port, err := net.SplitHostPort(rHost)
+	if err == nil {
+		rHost = host
+		rPort = port
+	} else {
+		rPort = shared.DefaultPort
+	}
+
+	if rScheme == "unix" {
+		if addr[0:5] == "unix:" {
+			if addr[0:7] == "unix://" {
+				if len(addr) > 8 {
+					rHost = addr[8:]
+				} else {
+					rHost = ""
+				}
+			} else {
+				rHost = addr[6:]
+			}
+		}
+		rPort = ""
+	}
+
+	if strings.Contains(rHost, ":") && !strings.HasPrefix(rHost, "[") {
+		rHost = fmt.Sprintf("[%s]", rHost)
+	}
+
+	if rPort != "" {
+		addr = rScheme + "://" + rHost + ":" + rPort
+	} else {
+		addr = rScheme + "://" + rHost
+	}
+
 	/* Actually add the remote */
-	config.Remotes[server] = lxd.RemoteConfig{Addr: addr}
+	config.Remotes[server] = lxd.RemoteConfig{Addr: addr, Protocol: protocol}
 
 	remote := config.ParseRemote(server)
-	c, err := lxd.NewClient(config, remote)
+	d, err := lxd.NewClient(config, remote)
 	if err != nil {
 		return err
 	}
@@ -132,28 +187,73 @@ func addServer(config *lxd.Config, server string, addr string, acceptCert bool, 
 		return nil
 	}
 
-	err = c.UserAuthServerCert(host, acceptCert)
+	var certificate *x509.Certificate
+
+	/* Attempt to connect using the system root CA */
+	_, err = d.GetServerConfig()
 	if err != nil {
-		return err
+		// Failed to connect using the system CA, so retrieve the remote certificate
+		certificate, err = getRemoteCertificate(addr)
+		if err != nil {
+			return err
+		}
 	}
 
-	if c.IsPublic() || public {
+	if certificate != nil {
+		if !acceptCert {
+			digest := sha256.Sum256(certificate.Raw)
+
+			fmt.Printf(i18n.G("Certificate fingerprint: %x")+"\n", digest)
+			fmt.Printf(i18n.G("ok (y/n)?") + " ")
+			line, err := shared.ReadStdin()
+			if err != nil {
+				return err
+			}
+
+			if len(line) < 1 || line[0] != 'y' && line[0] != 'Y' {
+				return fmt.Errorf(i18n.G("Server certificate NACKed by user"))
+			}
+		}
+
+		dnam := d.Config.ConfigPath("servercerts")
+		err := os.MkdirAll(dnam, 0750)
+		if err != nil {
+			return fmt.Errorf(i18n.G("Could not create server cert dir"))
+		}
+
+		certf := fmt.Sprintf("%s/%s.crt", dnam, d.Name)
+		certOut, err := os.Create(certf)
+		if err != nil {
+			return err
+		}
+
+		pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: certificate.Raw})
+		certOut.Close()
+
+		// Setup a new connection, this time with the remote certificate
+		d, err = lxd.NewClient(config, remote)
+		if err != nil {
+			return err
+		}
+	}
+
+	if d.IsPublic() || public {
 		config.Remotes[server] = lxd.RemoteConfig{Addr: addr, Public: true}
 
-		if err := c.Finger(); err != nil {
+		if _, err := d.GetServerConfig(); err != nil {
 			return err
 		}
 
 		return nil
 	}
 
-	if c.AmTrusted() {
+	if d.AmTrusted() {
 		// server already has our cert, so we're done
 		return nil
 	}
 
 	if password == "" {
-		fmt.Printf(gettext.Gettext("Admin password for %s: "), server)
+		fmt.Printf(i18n.G("Admin password for %s: "), server)
 		pwd, err := terminal.ReadPassword(0)
 		if err != nil {
 			/* We got an error, maybe this isn't a terminal, let's try to
@@ -167,21 +267,21 @@ func addServer(config *lxd.Config, server string, addr string, acceptCert bool, 
 		password = string(pwd)
 	}
 
-	err = c.AddMyCertToServer(password)
+	err = d.AddMyCertToServer(password)
 	if err != nil {
 		return err
 	}
 
-	if !c.AmTrusted() {
-		return fmt.Errorf(gettext.Gettext("Server doesn't trust us after adding our cert"))
+	if !d.AmTrusted() {
+		return fmt.Errorf(i18n.G("Server doesn't trust us after adding our cert"))
 	}
 
-	fmt.Println(gettext.Gettext("Client certificate stored at server: "), server)
+	fmt.Println(i18n.G("Client certificate stored at server: "), server)
 	return nil
 }
 
-func removeCertificate(remote string) {
-	certf := lxd.ServerCertPath(remote)
+func (c *remoteCmd) removeCertificate(config *lxd.Config, remote string) {
+	certf := config.ServerCertPath(remote)
 	shared.Debugf("Trying to remove %s", certf)
 
 	os.Remove(certf)
@@ -199,12 +299,13 @@ func (c *remoteCmd) run(config *lxd.Config, args []string) error {
 		}
 
 		if rc, ok := config.Remotes[args[1]]; ok {
-			return fmt.Errorf(gettext.Gettext("remote %s exists as <%s>"), args[1], rc.Addr)
+			return fmt.Errorf(i18n.G("remote %s exists as <%s>"), args[1], rc.Addr)
 		}
 
-		err := addServer(config, args[1], args[2], c.acceptCert, c.password, c.public)
+		err := c.addServer(config, args[1], args[2], c.acceptCert, c.password, c.public, c.protocol)
 		if err != nil {
 			delete(config.Remotes, args[1])
+			c.removeCertificate(config, args[1])
 			return err
 		}
 
@@ -213,34 +314,58 @@ func (c *remoteCmd) run(config *lxd.Config, args []string) error {
 			return errArgs
 		}
 
-		if _, ok := config.Remotes[args[1]]; !ok {
-			return fmt.Errorf(gettext.Gettext("remote %s doesn't exist"), args[1])
+		rc, ok := config.Remotes[args[1]]
+		if !ok {
+			return fmt.Errorf(i18n.G("remote %s doesn't exist"), args[1])
+		}
+
+		if rc.Static {
+			return fmt.Errorf(i18n.G("remote %s is static and cannot be modified"), args[1])
 		}
 
 		if config.DefaultRemote == args[1] {
-			return fmt.Errorf(gettext.Gettext("can't remove the default remote"))
+			return fmt.Errorf(i18n.G("can't remove the default remote"))
 		}
 
 		delete(config.Remotes, args[1])
 
-		removeCertificate(args[1])
+		c.removeCertificate(config, args[1])
 
 	case "list":
 		data := [][]string{}
 		for name, rc := range config.Remotes {
+			strPublic := i18n.G("NO")
 			if rc.Public {
-				data = append(data, []string{name, rc.Addr, gettext.Gettext("YES")})
-			} else {
-				data = append(data, []string{name, rc.Addr, gettext.Gettext("NO")})
+				strPublic = i18n.G("YES")
 			}
+
+			strStatic := i18n.G("NO")
+			if rc.Static {
+				strStatic = i18n.G("YES")
+			}
+
+			if rc.Protocol == "" {
+				rc.Protocol = "lxd"
+			}
+
+			strName := name
+			if name == config.DefaultRemote {
+				strName = fmt.Sprintf("%s (%s)", name, i18n.G("default"))
+			}
+			data = append(data, []string{strName, rc.Addr, rc.Protocol, strPublic, strStatic})
 		}
 
 		table := tablewriter.NewWriter(os.Stdout)
+		table.SetAutoWrapText(false)
+		table.SetAlignment(tablewriter.ALIGN_LEFT)
+		table.SetRowLine(true)
 		table.SetHeader([]string{
-			gettext.Gettext("NAME"),
-			gettext.Gettext("URL"),
-			gettext.Gettext("PUBLIC")})
-		sort.Sort(ByName(data))
+			i18n.G("NAME"),
+			i18n.G("URL"),
+			i18n.G("PROTOCOL"),
+			i18n.G("PUBLIC"),
+			i18n.G("STATIC")})
+		sort.Sort(byName(data))
 		table.AppendBulk(data)
 		table.Render()
 
@@ -253,11 +378,25 @@ func (c *remoteCmd) run(config *lxd.Config, args []string) error {
 
 		rc, ok := config.Remotes[args[1]]
 		if !ok {
-			return fmt.Errorf(gettext.Gettext("remote %s doesn't exist"), args[1])
+			return fmt.Errorf(i18n.G("remote %s doesn't exist"), args[1])
+		}
+
+		if rc.Static {
+			return fmt.Errorf(i18n.G("remote %s is static and cannot be modified"), args[1])
 		}
 
 		if _, ok := config.Remotes[args[2]]; ok {
-			return fmt.Errorf(gettext.Gettext("remote %s already exists"), args[2])
+			return fmt.Errorf(i18n.G("remote %s already exists"), args[2])
+		}
+
+		// Rename the certificate file
+		oldPath := filepath.Join(config.ConfigPath("servercerts"), fmt.Sprintf("%s.crt", args[1]))
+		newPath := filepath.Join(config.ConfigPath("servercerts"), fmt.Sprintf("%s.crt", args[2]))
+		if shared.PathExists(oldPath) {
+			err := os.Rename(oldPath, newPath)
+			if err != nil {
+				return err
+			}
 		}
 
 		config.Remotes[args[2]] = rc
@@ -271,10 +410,16 @@ func (c *remoteCmd) run(config *lxd.Config, args []string) error {
 		if len(args) != 3 {
 			return errArgs
 		}
-		_, ok := config.Remotes[args[1]]
+
+		rc, ok := config.Remotes[args[1]]
 		if !ok {
-			return fmt.Errorf(gettext.Gettext("remote %s doesn't exist"), args[1])
+			return fmt.Errorf(i18n.G("remote %s doesn't exist"), args[1])
 		}
+
+		if rc.Static {
+			return fmt.Errorf(i18n.G("remote %s is static and cannot be modified"), args[1])
+		}
+
 		config.Remotes[args[1]] = lxd.RemoteConfig{Addr: args[2]}
 
 	case "set-default":
@@ -284,7 +429,7 @@ func (c *remoteCmd) run(config *lxd.Config, args []string) error {
 
 		_, ok := config.Remotes[args[1]]
 		if !ok {
-			return fmt.Errorf(gettext.Gettext("remote %s doesn't exist"), args[1])
+			return fmt.Errorf(i18n.G("remote %s doesn't exist"), args[1])
 		}
 		config.DefaultRemote = args[1]
 
@@ -295,8 +440,8 @@ func (c *remoteCmd) run(config *lxd.Config, args []string) error {
 		fmt.Println(config.DefaultRemote)
 		return nil
 	default:
-		return fmt.Errorf(gettext.Gettext("Unknown remote subcommand %s"), args[0])
+		return errArgs
 	}
 
-	return lxd.SaveConfig(config)
+	return lxd.SaveConfig(config, configPath)
 }
