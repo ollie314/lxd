@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"reflect"
 
@@ -66,7 +68,7 @@ func profilesPost(d *Daemon, r *http.Request) Response {
 		return BadRequest(fmt.Errorf("No name provided"))
 	}
 
-	err := containerValidConfig(req.Config, true, false)
+	err := containerValidConfig(d, req.Config, true, false)
 	if err != nil {
 		return BadRequest(err)
 	}
@@ -83,7 +85,7 @@ func profilesPost(d *Daemon, r *http.Request) Response {
 			fmt.Errorf("Error inserting %s into database: %s", req.Name, err))
 	}
 
-	return EmptySyncResponse
+	return SyncResponseLocation(true, nil, fmt.Sprintf("/%s/profiles/%s", shared.APIVersion, req.Name))
 }
 
 var profilesCmd = Command{
@@ -104,7 +106,7 @@ func profileGet(d *Daemon, r *http.Request) Response {
 		return SmartError(err)
 	}
 
-	return SyncResponse(true, resp)
+	return SyncResponseETag(true, resp, resp)
 }
 
 func getRunningContainersWithProfile(d *Daemon, profile string) []container {
@@ -127,15 +129,95 @@ func getRunningContainersWithProfile(d *Daemon, profile string) []container {
 }
 
 func profilePut(d *Daemon, r *http.Request) Response {
+	// Get the profile
 	name := mux.Vars(r)["name"]
+	id, profile, err := dbProfileGet(d.db, name)
+	if err != nil {
+		return InternalError(fmt.Errorf("Failed to retrieve profile='%s'", name))
+	}
+
+	// Validate the ETag
+	err = etagCheck(r, profile)
+	if err != nil {
+		return PreconditionFailed(err)
+	}
 
 	req := profilesPostReq{}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return BadRequest(err)
 	}
 
+	return doProfileUpdate(d, name, id, profile, req)
+}
+
+func profilePatch(d *Daemon, r *http.Request) Response {
+	// Get the profile
+	name := mux.Vars(r)["name"]
+	id, profile, err := dbProfileGet(d.db, name)
+	if err != nil {
+		return InternalError(fmt.Errorf("Failed to retrieve profile='%s'", name))
+	}
+
+	// Validate the ETag
+	err = etagCheck(r, profile)
+	if err != nil {
+		return PreconditionFailed(err)
+	}
+
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		return InternalError(err)
+	}
+
+	rdr1 := ioutil.NopCloser(bytes.NewBuffer(body))
+	rdr2 := ioutil.NopCloser(bytes.NewBuffer(body))
+
+	reqRaw := shared.Jmap{}
+	if err := json.NewDecoder(rdr1).Decode(&reqRaw); err != nil {
+		return BadRequest(err)
+	}
+
+	req := profilesPostReq{}
+	if err := json.NewDecoder(rdr2).Decode(&req); err != nil {
+		return BadRequest(err)
+	}
+
+	// Get Description
+	_, err = reqRaw.GetString("description")
+	if err != nil {
+		req.Description = profile.Description
+	}
+
+	// Get Config
+	if req.Config == nil {
+		req.Config = profile.Config
+	} else {
+		for k, v := range profile.Config {
+			_, ok := req.Config[k]
+			if !ok {
+				req.Config[k] = v
+			}
+		}
+	}
+
+	// Get Devices
+	if req.Devices == nil {
+		req.Devices = profile.Devices
+	} else {
+		for k, v := range profile.Devices {
+			_, ok := req.Devices[k]
+			if !ok {
+				req.Devices[k] = v
+			}
+		}
+	}
+
+	return doProfileUpdate(d, name, id, profile, req)
+}
+
+func doProfileUpdate(d *Daemon, name string, id int64, profile *shared.ProfileConfig, req profilesPostReq) Response {
 	// Sanity checks
-	err := containerValidConfig(req.Config, true, false)
+	err := containerValidConfig(d, req.Config, true, false)
 	if err != nil {
 		return BadRequest(err)
 	}
@@ -157,11 +239,6 @@ func profilePut(d *Daemon, r *http.Request) Response {
 	}
 
 	// Update the database
-	id, profile, err := dbProfileGet(d.db, name)
-	if err != nil {
-		return InternalError(fmt.Errorf("Failed to retrieve profile='%s'", name))
-	}
-
 	tx, err := dbBegin(d.db)
 	if err != nil {
 		return InternalError(err)
@@ -253,7 +330,7 @@ func profilePost(d *Daemon, r *http.Request) Response {
 		return InternalError(err)
 	}
 
-	return EmptySyncResponse
+	return SyncResponseLocation(true, nil, fmt.Sprintf("/%s/profiles/%s", shared.APIVersion, req.Name))
 }
 
 // The handler for the delete operation.
@@ -273,4 +350,4 @@ func profileDelete(d *Daemon, r *http.Request) Response {
 	return EmptySyncResponse
 }
 
-var profileCmd = Command{name: "profiles/{name}", get: profileGet, put: profilePut, delete: profileDelete, post: profilePost}
+var profileCmd = Command{name: "profiles/{name}", get: profileGet, put: profilePut, delete: profileDelete, post: profilePost, patch: profilePatch}

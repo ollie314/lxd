@@ -45,9 +45,29 @@ var api10 = []Command{
 
 func api10Get(d *Daemon, r *http.Request) Response {
 	body := shared.Jmap{
-		"api_extensions": []string{},
-		"api_status":     "stable",
-		"api_version":    shared.APIVersion,
+		/* List of API extensions in the order they were added.
+		 *
+		 * The following kind of changes require an addition to api_extensions:
+		 *  - New configuration key
+		 *  - New valid values for a configuration key
+		 *  - New REST API endpoint
+		 *  - New argument inside an existing REST API call
+		 *  - New HTTPs authentication mechanisms or protocols
+		 */
+		"api_extensions": []string{
+			"storage_zfs_remove_snapshots",
+			"container_host_shutdown_timeout",
+			"container_syscall_filtering",
+			"auth_pki",
+			"container_last_used_at",
+			"etag",
+			"patch",
+			"usb_devices",
+			"https_allowed_credentials",
+		},
+
+		"api_status":  "stable",
+		"api_version": shared.APIVersion,
 	}
 
 	if d.isTrustedClient(r) {
@@ -132,7 +152,7 @@ func api10Get(d *Daemon, r *http.Request) Response {
 		body["public"] = false
 	}
 
-	return SyncResponse(true, body)
+	return SyncResponseETag(true, body, body["config"])
 }
 
 type apiPut struct {
@@ -145,12 +165,50 @@ func api10Put(d *Daemon, r *http.Request) Response {
 		return InternalError(err)
 	}
 
-	req := apiPut{}
+	err = etagCheck(r, oldConfig)
+	if err != nil {
+		return PreconditionFailed(err)
+	}
 
+	req := apiPut{}
 	if err := shared.ReadToJSON(r.Body, &req); err != nil {
 		return BadRequest(err)
 	}
 
+	return doApi10Update(d, oldConfig, req)
+}
+
+func api10Patch(d *Daemon, r *http.Request) Response {
+	oldConfig, err := dbConfigValuesGet(d.db)
+	if err != nil {
+		return InternalError(err)
+	}
+
+	err = etagCheck(r, oldConfig)
+	if err != nil {
+		return PreconditionFailed(err)
+	}
+
+	req := apiPut{}
+	if err := shared.ReadToJSON(r.Body, &req); err != nil {
+		return BadRequest(err)
+	}
+
+	if req.Config == nil {
+		return EmptySyncResponse
+	}
+
+	for k, v := range oldConfig {
+		_, ok := req.Config[k]
+		if !ok {
+			req.Config[k] = v
+		}
+	}
+
+	return doApi10Update(d, oldConfig, req)
+}
+
+func doApi10Update(d *Daemon, oldConfig map[string]string, req apiPut) Response {
 	// Deal with special keys
 	for k, v := range req.Config {
 		config := daemonConfig[k]
@@ -192,11 +250,11 @@ func api10Put(d *Daemon, r *http.Request) Response {
 
 		err := confKey.Set(d, value)
 		if err != nil {
-			return BadRequest(err)
+			return SmartError(err)
 		}
 	}
 
 	return EmptySyncResponse
 }
 
-var api10Cmd = Command{name: "", untrustedGet: true, get: api10Get, put: api10Put}
+var api10Cmd = Command{name: "", untrustedGet: true, get: api10Get, put: api10Put, patch: api10Patch}

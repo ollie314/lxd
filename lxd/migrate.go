@@ -6,18 +6,15 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
-	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/gorilla/websocket"
@@ -69,15 +66,6 @@ func (c *migrationFields) send(m proto.Message) error {
 	}
 
 	return shared.WriteAll(w, data)
-}
-
-func findCriu(host string) error {
-	_, err := exec.LookPath("criu")
-	if err != nil {
-		return fmt.Errorf("CRIU is required for live migration but its binary couldn't be found on the %s server. Is it installed in LXD's path?", host)
-	}
-
-	return nil
 }
 
 func (c *migrationFields) recv(m proto.Message) error {
@@ -156,32 +144,6 @@ func (c *migrationFields) controlChannel() <-chan MigrationControl {
 	}()
 
 	return ch
-}
-
-func CollectCRIULogFile(c container, imagesDir string, function string, method string) error {
-	t := time.Now().Format(time.RFC3339)
-	newPath := shared.LogPath(c.Name(), fmt.Sprintf("%s_%s_%s.log", function, method, t))
-	return shared.FileCopy(filepath.Join(imagesDir, fmt.Sprintf("%s.log", method)), newPath)
-}
-
-func GetCRIULogErrors(imagesDir string, method string) (string, error) {
-	f, err := os.Open(path.Join(imagesDir, fmt.Sprintf("%s.log", method)))
-	if err != nil {
-		return "", err
-	}
-
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	ret := []string{}
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.Contains(line, "Error") {
-			ret = append(ret, scanner.Text())
-		}
-	}
-
-	return strings.Join(ret, "\n"), nil
 }
 
 type migrationSourceWs struct {
@@ -267,7 +229,28 @@ func (s *migrationSourceWs) Connect(op *operation, r *http.Request, w http.Respo
 	return nil
 }
 
-func (s *migrationSourceWs) Do(op *operation) error {
+func writeActionScript(directory string, operation string, secret string) error {
+	script := fmt.Sprintf(`#!/bin/sh -e
+if [ "$CRTOOLS_SCRIPT_ACTION" = "post-dump" ]; then
+	%s migratedumpsuccess %s %s
+fi
+`, execPath, operation, secret)
+
+	f, err := os.Create(filepath.Join(directory, "action.sh"))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if err := f.Chmod(0500); err != nil {
+		return err
+	}
+
+	_, err = f.WriteString(script)
+	return err
+}
+
+func (s *migrationSourceWs) Do(migrateOp *operation) error {
 	<-s.allConnected
 
 	criuType := CRIUType_CRIU_RSYNC.Enum()
@@ -341,54 +324,122 @@ func (s *migrationSourceWs) Do(op *operation) error {
 		driver, _ = rsyncMigrationSource(s.container)
 	}
 
-	if err := driver.SendWhileRunning(s.fsConn); err != nil {
+	// All failure paths need to do a few things to correctly handle errors before returning.
+	// Unfortunately, handling errors is not well-suited to defer as the code depends on the
+	// status of driver and the error value.  The error value is especially tricky due to the
+	// common case of creating a new err variable (intentional or not) due to scoping and use
+	// of ":=".  Capturing err in a closure for use in defer would be fragile, which defeats
+	// the purpose of using defer.  An abort function reduces the odds of mishandling errors
+	// without introducing the fragility of closing on err.
+	abort := func(err error) error {
 		driver.Cleanup()
 		s.sendControl(err)
 		return err
 	}
 
+	if err := driver.SendWhileRunning(s.fsConn); err != nil {
+		return abort(err)
+	}
+
 	if s.live {
 		if header.Criu == nil {
-			driver.Cleanup()
-			err := fmt.Errorf("Got no CRIU socket type for live migration")
-			s.sendControl(err)
-			return err
+			return abort(fmt.Errorf("Got no CRIU socket type for live migration"))
 		} else if *header.Criu != CRIUType_CRIU_RSYNC {
-			driver.Cleanup()
-			err := fmt.Errorf("Formats other than criu rsync not understood")
-			s.sendControl(err)
-			return err
+			return abort(fmt.Errorf("Formats other than criu rsync not understood"))
+		}
+
+		/* What happens below is slightly convoluted. Due to various
+		 * complications with networking, there's no easy way for criu
+		 * to exit and leave the container in a frozen state for us to
+		 * somehow resume later.
+		 *
+		 * Instead, we use what criu calls an "action-script", which is
+		 * basically a callback that lets us know when the dump is
+		 * done. (Unfortunately, we can't pass arguments, just an
+		 * executable path, so we write a custom action script with the
+		 * real command we want to run.)
+		 *
+		 * This script then hangs until the migration operation either
+		 * finishes successfully or fails, and exits 1 or 0, which
+		 * causes criu to either leave the container running or kill it
+		 * as we asked.
+		 */
+		dumpDone := make(chan bool, 1)
+		actionScriptOpSecret, err := shared.RandomCryptoString()
+		if err != nil {
+			return abort(err)
+		}
+
+		actionScriptOp, err := operationCreate(
+			operationClassWebsocket,
+			nil,
+			nil,
+			func(op *operation) error {
+				_, err := migrateOp.WaitFinal(-1)
+				if err != nil {
+					return err
+				}
+
+				if migrateOp.status != shared.Success {
+					return fmt.Errorf("restore failed: %s", op.status.String())
+				}
+				return nil
+			},
+			nil,
+			func(op *operation, r *http.Request, w http.ResponseWriter) error {
+				secret := r.FormValue("secret")
+				if secret == "" {
+					return fmt.Errorf("missing secret")
+				}
+
+				if secret != actionScriptOpSecret {
+					return os.ErrPermission
+				}
+
+				c, err := shared.WebsocketUpgrader.Upgrade(w, r, nil)
+				if err != nil {
+					return err
+				}
+
+				dumpDone <- true
+
+				closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
+				return c.WriteMessage(websocket.CloseMessage, closeMsg)
+			},
+		)
+		if err != nil {
+			return abort(err)
 		}
 
 		checkpointDir, err := ioutil.TempDir("", "lxd_checkpoint_")
 		if err != nil {
-			driver.Cleanup()
-			s.sendControl(err)
-			return err
-		}
-		defer os.RemoveAll(checkpointDir)
-
-		opts := lxc.CheckpointOptions{Stop: true, Directory: checkpointDir, Verbose: true}
-		err = s.container.Checkpoint(opts)
-
-		if err2 := CollectCRIULogFile(s.container, checkpointDir, "migration", "dump"); err2 != nil {
-			shared.Debugf("Error collecting checkpoint log file %s", err)
+			return abort(err)
 		}
 
+		if err := writeActionScript(checkpointDir, actionScriptOp.url, actionScriptOpSecret); err != nil {
+			os.RemoveAll(checkpointDir)
+			return abort(err)
+		}
+
+		_, err = actionScriptOp.Run()
 		if err != nil {
-			driver.Cleanup()
-			log, err2 := GetCRIULogErrors(checkpointDir, "dump")
+			os.RemoveAll(checkpointDir)
+			return abort(err)
+		}
 
-			/* couldn't find the CRIU log file which means we
-			 * didn't even get that far; give back the liblxc
-			 * error. */
-			if err2 != nil {
-				log = err.Error()
-			}
+		migrateDone := make(chan error, 1)
+		go func() {
+			defer os.RemoveAll(checkpointDir)
+			migrateDone <- s.container.Migrate(lxc.MIGRATE_DUMP, checkpointDir, "migration", true, true)
+		}()
 
-			err = fmt.Errorf("checkpoint failed:\n%s", log)
-			s.sendControl(err)
-			return err
+		select {
+		/* the checkpoint failed, let's just abort */
+		case err = <-migrateDone:
+			return abort(err)
+		/* the dump finished, let's continue on to the restore */
+		case <-dumpDone:
+			shared.Debugf("Dump finished, continuing with restore...")
 		}
 
 		/*
@@ -399,15 +450,11 @@ func (s *migrationSourceWs) Do(op *operation) error {
 		 * p.haul's protocol, it will make sense to do these in parallel.
 		 */
 		if err := RsyncSend(shared.AddSlash(checkpointDir), s.criuConn); err != nil {
-			driver.Cleanup()
-			s.sendControl(err)
-			return err
+			return abort(err)
 		}
 
 		if err := driver.SendAfterCheckpoint(s.fsConn); err != nil {
-			driver.Cleanup()
-			s.sendControl(err)
-			return err
+			return abort(err)
 		}
 	}
 
@@ -419,8 +466,6 @@ func (s *migrationSourceWs) Do(op *operation) error {
 		return err
 	}
 
-	// TODO: should we add some config here about automatically restarting
-	// the container migrate failure? What about the failures above?
 	if !*msg.Success {
 		return fmt.Errorf(*msg.Message)
 	}
@@ -598,39 +643,15 @@ func (c *migrationSink) do() error {
 			var err error
 			imagesDir, err = ioutil.TempDir("", "lxd_restore_")
 			if err != nil {
-				os.RemoveAll(imagesDir)
-				return
-			}
-
-			defer func() {
-				err := CollectCRIULogFile(c.container, imagesDir, "migration", "restore")
-				/*
-				 * If the checkpoint fails, we won't have any log to collect,
-				 * so don't warn about that.
-				 */
-				if err != nil && !os.IsNotExist(err) {
-					shared.Debugf("Error collectiong migration log file %s", err)
-				}
-
-				os.RemoveAll(imagesDir)
-			}()
-
-			if err := RsyncRecv(shared.AddSlash(imagesDir), c.criuConn); err != nil {
 				restore <- err
 				return
 			}
 
-			/*
-			 * For unprivileged containers we need to shift the
-			 * perms on the images images so that they can be
-			 * opened by the process after it is in its user
-			 * namespace.
-			 */
-			if !c.container.IsPrivileged() {
-				if err := c.container.IdmapSet().ShiftRootfs(imagesDir); err != nil {
-					restore <- err
-					return
-				}
+			defer os.RemoveAll(imagesDir)
+
+			if err := RsyncRecv(shared.AddSlash(imagesDir), c.criuConn); err != nil {
+				restore <- err
+				return
 			}
 		}
 
@@ -641,15 +662,8 @@ func (c *migrationSink) do() error {
 		}
 
 		if c.live {
-			err := c.container.StartFromMigration(imagesDir)
+			err = c.container.Migrate(lxc.MIGRATE_RESTORE, imagesDir, "migration", false, false)
 			if err != nil {
-				log, err2 := GetCRIULogErrors(imagesDir, "restore")
-				/* restore failed before CRIU was invoked, give
-				 * back the liblxc error */
-				if err2 != nil {
-					log = err.Error()
-				}
-				err = fmt.Errorf("restore failed:\n%s", log)
 				restore <- err
 				return
 			}
@@ -694,7 +708,7 @@ func (c *migrationSink) do() error {
 /*
  * Similar to forkstart, this is called when lxd is invoked as:
  *
- *    lxd forkmigrate <container> <lxcpath> <path_to_config> <path_to_criu_images>
+ *    lxd forkmigrate <container> <lxcpath> <path_to_config> <path_to_criu_images> <preserves_inodes>
  *
  * liblxc's restore() sets up the processes in such a way that the monitor ends
  * up being a child of the process that calls it, in our case lxd. However, we
@@ -703,7 +717,7 @@ func (c *migrationSink) do() error {
  * footprint when we fork tasks that will never free golang's memory, etc.)
  */
 func MigrateContainer(args []string) error {
-	if len(args) != 5 {
+	if len(args) != 6 {
 		return fmt.Errorf("Bad arguments %q", args)
 	}
 
@@ -711,6 +725,7 @@ func MigrateContainer(args []string) error {
 	lxcpath := args[2]
 	configPath := args[3]
 	imagesDir := args[4]
+	preservesInodes, err := strconv.ParseBool(args[5])
 
 	c, err := lxc.NewContainer(name, lxcpath)
 	if err != nil {
@@ -726,8 +741,9 @@ func MigrateContainer(args []string) error {
 	os.Stdout.Close()
 	os.Stderr.Close()
 
-	return c.Restore(lxc.RestoreOptions{
-		Directory: imagesDir,
-		Verbose:   true,
+	return c.Migrate(lxc.MIGRATE_RESTORE, lxc.MigrateOptions{
+		Directory:       imagesDir,
+		Verbose:         true,
+		PreservesInodes: preservesInodes,
 	})
 }

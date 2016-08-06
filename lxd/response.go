@@ -39,21 +39,33 @@ type Response interface {
 // Sync response
 type syncResponse struct {
 	success  bool
+	etag     interface{}
 	metadata interface{}
+	location string
 }
 
 func (r *syncResponse) Render(w http.ResponseWriter) error {
+	// Set an appropriate ETag header
+	if r.etag != nil {
+		etag, err := etagHash(r.etag)
+		if err == nil {
+			w.Header().Set("ETag", etag)
+		}
+	}
+
+	// Prepare the JSON response
 	status := shared.Success
 	if !r.success {
 		status = shared.Failure
 	}
 
+	if r.location != "" {
+		w.Header().Set("Location", r.location)
+		w.WriteHeader(201)
+	}
+
 	resp := syncResp{Type: lxd.Sync, Status: status.String(), StatusCode: status, Metadata: r.metadata}
 	return WriteJSON(w, resp)
-}
-
-func SyncResponse(success bool, metadata interface{}) Response {
-	return &syncResponse{success, metadata}
 }
 
 func (r *syncResponse) String() string {
@@ -64,7 +76,19 @@ func (r *syncResponse) String() string {
 	return "failure"
 }
 
-var EmptySyncResponse = &syncResponse{true, make(map[string]interface{})}
+func SyncResponse(success bool, metadata interface{}) Response {
+	return &syncResponse{success: success, metadata: metadata}
+}
+
+func SyncResponseETag(success bool, metadata interface{}, etag interface{}) Response {
+	return &syncResponse{success: success, metadata: metadata, etag: etag}
+}
+
+func SyncResponseLocation(success bool, metadata interface{}, location string) Response {
+	return &syncResponse{success: success, metadata: metadata, location: location}
+}
+
+var EmptySyncResponse = &syncResponse{success: true, metadata: make(map[string]interface{})}
 
 // File transfer response
 type fileResponseEntry struct {
@@ -251,6 +275,10 @@ func BadRequest(err error) Response {
 
 func InternalError(err error) Response {
 	return &errorResponse{http.StatusInternalServerError, err.Error()}
+}
+
+func PreconditionFailed(err error) Response {
+	return &errorResponse{http.StatusPreconditionFailed, err.Error()}
 }
 
 /*

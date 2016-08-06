@@ -12,7 +12,8 @@ ARCHIVE=lxd-$(VERSION).tar
 
 .PHONY: default
 default:
-	# Must run twice due to go get race
+	# Must a few times due to go get race
+	-go get -t -v -d ./...
 	-go get -t -v -d ./...
 	-go get -t -v -d ./...
 	go install -v $(DEBUG) ./...
@@ -20,7 +21,8 @@ default:
 
 .PHONY: client
 client:
-	# Must run twice due to go get race
+	# Must a few times due to go get race
+	-go get -t -v -d ./...
 	-go get -t -v -d ./...
 	-go get -t -v -d ./...
 	go install -v $(DEBUG) ./lxc
@@ -28,7 +30,8 @@ client:
 
 .PHONY: update
 update:
-	# Must run twice due to go get race
+	# Must a few times due to go get race
+	-go get -t -v -d -u ./...
 	-go get -t -v -d -u ./...
 	go get -t -v -d -u ./...
 	@echo "Dependencies updated"
@@ -55,6 +58,8 @@ dist:
 	rm -Rf lxd-$(VERSION) $(ARCHIVE) $(ARCHIVE).gz
 	mkdir -p lxd-$(VERSION)/dist
 	-GOPATH=$(shell pwd)/lxd-$(VERSION)/dist go get -t -v -d ./...
+	-GOPATH=$(shell pwd)/lxd-$(VERSION)/dist go get -t -v -d ./...
+	-GOPATH=$(shell pwd)/lxd-$(VERSION)/dist go get -t -v -d ./...
 	GOPATH=$(shell pwd)/lxd-$(VERSION)/dist go get -t -v -d ./...
 	rm -rf $(shell pwd)/lxd-$(VERSION)/dist/src/github.com/lxc/lxd
 	ln -s ../../../.. ./lxd-$(VERSION)/dist/src/github.com/lxc/lxd
@@ -79,7 +84,7 @@ update-po:
 	done
 
 update-pot:
-	go get -v -x github.com/ubuntu-core/snappy/i18n/xgettext-go/
+	go get -v -x github.com/snapcore/snapd/i18n/xgettext-go/
 	xgettext-go -o po/$(DOMAIN).pot --add-comments-tag=TRANSLATORS: --sort-output --package-name=$(DOMAIN) --msgid-bugs-address=lxc-devel@lists.linuxcontainers.org --keyword=i18n.G --keyword-plural=i18n.NG *.go shared/*.go lxc/*.go lxd/*.go
 
 

@@ -301,14 +301,7 @@ func (s *storageLvm) ContainerCreateFromImage(
 		return fmt.Errorf("Error creating container directory: %v", err)
 	}
 
-	var mode os.FileMode
-	if container.IsPrivileged() {
-		mode = 0700
-	} else {
-		mode = 0755
-	}
-
-	err = os.Chmod(destPath, mode)
+	err = os.Chmod(destPath, 0700)
 	if err != nil {
 		return err
 	}
@@ -333,6 +326,18 @@ func (s *storageLvm) ContainerCreateFromImage(
 	if err != nil {
 		s.ContainerDelete(container)
 		return fmt.Errorf("Error mounting snapshot LV: %v", err)
+	}
+
+	var mode os.FileMode
+	if container.IsPrivileged() {
+		mode = 0700
+	} else {
+		mode = 0755
+	}
+
+	err = os.Chmod(destPath, mode)
+	if err != nil {
+		return err
 	}
 
 	if !container.IsPrivileged() {
@@ -727,28 +732,28 @@ func (s *storageLvm) ImageCreate(fingerprint string) error {
 	fstype := daemonConfig["storage.lvm_fstype"].Get()
 	err = tryMount(lvpath, tempLVMountPoint, fstype, 0, "discard")
 	if err != nil {
-		shared.Logf("Error mounting image LV for untarring: %v", err)
+		shared.Logf("Error mounting image LV for unpacking: %v", err)
 		return fmt.Errorf("Error mounting image LV: %v", err)
 	}
 
-	untarErr := untarImage(finalName, tempLVMountPoint)
+	unpackErr := unpackImage(finalName, tempLVMountPoint)
 
 	err = tryUnmount(tempLVMountPoint, 0)
 	if err != nil {
 		s.log.Warn("could not unmount LV. Will not remove",
 			log.Ctx{"lvpath": lvpath, "mountpoint": tempLVMountPoint, "err": err})
-		if untarErr == nil {
+		if unpackErr == nil {
 			return err
 		}
 
 		return fmt.Errorf(
 			"Error unmounting '%s' during cleanup of error %v",
-			tempLVMountPoint, untarErr)
+			tempLVMountPoint, unpackErr)
 	}
 
-	if untarErr != nil {
+	if unpackErr != nil {
 		s.removeLV(fingerprint)
-		return untarErr
+		return unpackErr
 	}
 
 	return nil
@@ -773,14 +778,28 @@ func (s *storageLvm) ImageDelete(fingerprint string) error {
 
 func (s *storageLvm) createDefaultThinPool() (string, error) {
 	thinPoolName := daemonConfig["storage.lvm_thinpool_name"].Get()
+	isRecent, err := s.lvmVersionIsAtLeast("2.02.99")
+	if err != nil {
+		return "", fmt.Errorf("Error checking LVM version: %v", err)
+	}
 
-	// Create a tiny 1G thinpool
-	output, err := tryExec(
-		"lvcreate",
-		"--poolmetadatasize", "1G",
-		"-L", "1G",
-		"--thinpool",
-		fmt.Sprintf("%s/%s", s.vgName, thinPoolName))
+	// Create the thin pool
+	var output []byte
+	if isRecent {
+		output, err = tryExec(
+			"lvcreate",
+			"--poolmetadatasize", "1G",
+			"-l", "100%FREE",
+			"--thinpool",
+			fmt.Sprintf("%s/%s", s.vgName, thinPoolName))
+	} else {
+		output, err = tryExec(
+			"lvcreate",
+			"--poolmetadatasize", "1G",
+			"-L", "1G",
+			"--thinpool",
+			fmt.Sprintf("%s/%s", s.vgName, thinPoolName))
+	}
 
 	if err != nil {
 		s.log.Error(
@@ -794,23 +813,25 @@ func (s *storageLvm) createDefaultThinPool() (string, error) {
 			"Could not create LVM thin pool named %s", thinPoolName)
 	}
 
-	// Grow it to the maximum VG size (two step process required by old LVM)
-	output, err = tryExec(
-		"lvextend",
-		"--alloc", "anywhere",
-		"-l", "100%FREE",
-		fmt.Sprintf("%s/%s", s.vgName, thinPoolName))
+	if !isRecent {
+		// Grow it to the maximum VG size (two step process required by old LVM)
+		output, err = tryExec(
+			"lvextend",
+			"--alloc", "anywhere",
+			"-l", "100%FREE",
+			fmt.Sprintf("%s/%s", s.vgName, thinPoolName))
 
-	if err != nil {
-		s.log.Error(
-			"Could not grow thin pool",
-			log.Ctx{
-				"name":   thinPoolName,
-				"err":    err,
-				"output": string(output)})
+		if err != nil {
+			s.log.Error(
+				"Could not grow thin pool",
+				log.Ctx{
+					"name":   thinPoolName,
+					"err":    err,
+					"output": string(output)})
 
-		return "", fmt.Errorf(
-			"Could not grow LVM thin pool named %s", thinPoolName)
+			return "", fmt.Errorf(
+				"Could not grow LVM thin pool named %s", thinPoolName)
+		}
 	}
 
 	return thinPoolName, nil
@@ -941,6 +962,10 @@ func (s *storageLvm) renameLV(oldName string, newName string) (string, error) {
 
 func (s *storageLvm) MigrationType() MigrationFSType {
 	return MigrationFSType_RSYNC
+}
+
+func (s *storageLvm) PreservesInodes() bool {
+	return false
 }
 
 func (s *storageLvm) MigrationSource(container container) (MigrationStorageSourceDriver, error) {

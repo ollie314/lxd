@@ -10,14 +10,15 @@ import (
 )
 
 type actionCmd struct {
-	action     shared.ContainerAction
-	hasTimeout bool
-	visible    bool
-	name       string
-	timeout    int
-	force      bool
-	stateful   bool
-	stateless  bool
+	action         shared.ContainerAction
+	hasTimeout     bool
+	visible        bool
+	name           string
+	timeout        int
+	force          bool
+	stateful       bool
+	stateless      bool
+	additionalHelp string
 }
 
 func (c *actionCmd) showByDefault() bool {
@@ -25,15 +26,20 @@ func (c *actionCmd) showByDefault() bool {
 }
 
 func (c *actionCmd) usage() string {
+	if c.additionalHelp != "" {
+		c.additionalHelp = fmt.Sprintf("\n\n%s", c.additionalHelp)
+	}
+
 	return fmt.Sprintf(i18n.G(
 		`Changes state of one or more containers to %s.
 
-lxc %s <name> [<name>...]`), c.name, c.name)
+lxc %s <name> [<name>...]%s`), c.name, c.name, c.additionalHelp)
 }
 
 func (c *actionCmd) flags() {
 	if c.hasTimeout {
 		gnuflag.IntVar(&c.timeout, "timeout", -1, i18n.G("Time to wait for the container before killing it."))
+		gnuflag.BoolVar(&c.force, "f", false, i18n.G("Force the container to shutdown."))
 		gnuflag.BoolVar(&c.force, "force", false, i18n.G("Force the container to shutdown."))
 	}
 	gnuflag.BoolVar(&c.stateful, "stateful", false, i18n.G("Store the container state (only for stop)."))
@@ -63,7 +69,7 @@ func (c *actionCmd) run(config *lxd.Config, args []string) error {
 			return fmt.Errorf(i18n.G("Must supply container name for: ")+"\"%s\"", nameArg)
 		}
 
-		if c.action == shared.Start || c.action == shared.Stop {
+		if c.action == shared.Start {
 			current, err := d.ContainerInfo(name)
 			if err != nil {
 				return err
@@ -90,7 +96,7 @@ func (c *actionCmd) run(config *lxd.Config, args []string) error {
 		}
 
 		if err := d.WaitForSuccess(resp.Operation); err != nil {
-			return fmt.Errorf("%s\n"+i18n.G("Try `lxc info --show-log %s` for more info"), err, name)
+			return fmt.Errorf("%s\n"+i18n.G("Try `lxc info --show-log %s` for more info"), err, nameArg)
 		}
 	}
 	return nil

@@ -79,6 +79,13 @@ func (s *storageZfs) Init(config map[string]interface{}) (storage, error) {
 
 // Things we don't need to care about
 func (s *storageZfs) ContainerStart(container container) error {
+	fs := fmt.Sprintf("containers/%s", container.Name())
+
+	// Just in case the container filesystem got unmounted
+	if !shared.IsMountPoint(shared.VarPath(fs)) {
+		s.zfsMount(fs)
+	}
+
 	return nil
 }
 
@@ -618,22 +625,31 @@ func (s *storageZfs) ImageCreate(fingerprint string) error {
 		return err
 	}
 
-	err = untarImage(imagePath, subvol)
-	if err != nil {
-		s.zfsDestroy(fs)
+	cleanup := func(err error) error {
+		if zerr := s.zfsDestroy(fs); zerr != nil {
+			err = fmt.Errorf("%s  During cleanup: %s", err, zerr)
+		}
+		if shared.PathExists(subvol) {
+			if oserr := os.Remove(subvol); oserr != nil {
+				err = fmt.Errorf("%s  During cleanup: Failed to remove sub-volume %s, %s", err, subvol, oserr)
+			}
+		}
 		return err
+	}
+
+	err = unpackImage(imagePath, subvol)
+	if err != nil {
+		return cleanup(err)
 	}
 
 	err = s.zfsSet(fs, "readonly", "on")
 	if err != nil {
-		s.zfsDestroy(fs)
-		return err
+		return cleanup(err)
 	}
 
 	err = s.zfsSnapshotCreate(fs, "readonly")
 	if err != nil {
-		s.zfsDestroy(fs)
-		return err
+		return cleanup(err)
 	}
 
 	return nil
@@ -847,7 +863,7 @@ func (s *storageZfs) zfsCleanup(path string) error {
 
 			return nil
 		}
-	} else if strings.HasPrefix(path, "containers") {
+	} else if strings.HasPrefix(path, "containers") && strings.Contains(path, "@copy-") {
 		// Just remove the copy- snapshot for copies of active containers
 		err := s.zfsDestroy(path)
 		if err != nil {
@@ -1220,7 +1236,7 @@ func (s *zfsMigrationSourceDriver) send(conn *websocket.Conn, zfsName string, zf
 		return err
 	}
 
-	<-shared.WebsocketSendStream(conn, stdout)
+	<-shared.WebsocketSendStream(conn, stdout, 4*1024*1024)
 
 	output, err := ioutil.ReadAll(stderr)
 	if err != nil {
@@ -1294,6 +1310,10 @@ func (s *zfsMigrationSourceDriver) Cleanup() {
 
 func (s *storageZfs) MigrationType() MigrationFSType {
 	return MigrationFSType_ZFS
+}
+
+func (s *storageZfs) PreservesInodes() bool {
+	return true
 }
 
 func (s *storageZfs) MigrationSource(ct container) (MigrationStorageSourceDriver, error) {

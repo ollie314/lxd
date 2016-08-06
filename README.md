@@ -37,7 +37,7 @@ curl --unix-socket /var/lib/lxd/unix.socket \
     -H "Content-Type: application/json" \
     -X POST \
     -d @hello-ubuntu.json \
-    "https://127.0.0.1:8443/1.0/containers"
+    lxd/1.0/containers
 ```
 
 #### via TCP
@@ -46,7 +46,7 @@ TCP requires some additional configuration and is not enabled by default.
 lxc config set core.https_address "[::]:8443"
 ```
 ```bash
-curl -k -L -I \
+curl -k -L \
     --cert ~/.config/lxc/client.crt \
     --key ~/.config/lxc/client.key \
     -H "Content-Type: application/json" \
@@ -83,7 +83,7 @@ via the LXD PPA:
     sudo apt-get install software-properties-common
     sudo add-apt-repository ppa:ubuntu-lxc/lxd-git-master
     sudo apt-get update
-    sudo apt-get install golang lxc lxc-dev mercurial git pkg-config protobuf-compiler golang-goprotobuf-dev xz-utils tar acl make
+    sudo apt-get install acl git golang liblxc1 lxc-dev make pkg-config rsync squashfs-tools tar xz-utils
 
 There are a few storage backends for LXD besides the default "directory"
 backend. Installing these tools adds a bit to initramfs and may slow down your
@@ -311,8 +311,16 @@ lxc-devel, and we can escalate to CRIU lists as necessary.
 
 Yes. The easiest way to do that is using a privileged container:
 
-    lxc launch ubuntu priv -c security.privileged=true
-    lxc config device add priv homedir disk source=/home/$USER path=/home/ubuntu
+1.a) create a container.
+
+    lxc launch ubuntu privilegedContainerName -c security.privileged=true
+    
+1.b) or, if your container already exists.
+
+        lxc config set privilegedContainerName security.privileged true
+2) then.
+
+    lxc config device add privilegedContainerName shareName disk source=/home/$USER path=/home/ubuntu
 
 #### How can I run docker inside a LXD container?
 

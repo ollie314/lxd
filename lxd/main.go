@@ -35,11 +35,11 @@ var argHelp = gnuflag.Bool("help", false, "")
 var argLogfile = gnuflag.String("logfile", "", "")
 var argMemProfile = gnuflag.String("memprofile", "", "")
 var argNetworkAddress = gnuflag.String("network-address", "", "")
-var argNetworkPort = gnuflag.Int("network-port", -1, "")
+var argNetworkPort = gnuflag.Int64("network-port", -1, "")
 var argPrintGoroutinesEvery = gnuflag.Int("print-goroutines-every", -1, "")
 var argStorageBackend = gnuflag.String("storage-backend", "", "")
 var argStorageCreateDevice = gnuflag.String("storage-create-device", "", "")
-var argStorageCreateLoop = gnuflag.Int("storage-create-loop", -1, "")
+var argStorageCreateLoop = gnuflag.Int64("storage-create-loop", -1, "")
 var argStoragePool = gnuflag.String("storage-pool", "", "")
 var argSyslog = gnuflag.Bool("syslog", false, "")
 var argTimeout = gnuflag.Int("timeout", -1, "")
@@ -158,8 +158,10 @@ func run() error {
 		fmt.Printf("        Start a container\n")
 		fmt.Printf("    callhook\n")
 		fmt.Printf("        Call a container hook\n")
+		fmt.Printf("    migratedumpsuccess\n")
+		fmt.Printf("        Indicate that a migration dump was successful\n")
 		fmt.Printf("    netcat\n")
-		fmt.Printf("        Mirror a unix socket to stdin/stdout")
+		fmt.Printf("        Mirror a unix socket to stdin/stdout\n")
 	}
 
 	// Parse the arguments
@@ -237,6 +239,8 @@ func run() error {
 			os.Exit(ret)
 		case "netcat":
 			return Netcat(os.Args[1:])
+		case "migratedumpsuccess":
+			return cmdMigrateDumpSuccess(os.Args[1:])
 		}
 	}
 
@@ -333,7 +337,7 @@ func cmdDaemon() error {
 		go memProfiler(*argMemProfile)
 	}
 
-	neededPrograms := []string{"setfacl", "rsync", "tar", "xz"}
+	neededPrograms := []string{"setfacl", "rsync", "tar", "unsquashfs", "xz"}
 	for _, p := range neededPrograms {
 		_, err := exec.LookPath(p)
 		if err != nil {
@@ -590,11 +594,11 @@ func cmdInit() error {
 	var defaultPrivileged int // controls whether we set security.privileged=true
 	var storageBackend string // dir or zfs
 	var storageMode string    // existing, loop or device
-	var storageLoopSize int   // Size in GB
+	var storageLoopSize int64 // Size in GB
 	var storageDevice string  // Path
 	var storagePool string    // pool name
 	var networkAddress string // Address
-	var networkPort int       // Port
+	var networkPort int64     // Port
 	var trustPassword string  // Trust password
 
 	// Detect userns
@@ -617,11 +621,14 @@ func cmdInit() error {
 
 	reader := bufio.NewReader(os.Stdin)
 
-	askBool := func(question string) bool {
+	askBool := func(question string, default_ string) bool {
 		for {
 			fmt.Printf(question)
 			input, _ := reader.ReadString('\n')
 			input = strings.TrimSuffix(input, "\n")
+			if input == "" {
+				input = default_
+			}
 			if shared.StringInSlice(strings.ToLower(input), []string{"yes", "y"}) {
 				return true
 			} else if shared.StringInSlice(strings.ToLower(input), []string{"no", "n"}) {
@@ -632,11 +639,14 @@ func cmdInit() error {
 		}
 	}
 
-	askChoice := func(question string, choices []string) string {
+	askChoice := func(question string, choices []string, default_ string) string {
 		for {
 			fmt.Printf(question)
 			input, _ := reader.ReadString('\n')
 			input = strings.TrimSuffix(input, "\n")
+			if input == "" {
+				input = default_
+			}
 			if shared.StringInSlice(input, choices) {
 				return input
 			}
@@ -645,12 +655,15 @@ func cmdInit() error {
 		}
 	}
 
-	askInt := func(question string, min int, max int) int {
+	askInt := func(question string, min int64, max int64, default_ string) int64 {
 		for {
 			fmt.Printf(question)
 			input, _ := reader.ReadString('\n')
 			input = strings.TrimSuffix(input, "\n")
-			intInput, err := strconv.Atoi(input)
+			if input == "" {
+				input = default_
+			}
+			intInput, err := strconv.ParseInt(input, 10, 64)
 
 			if err == nil && (min == -1 || intInput >= min) && (max == -1 || intInput <= max) {
 				return intInput
@@ -660,11 +673,21 @@ func cmdInit() error {
 		}
 	}
 
-	askString := func(question string) string {
+	askString := func(question string, default_ string, validate func(string) string) string {
 		for {
 			fmt.Printf(question)
 			input, _ := reader.ReadString('\n')
 			input = strings.TrimSuffix(input, "\n")
+			if input == "" {
+				input = default_
+			}
+			if validate != nil {
+				result := validate(input)
+				if result != "" {
+					fmt.Printf("Invalid input: %s\n\n", result)
+					continue
+				}
+			}
 			if len(input) != 0 {
 				return input
 			}
@@ -732,13 +755,13 @@ func cmdInit() error {
 
 		if *argStorageBackend == "dir" {
 			if *argStorageCreateLoop != -1 || *argStorageCreateDevice != "" || *argStoragePool != "" {
-				return fmt.Errorf("None of --storage-pool, --storage-create-device or --storage-create-pool may be used with the 'dir' backend.")
+				return fmt.Errorf("None of --storage-pool, --storage-create-device or --storage-create-loop may be used with the 'dir' backend.")
 			}
 		}
 
 		if *argStorageBackend == "zfs" {
 			if *argStorageCreateLoop != -1 && *argStorageCreateDevice != "" {
-				return fmt.Errorf("Only one of --storage-create-device or --storage-create-pool can be specified with the 'zfs' backend.")
+				return fmt.Errorf("Only one of --storage-create-device or --storage-create-loop can be specified with the 'zfs' backend.")
 			}
 
 			if *argStoragePool == "" {
@@ -776,7 +799,7 @@ func cmdInit() error {
 			return fmt.Errorf("Init configuration is only valid with --auto")
 		}
 
-		storageBackend = askChoice("Name of the storage backend to use (dir or zfs): ", backendsSupported)
+		storageBackend = askChoice("Name of the storage backend to use (dir or zfs) [default=zfs]: ", backendsSupported, "zfs")
 
 		if !shared.StringInSlice(storageBackend, backendsSupported) {
 			return fmt.Errorf("The requested backend '%s' isn't supported by lxd init.", storageBackend)
@@ -787,17 +810,23 @@ func cmdInit() error {
 		}
 
 		if storageBackend == "zfs" {
-			if askBool("Create a new ZFS pool (yes/no)? ") {
-				storagePool = askString("Name of the new ZFS pool: ")
-				if askBool("Would you like to use an existing block device (yes/no)? ") {
-					storageDevice = askString("Path to the existing block device: ")
+			if askBool("Create a new ZFS pool (yes/no) [default=yes]? ", "yes") {
+				storagePool = askString("Name of the new ZFS pool [default=lxd]: ", "lxd", nil)
+				if askBool("Would you like to use an existing block device (yes/no) [default=no]? ", "no") {
+					deviceExists := func(path string) string {
+						if !shared.IsBlockdevPath(path) {
+							return fmt.Sprintf("'%s' is not a block device", path)
+						}
+						return ""
+					}
+					storageDevice = askString("Path to the existing block device: ", "", deviceExists)
 					storageMode = "device"
 				} else {
-					storageLoopSize = askInt("Size in GB of the new loop device (1GB minimum): ", 1, -1)
+					storageLoopSize = askInt("Size in GB of the new loop device (1GB minimum) [default=10GB]: ", 1, -1, "10")
 					storageMode = "loop"
 				}
 			} else {
-				storagePool = askString("Name of the existing ZFS pool or dataset: ")
+				storagePool = askString("Name of the existing ZFS pool or dataset: ", "", nil)
 				storageMode = "existing"
 			}
 		}
@@ -814,16 +843,26 @@ in theory attack their parent container and gain more privileges than
 they otherwise would.
 
 `)
-			if askBool("Would you like to have your containers share their parent's allocation (yes/no)? ") {
+			if askBool("Would you like to have your containers share their parent's allocation (yes/no) [default=yes]? ", "yes") {
 				defaultPrivileged = 1
 			} else {
 				defaultPrivileged = 0
 			}
 		}
 
-		if askBool("Would you like LXD to be available over the network (yes/no)? ") {
-			networkAddress = askString("Address to bind LXD to (not including port): ")
-			networkPort = askInt("Port to bind LXD to (8443 recommended): ", 1, 65535)
+		if askBool("Would you like LXD to be available over the network (yes/no) [default=no]? ", "no") {
+			isIPAddress := func(s string) string {
+				if net.ParseIP(s) == nil {
+					return fmt.Sprintf("'%s' is not an IP address", s)
+				}
+				return ""
+			}
+
+			networkAddress = askString("Address to bind LXD to (not including port) [default=0.0.0.0]: ", "0.0.0.0", isIPAddress)
+			if net.ParseIP(networkAddress).To4() == nil {
+				networkAddress = fmt.Sprintf("[%s]", networkAddress)
+			}
+			networkPort = askInt("Port to bind LXD to [default=8443]: ", 1, 65535, "8443")
 			trustPassword = askPassword("Trust password for new clients: ")
 		}
 	}
@@ -833,7 +872,7 @@ they otherwise would.
 	}
 
 	// Unset all storage keys, core.https_address and core.trust_password
-	for _, key := range []string{"core.https_address", "core.trust_password"} {
+	for _, key := range []string{"storage.zfs_pool_name", "core.https_address", "core.trust_password"} {
 		_, err = c.SetServerConfig(key, "")
 		if err != nil {
 			return err
@@ -853,6 +892,11 @@ they otherwise would.
 			f, err := os.Create(storageDevice)
 			if err != nil {
 				return fmt.Errorf("Failed to open %s: %s", storageDevice, err)
+			}
+
+			err = f.Chmod(0600)
+			if err != nil {
+				return fmt.Errorf("Failed to chmod %s: %s", storageDevice, err)
 			}
 
 			err = f.Truncate(int64(storageLoopSize * 1024 * 1024 * 1024))
@@ -1044,4 +1088,23 @@ func printnet() error {
 	fmt.Printf("%s\n", buf)
 
 	return nil
+}
+
+func cmdMigrateDumpSuccess(args []string) error {
+	if len(args) != 3 {
+		return fmt.Errorf("bad migrate dump success args %s", args)
+	}
+
+	c, err := lxd.NewClient(&lxd.DefaultConfig, "local")
+	if err != nil {
+		return err
+	}
+
+	conn, err := c.Websocket(args[1], args[2])
+	if err != nil {
+		return err
+	}
+	conn.Close()
+
+	return c.WaitForSuccess(args[1])
 }

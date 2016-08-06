@@ -1,16 +1,5 @@
 #!/bin/sh
 
-gen_third_cert() {
-  [ -f "${LXD_CONF}/client3.crt" ] && return
-  mv "${LXD_CONF}/client.crt" "${LXD_CONF}/client.crt.bak"
-  mv "${LXD_CONF}/client.key" "${LXD_CONF}/client.key.bak"
-  lxc_remote list > /dev/null 2>&1
-  mv "${LXD_CONF}/client.crt" "${LXD_CONF}/client3.crt"
-  mv "${LXD_CONF}/client.key" "${LXD_CONF}/client3.key"
-  mv "${LXD_CONF}/client.crt.bak" "${LXD_CONF}/client.crt"
-  mv "${LXD_CONF}/client.key.bak" "${LXD_CONF}/client.key"
-}
-
 test_basic_usage() {
   ensure_import_testimage
   ensure_has_localhost_remote "${LXD_ADDR}"
@@ -24,7 +13,7 @@ test_basic_usage() {
     name=${sum}.tar.xz
   fi
   [ "${sum}" = "$(sha256sum "${LXD_DIR}/${name}" | cut -d' ' -f1)" ]
-
+  
   # Test an alias with slashes
   lxc image show "${sum}"
   lxc image alias create a/b/ "${sum}"
@@ -59,10 +48,43 @@ test_basic_usage() {
   lxc image import "${LXD_DIR}/testimage.tar.xz" --alias testimage
   rm "${LXD_DIR}/testimage.tar.xz"
 
-  # Test filename for image export (should be "out")
+  # Test filename for image export
   lxc image export testimage "${LXD_DIR}/"
   [ "${sum}" = "$(sha256sum "${LXD_DIR}/testimage.tar.xz" | cut -d' ' -f1)" ]
   rm "${LXD_DIR}/testimage.tar.xz"
+
+  # Test custom filename for image export
+  lxc image export testimage "${LXD_DIR}/foo"
+  [ "${sum}" = "$(sha256sum "${LXD_DIR}/foo.tar.xz" | cut -d' ' -f1)" ]
+  rm "${LXD_DIR}/foo.tar.xz"
+
+
+  # Test image export with a split image.
+  deps/import-busybox --split --alias splitimage
+
+  sum=$(lxc image info splitimage | grep ^Fingerprint | cut -d' ' -f2)
+
+  lxc image export splitimage "${LXD_DIR}"
+  [ "${sum}" = "$(cat "${LXD_DIR}/meta-${sum}.tar.xz" "${LXD_DIR}/${sum}.tar.xz" | sha256sum | cut -d' ' -f1)" ]
+  
+  # Delete the split image and exported files
+  rm "${LXD_DIR}/${sum}.tar.xz"
+  rm "${LXD_DIR}/meta-${sum}.tar.xz"
+  lxc image delete splitimage
+
+  # Redo the split image export test, this time with the --filename flag
+  # to tell import-busybox to set the 'busybox' filename in the upload.
+  # The sum should remain the same as its the same image.
+  deps/import-busybox --split --filename --alias splitimage
+
+  lxc image export splitimage "${LXD_DIR}"
+  [ "${sum}" = "$(cat "${LXD_DIR}/meta-busybox.tar.xz" "${LXD_DIR}/busybox.tar.xz" | sha256sum | cut -d' ' -f1)" ]
+  
+  # Delete the split image and exported files
+  rm "${LXD_DIR}/busybox.tar.xz"
+  rm "${LXD_DIR}/meta-busybox.tar.xz"
+  lxc image delete splitimage
+
 
   # Test container creation
   lxc init testimage foo
@@ -82,7 +104,7 @@ test_basic_usage() {
   lxc delete foo
 
   # gen untrusted cert
-  gen_third_cert
+  gen_cert client3
 
   # don't allow requests without a cert to get trusted data
   curl -k -s -X GET "https://${LXD_ADDR}/1.0/containers/foo" | grep 403
@@ -138,9 +160,33 @@ test_basic_usage() {
   lxc delete bar2
   lxc image delete foo
 
-  # test basic alias support
-  printf "aliases:\n  ls: list" >> "${LXD_CONF}/config.yml"
-  lxc ls
+  # Test alias support
+  cp "${LXD_CONF}/config.yml" "${LXD_CONF}/config.yml.bak"
+
+  #   1. Basic built-in alias functionality
+  [ "$(lxc ls)" = "$(lxc list)" ]
+  #   2. Basic user-defined alias functionality
+  printf "aliases:\n  l: list\n" >> "${LXD_CONF}/config.yml"
+  [ "$(lxc l)" = "$(lxc list)" ]
+  #   3. Built-in aliases and user-defined aliases can coexist
+  [ "$(lxc ls)" = "$(lxc l)" ]
+  #   4. Multi-argument alias keys and values
+  printf "  i ls: image list\n" >> "${LXD_CONF}/config.yml"
+  [ "$(lxc i ls)" = "$(lxc image list)" ]
+  #   5. Aliases where len(keys) != len(values) (expansion/contraction of number of arguments)
+  printf "  ils: image list\n  container ls: list\n" >> "${LXD_CONF}/config.yml"
+  [ "$(lxc ils)" = "$(lxc image list)" ]
+  [ "$(lxc container ls)" = "$(lxc list)" ]
+  #   6. User-defined aliases override built-in aliases
+  printf "  cp: list\n" >> "${LXD_CONF}/config.yml"
+  [ "$(lxc ls)" = "$(lxc cp)" ]
+  #   7. User-defined aliases override commands and don't recurse
+  LXC_LIST_DEBUG=$(lxc list --debug 2>&1 | grep -o "Raw.*")
+  printf "  list: list --debug\n" >> "${LXD_CONF}/config.yml"
+  [ "$(lxc list  2>&1 | grep -o 'Raw.*')" = "$LXC_LIST_DEBUG" ]
+
+  # Restore the config to remove the aliases
+  mv "${LXD_CONF}/config.yml.bak" "${LXD_CONF}/config.yml"
 
   # Delete the bar container we've used for several tests
   lxc delete bar
@@ -202,10 +248,20 @@ test_basic_usage() {
     false
   fi
 
+  # Test last_used_at field is working properly
+  lxc init testimage last-used-at-test
+  lxc list last-used-at-test  --format json | jq -r '.[].last_used_at' | grep '1970-01-01T00:00:00Z'
+  lxc start last-used-at-test
+  lxc list last-used-at-test  --format json | jq -r '.[].last_used_at' | grep -v '1970-01-01T00:00:00Z'
+
   # check that we can set the environment
   lxc exec foo pwd | grep /root
   lxc exec --env BEST_BAND=meshuggah foo env | grep meshuggah
   lxc exec foo ip link show | grep eth0
+
+  # check that we can get the return code for a non- wait-for-websocket exec
+  op=$(my_curl -X POST "https://${LXD_ADDR}/1.0/containers/foo/exec" -d '{"command": ["sleep", "1"], "environment": {}, "wait-for-websocket": false, "interactive": false}' | jq -r .operation)
+  [ "$(my_curl "https://${LXD_ADDR}${op}/wait" | jq -r .metadata.metadata.return)" != "null" ]
 
   # test file transfer
   echo abc > "${LXD_DIR}/in"
@@ -217,6 +273,14 @@ test_basic_usage() {
   lxc file push "${LXD_DIR}/in" foo/root/in1
   lxc exec foo /bin/cat /root/in1 | grep abc
   lxc exec foo -- /bin/rm -f root/in1
+
+  # test lxc file edit doesn't change target file's owner and permissions
+  echo "content" | lxc file push - foo/tmp/edit_test
+  lxc exec foo -- chown 55.55 /tmp/edit_test
+  lxc exec foo -- chmod 555 /tmp/edit_test
+  echo "new content" | lxc file edit foo/tmp/edit_test
+  [ "$(lxc exec foo -- cat /tmp/edit_test)" = "new content" ]
+  [ "$(lxc exec foo -- stat -c \"%u %g %a\" /tmp/edit_test)" = "55 55 555" ]
 
   # make sure stdin is chowned to our container root uid (Issue #590)
   [ -t 0 ] && [ -t 1 ] && lxc exec foo -- chown 1000:1000 /proc/self/fd/0
@@ -250,6 +314,16 @@ test_basic_usage() {
   lxc delete lxd-apparmor-test
   [ ! -f "${LXD_DIR}/security/apparmor/profiles/lxd-lxd-apparmor-test" ]
 
+  lxc launch testimage lxd-seccomp-test
+  init=$(lxc info lxd-seccomp-test | grep Pid | cut -f2 -d" ")
+  [ "$(grep Seccomp "/proc/${init}/status" | cut -f2)" -eq "2" ]
+  lxc stop --force lxd-seccomp-test
+  lxc config set lxd-seccomp-test security.syscalls.blacklist_default false
+  lxc start lxd-seccomp-test
+  init=$(lxc info lxd-seccomp-test | grep Pid | cut -f2 -d" ")
+  [ "$(grep Seccomp "/proc/${init}/status" | cut -f2)" -eq "0" ]
+  lxc stop --force lxd-seccomp-test
+
   # make sure that privileged containers are not world-readable
   lxc profile create unconfined
   lxc profile set unconfined security.privileged true
@@ -257,6 +331,32 @@ test_basic_usage() {
   [ "$(stat -L -c "%a" "${LXD_DIR}/containers/foo2")" = "700" ]
   lxc delete foo2
   lxc profile delete unconfined
+
+  # Test boot.host_shutdown_timeout config setting
+  lxc init testimage configtest --config boot.host_shutdown_timeout=45
+  [ "$(lxc config get configtest boot.host_shutdown_timeout)" -eq 45 ]
+  lxc config set configtest boot.host_shutdown_timeout 15
+  [ "$(lxc config get configtest boot.host_shutdown_timeout)" -eq 15 ]
+  lxc delete configtest
+
+  # Test deleting multiple images
+  # Start 3 containers to create 3 different images
+  lxc launch testimage c1
+  lxc launch testimage c2
+  lxc launch testimage c3
+  lxc exec c1 -- touch /tmp/c1
+  lxc exec c2 -- touch /tmp/c2
+  lxc exec c3 -- touch /tmp/c3
+  lxc publish --force c1 --alias=image1
+  lxc publish --force c2 --alias=image2
+  lxc publish --force c3 --alias=image3
+  # Delete multiple images with lxc delete and confirm they're deleted
+  lxc image delete local:image1 local:image2 local:image3
+  ! lxc image list | grep -q image1
+  ! lxc image list | grep -q image2
+  ! lxc image list | grep -q image3
+  # Cleanup the containers
+  lxc delete --force c1 c2 c3
 
   # Ephemeral
   lxc launch testimage foo -e

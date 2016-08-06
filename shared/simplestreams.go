@@ -115,14 +115,19 @@ func (s *SimpleStreamsManifest) ToLXD() ([]ImageInfo, map[string][][]string) {
 			found := 0
 			for _, item := range version.Items {
 				// Skip the files we don't care about
-				if !StringInSlice(item.FileType, []string{"root.tar.xz", "lxd.tar.xz"}) {
+				if !StringInSlice(item.FileType, []string{"root.tar.xz", "lxd.tar.xz", "squashfs"}) {
 					continue
 				}
 				found += 1
 
-				size += item.Size
-				if item.LXDHashSha256 != "" {
-					fingerprint = item.LXDHashSha256
+				if fingerprint == "" {
+					if item.LXDHashSha256SquashFs != "" {
+						fingerprint = item.LXDHashSha256SquashFs
+					} else if item.LXDHashSha256RootXz != "" {
+						fingerprint = item.LXDHashSha256RootXz
+					} else if item.LXDHashSha256 != "" {
+						fingerprint = item.LXDHashSha256
+					}
 				}
 
 				if item.FileType == "lxd.tar.xz" {
@@ -130,15 +135,26 @@ func (s *SimpleStreamsManifest) ToLXD() ([]ImageInfo, map[string][][]string) {
 					filename = fields[len(fields)-1]
 					metaPath = item.Path
 					metaHash = item.HashSha256
+
+					size += item.Size
 				}
 
-				if item.FileType == "root.tar.xz" {
-					rootfsPath = item.Path
-					rootfsHash = item.HashSha256
+				if rootfsPath == "" || rootfsHash == "" {
+					if item.FileType == "squashfs" {
+						rootfsPath = item.Path
+						rootfsHash = item.HashSha256
+					}
+
+					if item.FileType == "root.tar.xz" {
+						rootfsPath = item.Path
+						rootfsHash = item.HashSha256
+					}
+
+					size += item.Size
 				}
 			}
 
-			if found != 2 || size == 0 || filename == "" || fingerprint == "" {
+			if found < 2 || size == 0 || filename == "" || fingerprint == "" {
 				// Invalid image
 				continue
 			}
@@ -199,12 +215,14 @@ type SimpleStreamsManifestProductVersion struct {
 }
 
 type SimpleStreamsManifestProductVersionItem struct {
-	Path          string `json:"path"`
-	FileType      string `json:"ftype"`
-	HashMd5       string `json:"md5"`
-	HashSha256    string `json:"sha256"`
-	LXDHashSha256 string `json:"combined_sha256"`
-	Size          int64  `json:"size"`
+	Path                  string `json:"path"`
+	FileType              string `json:"ftype"`
+	HashMd5               string `json:"md5"`
+	HashSha256            string `json:"sha256"`
+	LXDHashSha256         string `json:"combined_sha256"`
+	LXDHashSha256RootXz   string `json:"combined_rootxz_sha256"`
+	LXDHashSha256SquashFs string `json:"combined_squashfs_sha256"`
+	Size                  int64  `json:"size"`
 }
 
 type SimpleStreamsIndex struct {
@@ -222,7 +240,7 @@ type SimpleStreamsIndexStream struct {
 
 func SimpleStreamsClient(url string, proxy func(*http.Request) (*url.URL, error)) (*SimpleStreams, error) {
 	// Setup a http client
-	tlsConfig, err := GetTLSConfig("", "", nil)
+	tlsConfig, err := GetTLSConfig("", "", "", nil)
 	if err != nil {
 		return nil, err
 	}

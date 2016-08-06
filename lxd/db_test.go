@@ -22,7 +22,7 @@ const DB_FIXTURES string = `
     INSERT INTO images_properties (image_id, type, key, value) VALUES (1, 0, 'thekey', 'some value');
     INSERT INTO profiles_config (profile_id, key, value) VALUES (3, 'thekey', 'thevalue');
     INSERT INTO profiles_devices (profile_id, name, type) VALUES (3, 'devicename', 1);
-    INSERT INTO profiles_devices_config (profile_device_id, key, value) VALUES (4, 'devicekey', 'devicevalue');
+    INSERT INTO profiles_devices_config (profile_device_id, key, value) VALUES (3, 'devicekey', 'devicevalue');
     `
 
 //  This Helper will initialize a test in-memory DB.
@@ -262,7 +262,7 @@ INSERT INTO containers_config (container_id, key, value) VALUES (1, 'thekey', 't
 	}
 
 	// Run the upgrade from V6 code
-	err = dbUpdateFromV6(d.db)
+	err = dbUpdateFromV6(5, 6, d)
 
 	// Make sure the inserted data is still there.
 	statements = `SELECT count(*) FROM containers_config;`
@@ -376,15 +376,15 @@ INSERT INTO containers_config (container_id, key, value) VALUES (1, 'thekey', 't
 	d.db = db
 	daemonConfigInit(db)
 
-	err = dbUpdate(d, 1)
+	err = dbUpdatesApplyAll(d)
 	if err != nil {
 		t.Error("Error upgrading database schema!")
 		t.Fatal(err)
 	}
 
 	result := dbGetSchema(db)
-	if result != DB_CURRENT_VERSION {
-		t.Fatal(fmt.Sprintf("The schema is not at the latest version after update! Found: %d, should be: %d", result, DB_CURRENT_VERSION))
+	if result != dbGetLatestSchema() {
+		t.Fatal(fmt.Sprintf("The schema is not at the latest version after update! Found: %d, should be: %d", result, dbGetLatestSchema()))
 	}
 
 	// Make sure there are 0 containers_config entries left.

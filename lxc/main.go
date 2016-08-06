@@ -2,8 +2,6 @@ package main
 
 import (
 	"fmt"
-	"net"
-	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -21,28 +19,16 @@ var configPath string
 
 func main() {
 	if err := run(); err != nil {
-		// The action we take depends on the error we get.
 		msg := fmt.Sprintf(i18n.G("error: %v"), err)
-		switch t := err.(type) {
-		case *url.Error:
-			switch u := t.Err.(type) {
-			case *net.OpError:
-				if u.Op == "dial" && u.Net == "unix" {
-					switch errno := u.Err.(type) {
-					case syscall.Errno:
-						switch errno {
-						case syscall.ENOENT:
-							msg = i18n.G("LXD socket not found; is LXD running?")
-						case syscall.ECONNREFUSED:
-							msg = i18n.G("Connection refused; is LXD running?")
-						case syscall.EACCES:
-							msg = i18n.G("Permisson denied, are you in the lxd group?")
-						default:
-							msg = fmt.Sprintf("%d %s", uintptr(errno), errno.Error())
-						}
-					}
-				}
-			}
+
+		lxdErr := lxd.GetLocalLXDErr(err)
+		switch lxdErr {
+		case syscall.ENOENT:
+			msg = i18n.G("LXD socket not found; is LXD installed and running?")
+		case syscall.ECONNREFUSED:
+			msg = i18n.G("Connection refused; is LXD running?")
+		case syscall.EACCES:
+			msg = i18n.G("Permission denied, are you in the lxd group?")
 		}
 
 		fmt.Fprintln(os.Stderr, fmt.Sprintf("%s", msg))
@@ -131,21 +117,20 @@ func run() error {
 		return err
 	}
 
-	certf := config.ConfigPath("client.crt")
-	keyf := config.ConfigPath("client.key")
+	// If the user is running a command that may attempt to connect to the local daemon
+	// and this is the first time the client has been run by the user, then check to see
+	// if LXD has been properly configured.  Don't display the message if the var path
+	// does not exist (LXD not installed), as the user may be targeting a remote daemon.
+	if os.Args[0] != "help" && os.Args[0] != "version" && shared.PathExists(shared.VarPath("")) && !shared.PathExists(config.ConfigDir) {
 
-	if !*forceLocal && os.Args[0] != "help" && os.Args[0] != "version" && (!shared.PathExists(certf) || !shared.PathExists(keyf)) {
-		fmt.Fprintf(os.Stderr, i18n.G("Generating a client certificate. This may take a minute...")+"\n")
-
-		err = shared.FindOrGenCert(certf, keyf)
+		// Create the config dir so that we don't get in here again for this user.
+		err = os.MkdirAll(config.ConfigDir, 0750)
 		if err != nil {
 			return err
 		}
 
-		if shared.PathExists("/var/lib/lxd/") {
-			fmt.Fprintf(os.Stderr, i18n.G("If this is your first time using LXD, you should also run: sudo lxd init")+"\n")
-			fmt.Fprintf(os.Stderr, i18n.G("To start your first container, try: lxc launch ubuntu:16.04")+"\n\n")
-		}
+		fmt.Fprintf(os.Stderr, i18n.G("If this is your first time using LXD, you should also run: sudo lxd init")+"\n")
+		fmt.Fprintf(os.Stderr, i18n.G("To start your first container, try: lxc launch ubuntu:16.04")+"\n\n")
 	}
 
 	err = cmd.run(config, gnuflag.Args())
@@ -170,64 +155,110 @@ type command interface {
 }
 
 var commands = map[string]command{
-	"config":   &configCmd{},
-	"copy":     &copyCmd{},
-	"delete":   &deleteCmd{},
-	"exec":     &execCmd{},
-	"file":     &fileCmd{},
-	"finger":   &fingerCmd{},
-	"help":     &helpCmd{},
-	"image":    &imageCmd{},
-	"info":     &infoCmd{},
-	"init":     &initCmd{},
-	"launch":   &launchCmd{},
-	"list":     &listCmd{},
-	"monitor":  &monitorCmd{},
-	"move":     &moveCmd{},
-	"pause":    &actionCmd{shared.Freeze, false, false, "pause", -1, false, false, false},
-	"profile":  &profileCmd{},
-	"publish":  &publishCmd{},
-	"remote":   &remoteCmd{},
-	"restart":  &actionCmd{shared.Restart, true, true, "restart", -1, false, false, false},
+	"config":  &configCmd{},
+	"copy":    &copyCmd{},
+	"delete":  &deleteCmd{},
+	"exec":    &execCmd{},
+	"file":    &fileCmd{},
+	"finger":  &fingerCmd{},
+	"help":    &helpCmd{},
+	"image":   &imageCmd{},
+	"info":    &infoCmd{},
+	"init":    &initCmd{},
+	"launch":  &launchCmd{},
+	"list":    &listCmd{},
+	"monitor": &monitorCmd{},
+	"move":    &moveCmd{},
+	"pause": &actionCmd{
+		action:         shared.Freeze,
+		name:           "pause",
+		additionalHelp: i18n.G("The opposite of `lxc pause` is `lxc start`."),
+	},
+	"profile": &profileCmd{},
+	"publish": &publishCmd{},
+	"remote":  &remoteCmd{},
+	"restart": &actionCmd{
+		action:     shared.Restart,
+		hasTimeout: true,
+		visible:    true,
+		name:       "restart",
+		timeout:    -1,
+	},
 	"restore":  &restoreCmd{},
 	"snapshot": &snapshotCmd{},
-	"start":    &actionCmd{shared.Start, false, true, "start", -1, false, false, false},
-	"stop":     &actionCmd{shared.Stop, true, true, "stop", -1, false, false, false},
-	"version":  &versionCmd{},
+	"start": &actionCmd{
+		action:  shared.Start,
+		visible: true,
+		name:    "start",
+	},
+	"stop": &actionCmd{
+		action:     shared.Stop,
+		hasTimeout: true,
+		visible:    true,
+		name:       "stop",
+		timeout:    -1,
+	},
+	"version": &versionCmd{},
+}
+
+// defaultAliases contains LXC's built-in command line aliases.  The built-in
+// aliases are checked only if no user-defined alias was found.
+var defaultAliases = map[string]string{
+	"shell": "exec @ARGS@ -- login -f root",
+
+	"cp": "copy",
+	"ls": "list",
+	"mv": "move",
+	"rm": "delete",
+
+	"image cp": "image copy",
+	"image ls": "image list",
+	"image rm": "image delete",
+
+	"image alias ls": "image alias list",
+	"image alias rm": "image alias delete",
+
+	"remote ls": "remote list",
+	"remote mv": "remote rename",
+	"remote rm": "remote remove",
+
+	"config device ls": "config device list",
+	"config device rm": "config device remove",
 }
 
 var errArgs = fmt.Errorf(i18n.G("wrong number of subcommand arguments"))
 
-func expandAlias(config *lxd.Config, origArgs []string) ([]string, bool) {
+func findAlias(aliases map[string]string, origArgs []string) ([]string, []string, bool) {
 	foundAlias := false
 	aliasKey := []string{}
 	aliasValue := []string{}
 
-	for k, v := range config.Aliases {
-		matches := false
-		for i, key := range strings.Split(k, " ") {
-			if len(origArgs) <= i+1 {
-				break
-			}
-
-			if origArgs[i+1] == key {
-				matches = true
-				aliasKey = strings.Split(k, " ")
-				aliasValue = strings.Split(v, " ")
-				break
-			}
-		}
-
-		if !matches {
-			continue
-		}
-
+	for k, v := range aliases {
 		foundAlias = true
-		break
+		for i, key := range strings.Split(k, " ") {
+			if len(origArgs) <= i+1 || origArgs[i+1] != key {
+				foundAlias = false
+				break
+			}
+		}
+
+		if foundAlias {
+			aliasKey = strings.Split(k, " ")
+			aliasValue = strings.Split(v, " ")
+			break
+		}
 	}
 
+	return aliasKey, aliasValue, foundAlias
+}
+
+func expandAlias(config *lxd.Config, origArgs []string) ([]string, bool) {
+	aliasKey, aliasValue, foundAlias := findAlias(config.Aliases, origArgs)
 	if !foundAlias {
-		return []string{}, false
+		aliasKey, aliasValue, foundAlias = findAlias(defaultAliases, origArgs)
+		if !foundAlias {
+			return []string{}, false
+		}
 	}
 
 	newArgs := []string{origArgs[0]}

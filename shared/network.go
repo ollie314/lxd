@@ -39,7 +39,9 @@ func initTLSConfig() *tls.Config {
 		MaxVersion: tls.VersionTLS12,
 		CipherSuites: []uint16{
 			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA},
 		PreferServerCipherSuites: true,
 	}
 }
@@ -47,7 +49,10 @@ func initTLSConfig() *tls.Config {
 func finalizeTLSConfig(tlsConfig *tls.Config, tlsRemoteCert *x509.Certificate) {
 	// Trusted certificates
 	if tlsRemoteCert != nil {
-		caCertPool := x509.NewCertPool()
+		caCertPool := tlsConfig.RootCAs
+		if caCertPool == nil {
+			caCertPool = x509.NewCertPool()
+		}
 
 		// Make it a valid RootCA
 		tlsRemoteCert.IsCA = true
@@ -66,7 +71,7 @@ func finalizeTLSConfig(tlsConfig *tls.Config, tlsRemoteCert *x509.Certificate) {
 	tlsConfig.BuildNameToCertificate()
 }
 
-func GetTLSConfig(tlsClientCertFile string, tlsClientKeyFile string, tlsRemoteCert *x509.Certificate) (*tls.Config, error) {
+func GetTLSConfig(tlsClientCertFile string, tlsClientKeyFile string, tlsClientCAFile string, tlsRemoteCert *x509.Certificate) (*tls.Config, error) {
 	tlsConfig := initTLSConfig()
 
 	// Client authentication
@@ -79,11 +84,23 @@ func GetTLSConfig(tlsClientCertFile string, tlsClientKeyFile string, tlsRemoteCe
 		tlsConfig.Certificates = []tls.Certificate{cert}
 	}
 
+	if tlsClientCAFile != "" {
+		caCertificates, err := ioutil.ReadFile(tlsClientCAFile)
+		if err != nil {
+			return nil, err
+		}
+
+		caPool := x509.NewCertPool()
+		caPool.AppendCertsFromPEM(caCertificates)
+
+		tlsConfig.RootCAs = caPool
+	}
+
 	finalizeTLSConfig(tlsConfig, tlsRemoteCert)
 	return tlsConfig, nil
 }
 
-func GetTLSConfigMem(tlsClientCert string, tlsClientKey string, tlsRemoteCertPEM string) (*tls.Config, error) {
+func GetTLSConfigMem(tlsClientCert string, tlsClientKey string, tlsClientCA string, tlsRemoteCertPEM string) (*tls.Config, error) {
 	tlsConfig := initTLSConfig()
 
 	// Client authentication
@@ -100,12 +117,24 @@ func GetTLSConfigMem(tlsClientCert string, tlsClientKey string, tlsRemoteCertPEM
 	if tlsRemoteCertPEM != "" {
 		// Ignore any content outside of the PEM bytes we care about
 		certBlock, _ := pem.Decode([]byte(tlsRemoteCertPEM))
+		if certBlock == nil {
+			return nil, fmt.Errorf("Invalid remote certificate")
+		}
+
 		var err error
 		tlsRemoteCert, err = x509.ParseCertificate(certBlock.Bytes)
 		if err != nil {
 			return nil, err
 		}
 	}
+
+	if tlsClientCA != "" {
+		caPool := x509.NewCertPool()
+		caPool.AppendCertsFromPEM([]byte(tlsClientCA))
+
+		tlsConfig.RootCAs = caPool
+	}
+
 	finalizeTLSConfig(tlsConfig, tlsRemoteCert)
 
 	return tlsConfig, nil
@@ -115,7 +144,7 @@ func IsLoopback(iface *net.Interface) bool {
 	return int(iface.Flags&net.FlagLoopback) > 0
 }
 
-func WebsocketSendStream(conn *websocket.Conn, r io.Reader) chan bool {
+func WebsocketSendStream(conn *websocket.Conn, r io.Reader, bufferSize int) chan bool {
 	ch := make(chan bool)
 
 	if r == nil {
@@ -124,7 +153,7 @@ func WebsocketSendStream(conn *websocket.Conn, r io.Reader) chan bool {
 	}
 
 	go func(conn *websocket.Conn, r io.Reader) {
-		in := ReaderToChannel(r)
+		in := ReaderToChannel(r, bufferSize)
 		for {
 			buf, ok := <-in
 			if !ok {
@@ -151,10 +180,10 @@ func WebsocketSendStream(conn *websocket.Conn, r io.Reader) chan bool {
 	return ch
 }
 
-func WebsocketRecvStream(w io.WriteCloser, conn *websocket.Conn) chan bool {
+func WebsocketRecvStream(w io.Writer, conn *websocket.Conn) chan bool {
 	ch := make(chan bool)
 
-	go func(w io.WriteCloser, conn *websocket.Conn) {
+	go func(w io.Writer, conn *websocket.Conn) {
 		for {
 			mt, r, err := conn.NextReader()
 			if mt == websocket.CloseMessage {
@@ -244,14 +273,18 @@ func WebsocketMirror(conn *websocket.Conn, w io.WriteCloser, r io.ReadCloser) (c
 	}(conn, w)
 
 	go func(conn *websocket.Conn, r io.ReadCloser) {
-		in := ReaderToChannel(r)
+		/* For now, we don't need to adjust buffer sizes in
+		 * WebsocketMirror, since it's used for interactive things like
+		 * exec.
+		 */
+		in := ReaderToChannel(r, -1)
 		for {
 			buf, ok := <-in
 			if !ok {
-				readDone <- true
 				r.Close()
 				Debugf("sending write barrier")
 				conn.WriteMessage(websocket.TextMessage, []byte{})
+				readDone <- true
 				return
 			}
 			w, err := conn.NextWriter(websocket.BinaryMessage)

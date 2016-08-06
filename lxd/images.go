@@ -66,43 +66,59 @@ func detectCompression(fname string) ([]string, string, error) {
 		return []string{"--lzma", "-xf"}, ".tar.lzma", nil
 	case bytes.Equal(header[257:262], []byte{'u', 's', 't', 'a', 'r'}):
 		return []string{"-xf"}, ".tar", nil
+	case bytes.Equal(header[0:4], []byte{'h', 's', 'q', 's'}):
+		return []string{""}, ".squashfs", nil
 	default:
 		return []string{""}, "", fmt.Errorf("Unsupported compression.")
 	}
 
 }
 
-func untar(tarball string, path string) error {
-	extractArgs, _, err := detectCompression(tarball)
+func unpack(file string, path string) error {
+	extractArgs, extension, err := detectCompression(file)
 	if err != nil {
 		return err
 	}
 
-	command := "tar"
+	command := ""
 	args := []string{}
-	if runningInUserns {
-		args = append(args, "--wildcards")
-		args = append(args, "--exclude=dev/*")
-		args = append(args, "--exclude=./dev/*")
-		args = append(args, "--exclude=rootfs/dev/*")
-		args = append(args, "--exclude=rootfs/./dev/*")
+	if strings.HasPrefix(extension, ".tar") {
+		command = "tar"
+		if runningInUserns {
+			args = append(args, "--wildcards")
+			args = append(args, "--exclude=dev/*")
+			args = append(args, "--exclude=./dev/*")
+			args = append(args, "--exclude=rootfs/dev/*")
+			args = append(args, "--exclude=rootfs/./dev/*")
+		}
+		args = append(args, "-C", path, "--numeric-owner")
+		args = append(args, extractArgs...)
+		args = append(args, file)
+	} else if strings.HasPrefix(extension, ".squashfs") {
+		command = "unsquashfs"
+		args = append(args, "-f", "-d", path, "-n")
+		args = append(args, file)
+	} else {
+		return fmt.Errorf("Unsupported image format: %s", extension)
 	}
-	args = append(args, "-C", path, "--numeric-owner")
-	args = append(args, extractArgs...)
-	args = append(args, tarball)
 
 	output, err := exec.Command(command, args...).CombinedOutput()
 	if err != nil {
+		co := string(output)
 		shared.Debugf("Unpacking failed")
-		shared.Debugf(string(output))
-		return err
+		shared.Debugf(co)
+
+		// Truncate the output to a single line for inclusion in the error
+		// message.  The first line isn't guaranteed to pinpoint the issue,
+		// but it's better than nothing and better than a multi-line message.
+		return fmt.Errorf("Unpack failed, %s.  %s", err, strings.SplitN(co, "\n", 2)[0])
 	}
 
 	return nil
 }
 
-func untarImage(imagefname string, destpath string) error {
-	err := untar(imagefname, destpath)
+func unpackImage(imagefname string, destpath string) error {
+	err := unpack(imagefname, destpath)
 	if err != nil {
 		return err
 	}
@@ -114,7 +130,7 @@ func untarImage(imagefname string, destpath string) error {
 			return fmt.Errorf("Error creating rootfs directory")
 		}
 
-		err = untar(imagefname+".rootfs", rootfsPath)
+		err = unpack(imagefname+".rootfs", rootfsPath)
 		if err != nil {
 			return err
 		}
@@ -323,7 +339,7 @@ func imgPostURLInfo(d *Daemon, req imagePostReq, op *operation) error {
 	}
 
 	// Resolve the image URL
-	tlsConfig, err := shared.GetTLSConfig("", "", nil)
+	tlsConfig, err := shared.GetTLSConfig("", "", "", nil)
 	if err != nil {
 		return err
 	}
@@ -1016,7 +1032,8 @@ func imageGet(d *Daemon, r *http.Request) Response {
 		return response
 	}
 
-	return SyncResponse(true, info)
+	etag := []interface{}{info.Public, info.AutoUpdate, info.Properties}
+	return SyncResponseETag(true, info, etag)
 }
 
 type imagePutReq struct {
@@ -1026,16 +1043,23 @@ type imagePutReq struct {
 }
 
 func imagePut(d *Daemon, r *http.Request) Response {
+	// Get current value
 	fingerprint := mux.Vars(r)["fingerprint"]
+	id, info, err := dbImageGet(d.db, fingerprint, false, false)
+	if err != nil {
+		return SmartError(err)
+	}
+
+	// Validate ETag
+	etag := []interface{}{info.Public, info.AutoUpdate, info.Properties}
+	err = etagCheck(r, etag)
+	if err != nil {
+		return PreconditionFailed(err)
+	}
 
 	req := imagePutReq{}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return BadRequest(err)
-	}
-
-	id, info, err := dbImageGet(d.db, fingerprint, false, false)
-	if err != nil {
-		return SmartError(err)
 	}
 
 	err = dbImageUpdate(d.db, id, info.Filename, info.Size, req.Public, req.AutoUpdate, info.Architecture, info.CreationDate, info.ExpiryDate, req.Properties)
@@ -1046,7 +1070,73 @@ func imagePut(d *Daemon, r *http.Request) Response {
 	return EmptySyncResponse
 }
 
-var imageCmd = Command{name: "images/{fingerprint}", untrustedGet: true, get: imageGet, put: imagePut, delete: imageDelete}
+func imagePatch(d *Daemon, r *http.Request) Response {
+	// Get current value
+	fingerprint := mux.Vars(r)["fingerprint"]
+	id, info, err := dbImageGet(d.db, fingerprint, false, false)
+	if err != nil {
+		return SmartError(err)
+	}
+
+	// Validate ETag
+	etag := []interface{}{info.Public, info.AutoUpdate, info.Properties}
+	err = etagCheck(r, etag)
+	if err != nil {
+		return PreconditionFailed(err)
+	}
+
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		return InternalError(err)
+	}
+
+	rdr1 := ioutil.NopCloser(bytes.NewBuffer(body))
+	rdr2 := ioutil.NopCloser(bytes.NewBuffer(body))
+
+	reqRaw := shared.Jmap{}
+	if err := json.NewDecoder(rdr1).Decode(&reqRaw); err != nil {
+		return BadRequest(err)
+	}
+
+	req := imagePutReq{}
+	if err := json.NewDecoder(rdr2).Decode(&req); err != nil {
+		return BadRequest(err)
+	}
+
+	// Get AutoUpdate
+	autoUpdate, err := reqRaw.GetBool("auto_update")
+	if err == nil {
+		info.AutoUpdate = autoUpdate
+	}
+
+	// Get Public
+	public, err := reqRaw.GetBool("public")
+	if err == nil {
+		info.Public = public
+	}
+
+	// Get Properties
+	_, ok := reqRaw["properties"]
+	if ok {
+		properties := req.Properties
+		for k, v := range info.Properties {
+			_, ok := req.Properties[k]
+			if !ok {
+				properties[k] = v
+			}
+		}
+		info.Properties = properties
+	}
+
+	err = dbImageUpdate(d.db, id, info.Filename, info.Size, info.Public, info.AutoUpdate, info.Architecture, info.CreationDate, info.ExpiryDate, info.Properties)
+	if err != nil {
+		return SmartError(err)
+	}
+
+	return EmptySyncResponse
+}
+
+var imageCmd = Command{name: "images/{fingerprint}", untrustedGet: true, get: imageGet, put: imagePut, delete: imageDelete, patch: imagePatch}
 
 type aliasPostReq struct {
 	Name        string `json:"name"`
@@ -1085,7 +1175,7 @@ func aliasesPost(d *Daemon, r *http.Request) Response {
 		return InternalError(err)
 	}
 
-	return EmptySyncResponse
+	return SyncResponseLocation(true, nil, fmt.Sprintf("/%s/images/aliases/%s", shared.APIVersion, req.Name))
 }
 
 func aliasesGet(d *Daemon, r *http.Request) Response {
@@ -1131,7 +1221,7 @@ func aliasGet(d *Daemon, r *http.Request) Response {
 		return SmartError(err)
 	}
 
-	return SyncResponse(true, alias)
+	return SyncResponseETag(true, alias, alias)
 }
 
 func aliasDelete(d *Daemon, r *http.Request) Response {
@@ -1150,7 +1240,18 @@ func aliasDelete(d *Daemon, r *http.Request) Response {
 }
 
 func aliasPut(d *Daemon, r *http.Request) Response {
+	// Get current value
 	name := mux.Vars(r)["name"]
+	id, alias, err := dbImageAliasGet(d.db, name, true)
+	if err != nil {
+		return SmartError(err)
+	}
+
+	// Validate ETag
+	err = etagCheck(r, alias)
+	if err != nil {
+		return PreconditionFailed(err)
+	}
 
 	req := aliasPutReq{}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1161,17 +1262,64 @@ func aliasPut(d *Daemon, r *http.Request) Response {
 		return BadRequest(fmt.Errorf("The target field is required"))
 	}
 
-	id, _, err := dbImageAliasGet(d.db, name, true)
-	if err != nil {
-		return SmartError(err)
-	}
-
 	imageId, _, err := dbImageGet(d.db, req.Target, false, false)
 	if err != nil {
 		return SmartError(err)
 	}
 
 	err = dbImageAliasUpdate(d.db, id, imageId, req.Description)
+	if err != nil {
+		return SmartError(err)
+	}
+
+	return EmptySyncResponse
+}
+
+func aliasPatch(d *Daemon, r *http.Request) Response {
+	// Get current value
+	name := mux.Vars(r)["name"]
+	id, alias, err := dbImageAliasGet(d.db, name, true)
+	if err != nil {
+		return SmartError(err)
+	}
+
+	// Validate ETag
+	err = etagCheck(r, alias)
+	if err != nil {
+		return PreconditionFailed(err)
+	}
+
+	req := shared.Jmap{}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return BadRequest(err)
+	}
+
+	_, ok := req["target"]
+	if ok {
+		target, err := req.GetString("target")
+		if err != nil {
+			return BadRequest(err)
+		}
+
+		alias.Target = target
+	}
+
+	_, ok = req["description"]
+	if ok {
+		description, err := req.GetString("description")
+		if err != nil {
+			return BadRequest(err)
+		}
+
+		alias.Description = description
+	}
+
+	imageId, _, err := dbImageGet(d.db, alias.Target, false, false)
+	if err != nil {
+		return SmartError(err)
+	}
+
+	err = dbImageAliasUpdate(d.db, id, imageId, alias.Description)
 	if err != nil {
 		return SmartError(err)
 	}
@@ -1197,7 +1345,7 @@ func aliasPost(d *Daemon, r *http.Request) Response {
 		return SmartError(err)
 	}
 
-	return EmptySyncResponse
+	return SyncResponseLocation(true, nil, fmt.Sprintf("/%s/images/aliases/%s", shared.APIVersion, req.Name))
 }
 
 func imageExport(d *Daemon, r *http.Request) Response {
@@ -1280,4 +1428,4 @@ var imagesSecretCmd = Command{name: "images/{fingerprint}/secret", post: imageSe
 
 var aliasesCmd = Command{name: "images/aliases", post: aliasesPost, get: aliasesGet}
 
-var aliasCmd = Command{name: "images/aliases/{name:.*}", untrustedGet: true, get: aliasGet, delete: aliasDelete, put: aliasPut, post: aliasPost}
+var aliasCmd = Command{name: "images/aliases/{name:.*}", untrustedGet: true, get: aliasGet, delete: aliasDelete, put: aliasPut, post: aliasPost, patch: aliasPatch}

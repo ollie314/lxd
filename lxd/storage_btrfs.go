@@ -249,7 +249,7 @@ func (s *storageBtrfs) ContainerRestore(
 	} else {
 		// Remove the backup, we made
 		if s.isSubvolume(sourceBackupPath) {
-			return s.subvolDelete(sourceBackupPath)
+			return s.subvolsDelete(sourceBackupPath)
 		}
 		os.RemoveAll(sourceBackupPath)
 	}
@@ -413,7 +413,7 @@ func (s *storageBtrfs) ImageCreate(fingerprint string) error {
 		return err
 	}
 
-	if err := untarImage(imagePath, subvol); err != nil {
+	if err := unpackImage(imagePath, subvol); err != nil {
 		s.subvolDelete(subvol)
 		return err
 	}
@@ -850,7 +850,7 @@ func (s *btrfsMigrationSourceDriver) send(conn *websocket.Conn, btrfsPath string
 		return err
 	}
 
-	<-shared.WebsocketSendStream(conn, stdout)
+	<-shared.WebsocketSendStream(conn, stdout, 4*1024*1024)
 
 	output, err := ioutil.ReadAll(stderr)
 	if err != nil {
@@ -945,6 +945,14 @@ func (s *storageBtrfs) MigrationType() MigrationFSType {
 		return MigrationFSType_RSYNC
 	} else {
 		return MigrationFSType_BTRFS
+	}
+}
+
+func (s *storageBtrfs) PreservesInodes() bool {
+	if runningInUserns {
+		return false
+	} else {
+		return true
 	}
 }
 

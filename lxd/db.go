@@ -34,8 +34,6 @@ type Profile struct {
 // Profiles will contain a list of all Profiles.
 type Profiles []Profile
 
-const DB_CURRENT_VERSION int = 29
-
 // CURRENT_SCHEMA contains the current SQLite SQL Schema.
 const CURRENT_SCHEMA string = `
 CREATE TABLE IF NOT EXISTS certificates (
@@ -60,6 +58,7 @@ CREATE TABLE IF NOT EXISTS containers (
     ephemeral INTEGER NOT NULL DEFAULT 0,
     stateful INTEGER NOT NULL DEFAULT 0,
     creation_date DATETIME,
+    last_use_date DATETIME,
     UNIQUE (name)
 );
 CREATE TABLE IF NOT EXISTS containers_config (
@@ -135,6 +134,12 @@ CREATE TABLE IF NOT EXISTS images_source (
     alias VARCHAR(255) NOT NULL,
     FOREIGN KEY (image_id) REFERENCES images (id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS patches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    applied_at DATETIME NOT NULL,
+    UNIQUE (name)
+);
 CREATE TABLE IF NOT EXISTS profiles (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     name VARCHAR(255) NOT NULL,
@@ -187,7 +192,7 @@ func createDb(db *sql.DB) (err error) {
 
 	// There isn't an entry for schema version, let's put it in.
 	insertStmt := `INSERT INTO schema (version, updated_at) values (?, strftime("%s"));`
-	_, err = db.Exec(insertStmt, DB_CURRENT_VERSION)
+	_, err = db.Exec(insertStmt, dbGetLatestSchema())
 	if err != nil {
 		return err
 	}
@@ -209,6 +214,10 @@ func dbGetSchema(db *sql.DB) (v int) {
 		return 0
 	}
 	return v
+}
+
+func dbGetLatestSchema() int {
+	return dbUpdates[len(dbUpdates)-1].version
 }
 
 // Create a database connection object and return it.
@@ -236,13 +245,10 @@ func initializeDbObject(d *Daemon, path string) (err error) {
 	// Run PRAGMA statements now since they are *per-connection*.
 	d.db.Exec("PRAGMA foreign_keys=ON;") // This allows us to use ON DELETE CASCADE
 
-	v := dbGetSchema(d.db)
-
-	if v != DB_CURRENT_VERSION {
-		err = dbUpdate(d, v)
-		if err != nil {
-			return err
-		}
+	// Apply any update
+	err = dbUpdatesApplyAll(d)
+	if err != nil {
+		return err
 	}
 
 	return nil

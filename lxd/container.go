@@ -4,15 +4,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
 	"gopkg.in/lxc/go-lxc.v2"
 
 	"github.com/lxc/lxd/shared"
-
-	log "gopkg.in/inconshreveable/log15.v2"
 )
 
 // Helper functions
@@ -38,110 +35,28 @@ func containerValidName(name string) error {
 	return nil
 }
 
-func containerValidConfigKey(key string, value string) error {
-	isInt64 := func(key string, value string) error {
-		if value == "" {
-			return nil
-		}
-
-		_, err := strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return fmt.Errorf("Invalid value for an integer: %s", value)
-		}
-
-		return nil
+func containerValidConfigKey(d *Daemon, key string, value string) error {
+	f, err := shared.ConfigKeyChecker(key)
+	if err != nil {
+		return err
 	}
-
-	isBool := func(key string, value string) error {
-		if value == "" {
-			return nil
-		}
-
-		if !shared.StringInSlice(strings.ToLower(value), []string{"true", "false", "yes", "no", "1", "0", "on", "off"}) {
-			return fmt.Errorf("Invalid value for a boolean: %s", value)
-		}
-
-		return nil
+	if err = f(value); err != nil {
+		return err
 	}
-
-	isOneOf := func(key string, value string, valid []string) error {
-		if value == "" {
-			return nil
-		}
-
-		if !shared.StringInSlice(value, valid) {
-			return fmt.Errorf("Invalid value: %s (not one of %s)", value, valid)
-		}
-
-		return nil
-	}
-
-	switch key {
-	case "boot.autostart":
-		return isBool(key, value)
-	case "boot.autostart.delay":
-		return isInt64(key, value)
-	case "boot.autostart.priority":
-		return isInt64(key, value)
-	case "limits.cpu":
-		return nil
-	case "limits.cpu.allowance":
-		return nil
-	case "limits.cpu.priority":
-		return isInt64(key, value)
-	case "limits.disk.priority":
-		return isInt64(key, value)
-	case "limits.memory":
-		return nil
-	case "limits.memory.enforce":
-		return isOneOf(key, value, []string{"soft", "hard"})
-	case "limits.memory.swap":
-		return isBool(key, value)
-	case "limits.memory.swap.priority":
-		return isInt64(key, value)
-	case "limits.network.priority":
-		return isInt64(key, value)
-	case "limits.processes":
-		return isInt64(key, value)
-	case "linux.kernel_modules":
-		return nil
-	case "security.privileged":
-		return isBool(key, value)
-	case "security.nesting":
-		return isBool(key, value)
-	case "raw.apparmor":
-		return nil
-	case "raw.lxc":
+	if key == "raw.lxc" {
 		return lxcValidConfig(value)
-	case "volatile.apply_template":
-		return nil
-	case "volatile.base_image":
-		return nil
-	case "volatile.last_state.idmap":
-		return nil
-	case "volatile.last_state.power":
-		return nil
 	}
-
-	if strings.HasPrefix(key, "volatile.") {
-		if strings.HasSuffix(key, ".hwaddr") {
-			return nil
+	if key == "security.syscalls.blacklist_compat" {
+		for _, arch := range d.architectures {
+			if arch == shared.ARCH_64BIT_INTEL_X86 ||
+				arch == shared.ARCH_64BIT_ARMV8_LITTLE_ENDIAN ||
+				arch == shared.ARCH_64BIT_POWERPC_BIG_ENDIAN {
+				return nil
+			}
 		}
-
-		if strings.HasSuffix(key, ".name") {
-			return nil
-		}
+		return fmt.Errorf("security.syscalls.blacklist_compat is only valid on x86_64")
 	}
-
-	if strings.HasPrefix(key, "environment.") {
-		return nil
-	}
-
-	if strings.HasPrefix(key, "user.") {
-		return nil
-	}
-
-	return fmt.Errorf("Bad key: %s", key)
+	return nil
 }
 
 func containerValidDeviceConfigKey(t, k string) bool {
@@ -213,6 +128,23 @@ func containerValidDeviceConfigKey(t, k string) bool {
 		default:
 			return false
 		}
+	case "usb":
+		switch k {
+		case "vendorid":
+			return true
+		case "productid":
+			return true
+		case "mode":
+			return true
+		case "gid":
+			return true
+		case "uid":
+			return true
+		case "required":
+			return true
+		default:
+			return false
+		}
 	case "none":
 		return false
 	default:
@@ -220,7 +152,7 @@ func containerValidDeviceConfigKey(t, k string) bool {
 	}
 }
 
-func containerValidConfig(config map[string]string, profile bool, expanded bool) error {
+func containerValidConfig(d *Daemon, config map[string]string, profile bool, expanded bool) error {
 	if config == nil {
 		return nil
 	}
@@ -230,10 +162,24 @@ func containerValidConfig(config map[string]string, profile bool, expanded bool)
 			return fmt.Errorf("Volatile keys can only be set on containers.")
 		}
 
-		err := containerValidConfigKey(k, v)
+		err := containerValidConfigKey(d, k, v)
 		if err != nil {
 			return err
 		}
+	}
+
+	_, rawSeccomp := config["raw.seccomp"]
+	_, whitelist := config["security.syscalls.whitelist"]
+	_, blacklist := config["securtiy.syscalls.blacklist"]
+	blacklistDefault := shared.IsTrue(config["security.syscalls.blacklist_default"])
+	blacklistCompat := shared.IsTrue(config["security.syscalls.blacklist_compat"])
+
+	if rawSeccomp && (whitelist || blacklist || blacklistDefault || blacklistCompat) {
+		return fmt.Errorf("raw.seccomp is mutually exclusive with security.syscalls*")
+	}
+
+	if whitelist && (blacklist || blacklistDefault || blacklistCompat) {
+		return fmt.Errorf("security.syscalls.whitelist is mutually exclusive with security.syscalls.blacklist*")
 	}
 
 	return nil
@@ -246,7 +192,15 @@ func containerValidDevices(devices shared.Devices, profile bool, expanded bool) 
 	}
 
 	// Check each device individually
-	for _, m := range devices {
+	for name, m := range devices {
+		if m["type"] == "" {
+			return fmt.Errorf("Missing device type for device '%s'", name)
+		}
+
+		if !shared.StringInSlice(m["type"], []string{"none", "nic", "disk", "unix-char", "unix-block", "usb"}) {
+			return fmt.Errorf("Invalid device type for device '%s'", name)
+		}
+
 		for k, _ := range m {
 			if !containerValidDeviceConfigKey(m["type"], k) {
 				return fmt.Errorf("Invalid device configuration key for %s: %s", m["type"], k)
@@ -289,6 +243,10 @@ func containerValidDevices(devices shared.Devices, profile bool, expanded bool) 
 			if m["path"] == "" {
 				return fmt.Errorf("Unix device entry is missing the required \"path\" property.")
 			}
+		} else if m["type"] == "usb" {
+			if m["productid"] == "" {
+				return fmt.Errorf("Missing productid for USB device.")
+			}
 		} else if m["type"] == "none" {
 			continue
 		} else {
@@ -322,6 +280,7 @@ type containerArgs struct {
 	BaseImage    string
 	Config       map[string]string
 	CreationDate time.Time
+	LastUsedDate time.Time
 	Ctype        containerType
 	Devices      shared.Devices
 	Ephemeral    bool
@@ -341,8 +300,10 @@ type container interface {
 
 	// Snapshots & migration
 	Restore(sourceContainer container) error
-	Checkpoint(opts lxc.CheckpointOptions) error
-	StartFromMigration(imagesDir string) error
+	/* actionScript here is a script called action.sh in the stateDir, to
+	 * be passed to CRIU as --action-script
+	 */
+	Migrate(cmd uint, stateDir string, function string, stop bool, actionScript bool) error
 	Snapshots() ([]container, error)
 
 	// Config handling
@@ -365,7 +326,7 @@ type container interface {
 	Exec(command []string, env map[string]string, stdin *os.File, stdout *os.File, stderr *os.File) (int, error)
 
 	// Status
-	Render() (interface{}, error)
+	Render() (interface{}, interface{}, error)
 	RenderState() (*shared.ContainerState, error)
 	IsPrivileged() bool
 	IsRunning() bool
@@ -384,6 +345,7 @@ type container interface {
 	Name() string
 	Architecture() int
 	CreationDate() time.Time
+	LastUsedDate() time.Time
 	ExpandedConfig() map[string]string
 	ExpandedDevices() shared.Devices
 	LocalConfig() map[string]string
@@ -527,13 +489,7 @@ func containerCreateAsSnapshot(d *Daemon, args containerArgs, sourceContainer co
 		 * after snapshotting will fail.
 		 */
 
-		opts := lxc.CheckpointOptions{Directory: stateDir, Stop: false, Verbose: true}
-		err = sourceContainer.Checkpoint(opts)
-		err2 := CollectCRIULogFile(sourceContainer, stateDir, "snapshot", "dump")
-		if err2 != nil {
-			shared.Log.Warn("failed to collect criu log file", log.Ctx{"error": err2})
-		}
-
+		err = sourceContainer.Migrate(lxc.MIGRATE_DUMP, stateDir, "snapshot", false, false)
 		if err != nil {
 			os.RemoveAll(sourceContainer.StatePath())
 			return nil, err
@@ -591,7 +547,7 @@ func containerCreateInternal(d *Daemon, args containerArgs) (container, error) {
 	}
 
 	// Validate container config
-	err := containerValidConfig(args.Config, false, false)
+	err := containerValidConfig(d, args.Config, false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -644,6 +600,7 @@ func containerCreateInternal(d *Daemon, args containerArgs) (container, error) {
 		return nil, err
 	}
 	args.CreationDate = dbArgs.CreationDate
+	args.LastUsedDate = dbArgs.LastUsedDate
 
 	return containerLXCCreate(d, args)
 }

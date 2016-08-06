@@ -56,9 +56,24 @@ func (c *remoteCmd) flags() {
 	gnuflag.BoolVar(&c.public, "public", false, i18n.G("Public image server"))
 }
 
+func generateClientCertificate(config *lxd.Config) error {
+	// Generate a client certificate if necessary.  The default repositories are
+	// either local or public, neither of which requires a client certificate.
+	// Generation of the cert is delayed to avoid unnecessary overhead, e.g in
+	// testing scenarios where only the default repositories are used.
+	certf := config.ConfigPath("client.crt")
+	keyf := config.ConfigPath("client.key")
+	if !shared.PathExists(certf) || !shared.PathExists(keyf) {
+		fmt.Fprintf(os.Stderr, i18n.G("Generating a client certificate. This may take a minute...")+"\n")
+
+		return shared.FindOrGenCert(certf, keyf)
+	}
+	return nil
+}
+
 func getRemoteCertificate(address string) (*x509.Certificate, error) {
 	// Setup a permissive TLS config
-	tlsConfig, err := shared.GetTLSConfig("", "", nil)
+	tlsConfig, err := shared.GetTLSConfig("", "", "", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +128,7 @@ func (c *remoteCmd) addServer(config *lxd.Config, server string, addr string, ac
 
 	// Fix broken URL parser
 	if !strings.Contains(addr, "://") && remoteURL.Scheme != "" && remoteURL.Scheme != "unix" && remoteURL.Host == "" {
-		remoteURL.Host = remoteURL.Scheme
+		remoteURL.Host = addr
 		remoteURL.Scheme = ""
 	}
 
@@ -126,7 +141,7 @@ func (c *remoteCmd) addServer(config *lxd.Config, server string, addr string, ac
 	} else if addr[0] == '/' {
 		rScheme = "unix"
 	} else {
-		if !shared.PathExists(addr) {
+		if !shared.IsUnixSocket(addr) {
 			rScheme = "https"
 		} else {
 			rScheme = "unix"
@@ -148,17 +163,7 @@ func (c *remoteCmd) addServer(config *lxd.Config, server string, addr string, ac
 	}
 
 	if rScheme == "unix" {
-		if addr[0:5] == "unix:" {
-			if addr[0:7] == "unix://" {
-				if len(addr) > 8 {
-					rHost = addr[8:]
-				} else {
-					rHost = ""
-				}
-			} else {
-				rHost = addr[6:]
-			}
-		}
+		rHost = strings.TrimPrefix(strings.TrimPrefix(addr, "unix:"), "//")
 		rPort = ""
 	}
 
@@ -172,7 +177,15 @@ func (c *remoteCmd) addServer(config *lxd.Config, server string, addr string, ac
 		addr = rScheme + "://" + rHost
 	}
 
-	/* Actually add the remote */
+	// Finally, actually add the remote, almost...  If the remote is a private
+	// HTTPS server then we need to ensure we have a client certificate before
+	// adding the remote server.
+	if rScheme != "unix" && !public {
+		err = generateClientCertificate(config)
+		if err != nil {
+			return err
+		}
+	}
 	config.Remotes[server] = lxd.RemoteConfig{Addr: addr, Protocol: protocol}
 
 	remote := config.ParseRemote(server)
@@ -181,7 +194,7 @@ func (c *remoteCmd) addServer(config *lxd.Config, server string, addr string, ac
 		return err
 	}
 
-	if len(addr) > 5 && addr[0:5] == "unix:" {
+	if strings.HasPrefix(addr, "unix:") {
 		// NewClient succeeded so there was a lxd there (we fingered
 		// it) so just accept it
 		return nil

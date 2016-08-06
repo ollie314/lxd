@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -99,6 +100,7 @@ func containerLXCCreate(d *Daemon, args containerArgs) (container, error) {
 		cType:        args.Ctype,
 		stateful:     args.Stateful,
 		creationDate: args.CreationDate,
+		lastUsedDate: args.LastUsedDate,
 		profiles:     args.Profiles,
 		localConfig:  args.Config,
 		localDevices: args.Devices,
@@ -116,7 +118,8 @@ func containerLXCCreate(d *Daemon, args containerArgs) (container, error) {
 
 	// Look for a rootfs entry
 	rootfs := false
-	for _, m := range c.expandedDevices {
+	for _, name := range c.expandedDevices.DeviceNames() {
+		m := c.expandedDevices[name]
 		if m["type"] == "disk" && m["path"] == "/" {
 			rootfs = true
 			break
@@ -151,7 +154,7 @@ func containerLXCCreate(d *Daemon, args containerArgs) (container, error) {
 	}
 
 	// Validate expanded config
-	err = containerValidConfig(c.expandedConfig, false, true)
+	err = containerValidConfig(d, c.expandedConfig, false, true)
 	if err != nil {
 		c.Delete()
 		return nil, err
@@ -196,6 +199,7 @@ func containerLXCLoad(d *Daemon, args containerArgs) (container, error) {
 		architecture: args.Architecture,
 		cType:        args.Ctype,
 		creationDate: args.CreationDate,
+		lastUsedDate: args.LastUsedDate,
 		profiles:     args.Profiles,
 		localConfig:  args.Config,
 		localDevices: args.Devices,
@@ -223,6 +227,7 @@ type containerLXC struct {
 	architecture int
 	cType        containerType
 	creationDate time.Time
+	lastUsedDate time.Time
 	ephemeral    bool
 	id           int
 	name         string
@@ -324,6 +329,8 @@ func (c *containerLXC) initLXC() error {
 	}
 
 	bindMounts := []string{
+		"/dev/fuse",
+		"/dev/net/tun",
 		"/proc/sys/fs/binfmt_misc",
 		"/sys/firmware/efi/efivars",
 		"/sys/fs/fuse/connections",
@@ -341,9 +348,20 @@ func (c *containerLXC) initLXC() error {
 	}
 
 	for _, mnt := range bindMounts {
-		err = lxcSetConfigItem(cc, "lxc.mount.entry", fmt.Sprintf("%s %s none rbind,create=dir,optional", mnt, strings.TrimPrefix(mnt, "/")))
-		if err != nil {
-			return err
+		if !shared.PathExists(mnt) {
+			continue
+		}
+
+		if shared.IsDir(mnt) {
+			err = lxcSetConfigItem(cc, "lxc.mount.entry", fmt.Sprintf("%s %s none rbind,create=dir,optional", mnt, strings.TrimPrefix(mnt, "/")))
+			if err != nil {
+				return err
+			}
+		} else {
+			err = lxcSetConfigItem(cc, "lxc.mount.entry", fmt.Sprintf("%s %s none bind,create=file,optional", mnt, strings.TrimPrefix(mnt, "/")))
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -367,7 +385,23 @@ func (c *containerLXC) initLXC() error {
 			return err
 		}
 
-		for _, dev := range []string{"c *:* m", "b *:* m", "c 5:0 rwm", "c 5:1 rwm", "c 1:5 rwm", "c 1:7 rwm", "c 1:3 rwm", "c 1:8 rwm", "c 1:9 rwm", "c 5:2 rwm", "c 136:* rwm"} {
+		devices := []string{
+			"b *:* m",      // Allow mknod of block devices
+			"c *:* m",      // Allow mknod of char devices
+			"c 136:* rwm",  // /dev/pts devices
+			"c 1:3 rwm",    // /dev/null
+			"c 1:5 rwm",    // /dev/zero
+			"c 1:7 rwm",    // /dev/full
+			"c 1:8 rwm",    // /dev/random
+			"c 1:9 rwm",    // /dev/urandom
+			"c 5:0 rwm",    // /dev/tty
+			"c 5:1 rwm",    // /dev/console
+			"c 5:2 rwm",    // /dev/ptmx
+			"c 10:229 rwm", // /dev/fuse
+			"c 10:200 rwm", // /dev/net/tun
+		}
+
+		for _, dev := range devices {
 			err = lxcSetConfigItem(cc, "lxc.cgroup.devices.allow", dev)
 			if err != nil {
 				return err
@@ -466,10 +500,12 @@ func (c *containerLXC) initLXC() error {
 		}
 	}
 
-	// Setup Seccomp
-	err = lxcSetConfigItem(cc, "lxc.seccomp", SeccompProfilePath(c))
-	if err != nil {
-		return err
+	// Setup Seccomp if necessary
+	if ContainerNeedsSeccomp(c) {
+		err = lxcSetConfigItem(cc, "lxc.seccomp", SeccompProfilePath(c))
+		if err != nil {
+			return err
+		}
 	}
 
 	// Setup idmap
@@ -606,14 +642,21 @@ func (c *containerLXC) initLXC() error {
 				return err
 			}
 
-			err = lxcSetConfigItem(cc, "lxc.cgroup.blkio.weight", fmt.Sprintf("%d", priorityInt*100))
+			// Minimum valid value is 10
+			priority := priorityInt * 100
+			if priority == 0 {
+				priority = 10
+			}
+
+			err = lxcSetConfigItem(cc, "lxc.cgroup.blkio.weight", fmt.Sprintf("%d", priority))
 			if err != nil {
 				return err
 			}
 		}
 
 		hasDiskLimits := false
-		for _, m := range c.expandedDevices {
+		for _, name := range c.expandedDevices.DeviceNames() {
+			m := c.expandedDevices[name]
 			if m["type"] != "disk" {
 				continue
 			}
@@ -679,7 +722,8 @@ func (c *containerLXC) initLXC() error {
 	}
 
 	// Setup devices
-	for k, m := range c.expandedDevices {
+	for _, k := range c.expandedDevices.DeviceNames() {
+		m := c.expandedDevices[k]
 		if shared.StringInSlice(m["type"], []string{"unix-char", "unix-block"}) {
 			// Prepare all the paths
 			srcPath := m["path"]
@@ -923,6 +967,25 @@ func (c *containerLXC) startCommon() (string, error) {
 		return "", fmt.Errorf("The container is already running")
 	}
 
+	// Sanity checks for devices
+	for _, name := range c.expandedDevices.DeviceNames() {
+		m := c.expandedDevices[name]
+		switch m["type"] {
+		case "disk":
+			if m["source"] != "" && !shared.PathExists(m["source"]) {
+				return "", fmt.Errorf("Missing source '%s' for disk '%s'", m["source"], name)
+			}
+		case "nic":
+			if m["parent"] != "" && !shared.PathExists(fmt.Sprintf("/sys/class/net/%s", m["parent"])) {
+				return "", fmt.Errorf("Missing parent '%s' for nic '%s'", m["parent"], name)
+			}
+		case "unix-char", "unix-block":
+			if m["path"] != "" && m["major"] == "" && m["minor"] == "" && !shared.PathExists(m["path"]) {
+				return "", fmt.Errorf("Missing source '%s' for device '%s'", m["path"], name)
+			}
+		}
+	}
+
 	// Load any required kernel modules
 	kernelModules := c.expandedConfig["linux.kernel_modules"]
 	if kernelModules != "" {
@@ -978,6 +1041,29 @@ func (c *containerLXC) startCommon() (string, error) {
 			}
 		}
 
+		var mode os.FileMode
+		var uid int
+		var gid int
+
+		if c.IsPrivileged() {
+			mode = 0700
+		} else {
+			mode = 0755
+			if idmap != nil {
+				uid, gid = idmap.ShiftIntoNs(0, 0)
+			}
+		}
+
+		err = os.Chmod(c.Path(), mode)
+		if err != nil {
+			return "", err
+		}
+
+		err = os.Chown(c.Path(), uid, gid)
+		if err != nil {
+			return "", err
+		}
+
 		err = c.StorageStop()
 		if err != nil {
 			return "", err
@@ -998,11 +1084,14 @@ func (c *containerLXC) startCommon() (string, error) {
 	c.removeUnixDevices()
 	c.removeDiskDevices()
 
+	var usbs []usbDevice
+
 	// Create the devices
-	for k, m := range c.expandedDevices {
+	for _, k := range c.expandedDevices.DeviceNames() {
+		m := c.expandedDevices[k]
 		if shared.StringInSlice(m["type"], []string{"unix-char", "unix-block"}) {
 			// Unix device
-			devPath, err := c.createUnixDevice(k, m)
+			devPath, err := c.createUnixDevice(m)
 			if err != nil {
 				return "", err
 			}
@@ -1016,6 +1105,53 @@ func (c *containerLXC) startCommon() (string, error) {
 			err = lxcSetConfigItem(c.c, "lxc.cgroup.devices.allow", fmt.Sprintf("%s %d:%d rwm", dType, dMajor, dMinor))
 			if err != nil {
 				return "", fmt.Errorf("Failed to add cgroup rule for device")
+			}
+		} else if m["type"] == "usb" {
+			if usbs == nil {
+				usbs, err = deviceLoadUsb()
+				if err != nil {
+					return "", err
+				}
+			}
+
+			created := false
+
+			for _, usb := range usbs {
+				if usb.vendor != m["vendorid"] || (m["productid"] != "" && usb.product != m["productid"]) {
+					continue
+				}
+
+				err = lxcSetConfigItem(c.c, "lxc.cgroup.devices.allow", fmt.Sprintf("c %d:%d rwm", usb.major, usb.minor))
+				if err != nil {
+					return "", err
+				}
+
+				m["major"] = fmt.Sprintf("%d", usb.major)
+				m["minor"] = fmt.Sprintf("%d", usb.minor)
+				m["path"] = usb.path
+
+				/* it's ok to fail, the device might be hot plugged later */
+				_, err := c.createUnixDevice(m)
+				if err != nil {
+					shared.Log.Debug("failed to create usb device", log.Ctx{"err": err, "device": k})
+					continue
+				}
+
+				created = true
+
+				/* if the create was successful, let's bind mount it */
+				srcPath := usb.path
+				tgtPath := strings.TrimPrefix(srcPath, "/")
+				devName := fmt.Sprintf("unix.%s", strings.Replace(tgtPath, "/", "-", -1))
+				devPath := filepath.Join(c.DevicesPath(), devName)
+				err = lxcSetConfigItem(c.c, "lxc.mount.entry", fmt.Sprintf("%s %s none bind,create=file", devPath, tgtPath))
+				if err != nil {
+					return "", err
+				}
+			}
+
+			if !created && shared.IsTrue(m["required"]) {
+				return "", fmt.Errorf("couldn't create usb device %s", k)
 			}
 		} else if m["type"] == "disk" {
 			// Disk device
@@ -1046,7 +1182,8 @@ func (c *containerLXC) startCommon() (string, error) {
 
 	// Cleanup any leftover volatile entries
 	netNames := []string{}
-	for k, v := range c.expandedDevices {
+	for _, k := range c.expandedDevices.DeviceNames() {
+		v := c.expandedDevices[k]
 		if v["type"] == "nic" {
 			netNames = append(netNames, k)
 		}
@@ -1106,6 +1243,12 @@ func (c *containerLXC) startCommon() (string, error) {
 		return "", err
 	}
 
+	// Update time container was last started
+	err = dbContainerLastUsedUpdate(c.daemon.db, c.id, time.Now().UTC())
+	if err != nil {
+		fmt.Printf("Error updating last used: %v", err)
+	}
+
 	return configPath, nil
 }
 
@@ -1134,30 +1277,7 @@ func (c *containerLXC) Start(stateful bool) error {
 			return fmt.Errorf("Container has no existing state to restore.")
 		}
 
-		if err := findCriu("snapshot"); err != nil {
-			return err
-		}
-
-		if !c.IsPrivileged() {
-			if err := c.IdmapSet().ShiftRootfs(c.StatePath()); err != nil {
-				return err
-			}
-		}
-
-		out, err := exec.Command(
-			execPath,
-			"forkmigrate",
-			c.name,
-			c.daemon.lxcpath,
-			configPath,
-			c.StatePath()).CombinedOutput()
-		if string(out) != "" {
-			for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
-				shared.Debugf("forkmigrate: %s", line)
-			}
-		}
-		CollectCRIULogFile(c, c.StatePath(), "snapshot", "restore")
-
+		err := c.Migrate(lxc.MIGRATE_RESTORE, c.StatePath(), "snapshot", false, false)
 		if err != nil && !c.IsRunning() {
 			return err
 		}
@@ -1187,6 +1307,7 @@ func (c *containerLXC) Start(stateful bool) error {
 		c.daemon.lxcpath,
 		configPath).CombinedOutput()
 
+	// Capture debug output
 	if string(out) != "" {
 		for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
 			shared.Debugf("forkstart: %s", line)
@@ -1194,47 +1315,40 @@ func (c *containerLXC) Start(stateful bool) error {
 	}
 
 	if err != nil && !c.IsRunning() {
-		return fmt.Errorf(
-			"Error calling 'lxd forkstart %s %s %s': err='%v'",
-			c.name,
-			c.daemon.lxcpath,
-			filepath.Join(c.LogPath(), "lxc.conf"),
-			err)
-	}
+		// Attempt to extract the LXC errors
+		log := ""
+		logPath := filepath.Join(c.LogPath(), "lxc.log")
+		if shared.PathExists(logPath) {
+			logContent, err := ioutil.ReadFile(logPath)
+			if err == nil {
+				for _, line := range strings.Split(string(logContent), "\n") {
+					fields := strings.Fields(line)
+					if len(fields) < 4 {
+						continue
+					}
 
-	return nil
-}
+					// We only care about errors
+					if fields[2] != "ERROR" {
+						continue
+					}
 
-func (c *containerLXC) StartFromMigration(imagesDir string) error {
-	// Run the shared start code
-	configPath, err := c.startCommon()
-	if err != nil {
-		return err
-	}
+					// Prepend the line break
+					if len(log) == 0 {
+						log += "\n"
+					}
 
-	// Start the LXC container
-	out, err := exec.Command(
-		execPath,
-		"forkmigrate",
-		c.name,
-		c.daemon.lxcpath,
-		configPath,
-		imagesDir).CombinedOutput()
-
-	if string(out) != "" {
-		for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
-			shared.Debugf("forkmigrate: %s", line)
+					log += fmt.Sprintf("  %s\n", strings.Join(fields[0:], " "))
+				}
+			}
 		}
-	}
 
-	if err != nil && !c.IsRunning() {
+		// Return the actual error
 		return fmt.Errorf(
-			"Error calling 'lxd forkmigrate %s %s %s %s': err='%v'",
+			"Error calling 'lxd forkstart %s %s %s': err='%v'%s",
 			c.name,
 			c.daemon.lxcpath,
 			filepath.Join(c.LogPath(), "lxc.conf"),
-			imagesDir,
-			err)
+			err, log)
 	}
 
 	return nil
@@ -1296,7 +1410,8 @@ func (c *containerLXC) OnStart() error {
 	}
 
 	// Apply network limits
-	for name, m := range c.expandedDevices {
+	for _, name := range c.expandedDevices.DeviceNames() {
+		m := c.expandedDevices[name]
 		if m["type"] != "nic" {
 			continue
 		}
@@ -1348,10 +1463,6 @@ func (c *containerLXC) setupStopping() *sync.WaitGroup {
 func (c *containerLXC) Stop(stateful bool) error {
 	// Handle stateful stop
 	if stateful {
-		if err := findCriu("snapshot"); err != nil {
-			return err
-		}
-
 		// Cleanup any existing state
 		stateDir := c.StatePath()
 		os.RemoveAll(stateDir)
@@ -1362,13 +1473,7 @@ func (c *containerLXC) Stop(stateful bool) error {
 		}
 
 		// Checkpoint
-		opts := lxc.CheckpointOptions{Directory: stateDir, Stop: true, Verbose: true}
-		err = c.Checkpoint(opts)
-		err2 := CollectCRIULogFile(c, stateDir, "snapshot", "dump")
-		if err2 != nil {
-			shared.Log.Warn("failed to collect criu log file", log.Ctx{"error": err2})
-		}
-
+		err = c.Migrate(lxc.MIGRATE_DUMP, stateDir, "snapshot", true, false)
 		if err != nil {
 			return err
 		}
@@ -1579,15 +1684,18 @@ func (c *containerLXC) getLxcState() (lxc.State, error) {
 	}
 }
 
-func (c *containerLXC) Render() (interface{}, error) {
+func (c *containerLXC) Render() (interface{}, interface{}, error) {
 	// Load the go-lxc struct
 	err := c.initLXC()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Ignore err as the arch string on error is correct (unknown)
 	architectureName, _ := shared.ArchitectureName(c.architecture)
+
+	// Prepare the ETag
+	etag := []interface{}{c.architecture, c.localConfig, c.localDevices, c.ephemeral, c.profiles}
 
 	if c.IsSnapshot() {
 		return &shared.SnapshotInfo{
@@ -1598,15 +1706,16 @@ func (c *containerLXC) Render() (interface{}, error) {
 			Ephemeral:       c.ephemeral,
 			ExpandedConfig:  c.expandedConfig,
 			ExpandedDevices: c.expandedDevices,
+			LastUsedDate:    c.lastUsedDate,
 			Name:            c.name,
 			Profiles:        c.profiles,
 			Stateful:        c.stateful,
-		}, nil
+		}, etag, nil
 	} else {
 		// FIXME: Render shouldn't directly access the go-lxc struct
 		cState, err := c.getLxcState()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		statusCode := shared.FromLXCState(int(cState))
 
@@ -1618,12 +1727,13 @@ func (c *containerLXC) Render() (interface{}, error) {
 			Ephemeral:       c.ephemeral,
 			ExpandedConfig:  c.expandedConfig,
 			ExpandedDevices: c.expandedDevices,
+			LastUsedDate:    c.lastUsedDate,
 			Name:            c.name,
 			Profiles:        c.profiles,
 			Status:          statusCode.String(),
 			StatusCode:      statusCode,
 			Stateful:        c.stateful,
-		}, nil
+		}, etag, nil
 	}
 }
 
@@ -1739,32 +1849,7 @@ func (c *containerLXC) Restore(sourceContainer container) error {
 	// If the container wasn't running but was stateful, should we restore
 	// it as running?
 	if shared.PathExists(c.StatePath()) {
-		configPath, err := c.startCommon()
-		if err != nil {
-			return err
-		}
-
-		if !c.IsPrivileged() {
-			if err := c.IdmapSet().ShiftRootfs(c.StatePath()); err != nil {
-				return err
-			}
-		}
-
-		out, err := exec.Command(
-			execPath,
-			"forkmigrate",
-			c.name,
-			c.daemon.lxcpath,
-			configPath,
-			c.StatePath()).CombinedOutput()
-		if string(out) != "" {
-			for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
-				shared.Debugf("forkmigrate: %s", line)
-			}
-		}
-		CollectCRIULogFile(c, c.StatePath(), "snapshot", "restore")
-
-		if err != nil {
+		if err := c.Migrate(lxc.MIGRATE_RESTORE, c.StatePath(), "snapshot", false, false); err != nil {
 			return err
 		}
 
@@ -1972,7 +2057,7 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 	}
 
 	// Validate the new config
-	err := containerValidConfig(args.Config, false, false)
+	err := containerValidConfig(c.daemon, args.Config, false, false)
 	if err != nil {
 		return err
 	}
@@ -2061,18 +2146,24 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 		return err
 	}
 
-	// Define a function which reverts everything
-	undoChanges := func() {
-		c.architecture = oldArchitecture
-		c.ephemeral = oldEphemeral
-		c.expandedConfig = oldExpandedConfig
-		c.expandedDevices = oldExpandedDevices
-		c.localConfig = oldLocalConfig
-		c.localDevices = oldLocalDevices
-		c.profiles = oldProfiles
-		c.initLXC()
-		deviceTaskSchedulerTrigger("container", c.name, "changed")
-	}
+	// Define a function which reverts everything.  Defer this function
+	// so that it doesn't need to be explicitly called in every failing
+	// return path.  Track whether or not we want to undo the changes
+	// using a closure.
+	undoChanges := true
+	defer func() {
+		if undoChanges {
+			c.architecture = oldArchitecture
+			c.ephemeral = oldEphemeral
+			c.expandedConfig = oldExpandedConfig
+			c.expandedDevices = oldExpandedDevices
+			c.localConfig = oldLocalConfig
+			c.localDevices = oldLocalDevices
+			c.profiles = oldProfiles
+			c.initLXC()
+			deviceTaskSchedulerTrigger("container", c.name, "changed")
+		}
+	}()
 
 	// Apply the various changes
 	c.architecture = args.Architecture
@@ -2084,19 +2175,16 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 	// Expand the config and refresh the LXC config
 	err = c.expandConfig()
 	if err != nil {
-		undoChanges()
 		return err
 	}
 
 	err = c.expandDevices()
 	if err != nil {
-		undoChanges()
 		return err
 	}
 
 	err = c.initLXC()
 	if err != nil {
-		undoChanges()
 		return err
 	}
 
@@ -2122,16 +2210,14 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 	removeDevices, addDevices, updateDevices := oldExpandedDevices.Update(c.expandedDevices)
 
 	// Do some validation of the config diff
-	err = containerValidConfig(c.expandedConfig, false, true)
+	err = containerValidConfig(c.daemon, c.expandedConfig, false, true)
 	if err != nil {
-		undoChanges()
 		return err
 	}
 
 	// Do some validation of the devices diff
 	err = containerValidDevices(c.expandedDevices, false, true)
 	if err != nil {
-		undoChanges()
 		return err
 	}
 
@@ -2140,7 +2226,6 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 		if key == "raw.apparmor" || key == "security.nesting" {
 			err = AAParseProfile(c)
 			if err != nil {
-				undoChanges()
 				return err
 			}
 		}
@@ -2159,13 +2244,11 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 		if m["size"] != oldRootfsSize {
 			size, err := shared.ParseByteSizeString(m["size"])
 			if err != nil {
-				undoChanges()
 				return err
 			}
 
 			err = c.storage.ContainerSetQuota(c, size)
 			if err != nil {
-				undoChanges()
 				return err
 			}
 		}
@@ -2183,7 +2266,8 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 		}
 
 		var newRootfs shared.Device
-		for _, m := range c.expandedDevices {
+		for _, name := range c.expandedDevices.DeviceNames() {
+			m := c.expandedDevices[name]
 			if m["type"] == "disk" && m["path"] == "/" {
 				newRootfs = m
 				break
@@ -2191,7 +2275,6 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 		}
 
 		if oldRootfs["source"] != newRootfs["source"] {
-			undoChanges()
 			return fmt.Errorf("Cannot change the rootfs path of a running container")
 		}
 
@@ -2203,7 +2286,6 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 				// Update the AppArmor profile
 				err = AALoadProfile(c)
 				if err != nil {
-					undoChanges()
 					return err
 				}
 			} else if key == "linux.kernel_modules" && value != "" {
@@ -2211,7 +2293,6 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 					module = strings.TrimPrefix(module, " ")
 					out, err := exec.Command("modprobe", module).CombinedOutput()
 					if err != nil {
-						undoChanges()
 						return fmt.Errorf("Failed to load kernel module '%s': %s", module, out)
 					}
 				}
@@ -2229,7 +2310,13 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 					}
 				}
 
-				err = c.CGroupSet("blkio.weight", fmt.Sprintf("%d", priorityInt*100))
+				// Minimum valid value is 10
+				priority := priorityInt * 100
+				if priority == 0 {
+					priority = 10
+				}
+
+				err = c.CGroupSet("blkio.weight", fmt.Sprintf("%d", priority))
 				if err != nil {
 					return err
 				}
@@ -2262,7 +2349,6 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 				} else {
 					valueInt, err := shared.ParseByteSizeString(memory)
 					if err != nil {
-						undoChanges()
 						return err
 					}
 					memory = fmt.Sprintf("%d", valueInt)
@@ -2272,20 +2358,17 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 				if cgSwapAccounting {
 					err = c.CGroupSet("memory.memsw.limit_in_bytes", "-1")
 					if err != nil {
-						undoChanges()
 						return err
 					}
 				}
 
 				err = c.CGroupSet("memory.limit_in_bytes", "-1")
 				if err != nil {
-					undoChanges()
 					return err
 				}
 
 				err = c.CGroupSet("memory.soft_limit_in_bytes", "-1")
 				if err != nil {
-					undoChanges()
 					return err
 				}
 
@@ -2294,25 +2377,21 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 					// Set new limit
 					err = c.CGroupSet("memory.soft_limit_in_bytes", memory)
 					if err != nil {
-						undoChanges()
 						return err
 					}
 				} else {
 					if cgSwapAccounting && (memorySwap == "" || shared.IsTrue(memorySwap)) {
 						err = c.CGroupSet("memory.limit_in_bytes", memory)
 						if err != nil {
-							undoChanges()
 							return err
 						}
 						err = c.CGroupSet("memory.memsw.limit_in_bytes", memory)
 						if err != nil {
-							undoChanges()
 							return err
 						}
 					} else {
 						err = c.CGroupSet("memory.limit_in_bytes", memory)
 						if err != nil {
-							undoChanges()
 							return err
 						}
 					}
@@ -2325,7 +2404,6 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 					if memorySwap != "" && !shared.IsTrue(memorySwap) {
 						err = c.CGroupSet("memory.swappiness", "0")
 						if err != nil {
-							undoChanges()
 							return err
 						}
 					} else {
@@ -2333,14 +2411,12 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 						if memorySwapPriority != "" {
 							priority, err = strconv.Atoi(memorySwapPriority)
 							if err != nil {
-								undoChanges()
 								return err
 							}
 						}
 
 						err = c.CGroupSet("memory.swappiness", fmt.Sprintf("%d", 60-10+priority))
 						if err != nil {
-							undoChanges()
 							return err
 						}
 					}
@@ -2362,25 +2438,21 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 				// Apply new CPU limits
 				cpuShares, cpuCfsQuota, cpuCfsPeriod, err := deviceParseCPU(c.expandedConfig["limits.cpu.allowance"], c.expandedConfig["limits.cpu.priority"])
 				if err != nil {
-					undoChanges()
 					return err
 				}
 
 				err = c.CGroupSet("cpu.shares", cpuShares)
 				if err != nil {
-					undoChanges()
 					return err
 				}
 
 				err = c.CGroupSet("cpu.cfs_period_us", cpuCfsPeriod)
 				if err != nil {
-					undoChanges()
 					return err
 				}
 
 				err = c.CGroupSet("cpu.cfs_quota_us", cpuCfsQuota)
 				if err != nil {
-					undoChanges()
 					return err
 				}
 			} else if key == "limits.processes" {
@@ -2391,44 +2463,63 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 				if value == "" {
 					err = c.CGroupSet("pids.max", "max")
 					if err != nil {
-						undoChanges()
 						return err
 					}
 				} else {
 					valueInt, err := strconv.ParseInt(value, 10, 64)
 					if err != nil {
-						undoChanges()
 						return err
 					}
 
 					err = c.CGroupSet("pids.max", fmt.Sprintf("%d", valueInt))
 					if err != nil {
-						undoChanges()
 						return err
 					}
 				}
 			}
 		}
 
+		var usbs []usbDevice
+
 		// Live update the devices
 		for k, m := range removeDevices {
 			if shared.StringInSlice(m["type"], []string{"unix-char", "unix-block"}) {
-				err = c.removeUnixDevice(k, m)
+				err = c.removeUnixDevice(m)
 				if err != nil {
-					undoChanges()
 					return err
 				}
 			} else if m["type"] == "disk" && m["path"] != "/" {
 				err = c.removeDiskDevice(k, m)
 				if err != nil {
-					undoChanges()
 					return err
 				}
 			} else if m["type"] == "nic" {
 				err = c.removeNetworkDevice(k, m)
 				if err != nil {
-					undoChanges()
 					return err
+				}
+			} else if m["type"] == "usb" {
+				if usbs == nil {
+					usbs, err = deviceLoadUsb()
+					if err != nil {
+						return err
+					}
+				}
+
+				/* if the device isn't present, we don't need to remove it */
+				for _, usb := range usbs {
+					if usb.vendor != m["vendorid"] || (m["productid"] != "" && usb.product != m["productid"]) {
+						continue
+					}
+
+					m["major"] = fmt.Sprintf("%d", usb.major)
+					m["minor"] = fmt.Sprintf("%d", usb.minor)
+					m["path"] = usb.path
+
+					err = c.removeUnixDevice(m)
+					if err != nil {
+						shared.Log.Error("failed to remove usb device", log.Ctx{"err": err, "usb": usb, "container": c.Name()})
+					}
 				}
 			}
 		}
@@ -2437,20 +2528,39 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 			if shared.StringInSlice(m["type"], []string{"unix-char", "unix-block"}) {
 				err = c.insertUnixDevice(k, m)
 				if err != nil {
-					undoChanges()
 					return err
 				}
 			} else if m["type"] == "disk" && m["path"] != "/" {
 				err = c.insertDiskDevice(k, m)
 				if err != nil {
-					undoChanges()
 					return err
 				}
 			} else if m["type"] == "nic" {
 				err = c.insertNetworkDevice(k, m)
 				if err != nil {
-					undoChanges()
 					return err
+				}
+			} else if m["type"] == "usb" {
+				if usbs == nil {
+					usbs, err = deviceLoadUsb()
+					if err != nil {
+						return err
+					}
+				}
+
+				for _, usb := range usbs {
+					if usb.vendor != m["vendorid"] || (m["productid"] != "" && usb.product != m["productid"]) {
+						continue
+					}
+
+					m["major"] = fmt.Sprintf("%d", usb.major)
+					m["minor"] = fmt.Sprintf("%d", usb.minor)
+					m["path"] = usb.path
+
+					err = c.insertUnixDevice(k, m)
+					if err != nil {
+						shared.Log.Error("failed to insert usb device", log.Ctx{"err": err, "usb": usb, "container": c.Name()})
+					}
 				}
 			}
 		}
@@ -2462,7 +2572,6 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 			} else if m["type"] == "nic" {
 				err = c.setNetworkLimits(k, m)
 				if err != nil {
-					undoChanges()
 					return err
 				}
 			}
@@ -2472,32 +2581,27 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 		if updateDiskLimit && cgBlkioController {
 			diskLimits, err := c.getDiskLimits()
 			if err != nil {
-				undoChanges()
 				return err
 			}
 
 			for block, limit := range diskLimits {
 				err = c.CGroupSet("blkio.throttle.read_bps_device", fmt.Sprintf("%s %d", block, limit.readBps))
 				if err != nil {
-					undoChanges()
 					return err
 				}
 
 				err = c.CGroupSet("blkio.throttle.read_iops_device", fmt.Sprintf("%s %d", block, limit.readIops))
 				if err != nil {
-					undoChanges()
 					return err
 				}
 
 				err = c.CGroupSet("blkio.throttle.write_bps_device", fmt.Sprintf("%s %d", block, limit.writeBps))
 				if err != nil {
-					undoChanges()
 					return err
 				}
 
 				err = c.CGroupSet("blkio.throttle.write_iops_device", fmt.Sprintf("%s %d", block, limit.writeIops))
 				if err != nil {
-					undoChanges()
 					return err
 				}
 			}
@@ -2507,49 +2611,45 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 	// Finally, apply the changes to the database
 	tx, err := dbBegin(c.daemon.db)
 	if err != nil {
-		undoChanges()
 		return err
 	}
 
 	err = dbContainerConfigClear(tx, c.id)
 	if err != nil {
 		tx.Rollback()
-		undoChanges()
 		return err
 	}
 
 	err = dbContainerConfigInsert(tx, c.id, args.Config)
 	if err != nil {
 		tx.Rollback()
-		undoChanges()
 		return err
 	}
 
 	err = dbContainerProfilesInsert(tx, c.id, args.Profiles)
 	if err != nil {
 		tx.Rollback()
-		undoChanges()
 		return err
 	}
 
 	err = dbDevicesAdd(tx, "container", int64(c.id), args.Devices)
 	if err != nil {
 		tx.Rollback()
-		undoChanges()
 		return err
 	}
 
 	err = dbContainerUpdate(tx, c.id, c.architecture, c.ephemeral)
 	if err != nil {
 		tx.Rollback()
-		undoChanges()
 		return err
 	}
 
 	if err := txCommit(tx); err != nil {
-		undoChanges()
 		return err
 	}
+
+	// Success, update the closure to mark that the changes should be kept.
+	undoChanges = false
 
 	return nil
 }
@@ -2689,14 +2789,165 @@ func (c *containerLXC) Export(w io.Writer) error {
 	return tw.Close()
 }
 
-func (c *containerLXC) Checkpoint(opts lxc.CheckpointOptions) error {
-	// Load the go-lxc struct
-	err := c.initLXC()
+func collectCRIULogFile(c container, imagesDir string, function string, method string) error {
+	t := time.Now().Format(time.RFC3339)
+	newPath := shared.LogPath(c.Name(), fmt.Sprintf("%s_%s_%s.log", function, method, t))
+	return shared.FileCopy(filepath.Join(imagesDir, fmt.Sprintf("%s.log", method)), newPath)
+}
+
+func getCRIULogErrors(imagesDir string, method string) (string, error) {
+	f, err := os.Open(path.Join(imagesDir, fmt.Sprintf("%s.log", method)))
 	if err != nil {
+		return "", err
+	}
+
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	ret := []string{}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, "Error") {
+			ret = append(ret, scanner.Text())
+		}
+	}
+
+	return strings.Join(ret, "\n"), nil
+}
+
+func findCriu(host string) error {
+	_, err := exec.LookPath("criu")
+	if err != nil {
+		return fmt.Errorf("CRIU is required for live migration but its binary couldn't be found on the %s server. Is it installed in LXD's path?", host)
+	}
+
+	return nil
+}
+
+func (c *containerLXC) Migrate(cmd uint, stateDir string, function string, stop bool, actionScript bool) error {
+	if err := findCriu(function); err != nil {
 		return err
 	}
 
-	return c.c.Checkpoint(opts)
+	prettyCmd := ""
+	switch cmd {
+	case lxc.MIGRATE_PRE_DUMP:
+		prettyCmd = "pre-dump"
+	case lxc.MIGRATE_DUMP:
+		prettyCmd = "dump"
+	case lxc.MIGRATE_RESTORE:
+		prettyCmd = "restore"
+	default:
+		prettyCmd = "unknown"
+		shared.Log.Warn("unknown migrate call", log.Ctx{"cmd": cmd})
+	}
+
+	preservesInodes := c.storage.PreservesInodes()
+	/* This feature was only added in 2.0.1, let's not ask for it
+	 * before then or migrations will fail.
+	 */
+	if !lxc.VersionAtLeast(2, 0, 1) {
+		preservesInodes = false
+	}
+
+	var migrateErr error
+
+	/* For restore, we need an extra fork so that we daemonize monitor
+	 * instead of having it be a child of LXD, so let's hijack the command
+	 * here and do the extra fork.
+	 */
+	if cmd == lxc.MIGRATE_RESTORE {
+		// Run the shared start
+		_, err := c.startCommon()
+		if err != nil {
+			return err
+		}
+
+		/*
+		 * For unprivileged containers we need to shift the
+		 * perms on the images images so that they can be
+		 * opened by the process after it is in its user
+		 * namespace.
+		 */
+		if !c.IsPrivileged() {
+			if err := c.IdmapSet().ShiftRootfs(stateDir); err != nil {
+				return err
+			}
+		}
+
+		configPath := filepath.Join(c.LogPath(), "lxc.conf")
+
+		var out []byte
+		out, migrateErr = exec.Command(
+			execPath,
+			"forkmigrate",
+			c.name,
+			c.daemon.lxcpath,
+			configPath,
+			stateDir,
+			fmt.Sprintf("%v", preservesInodes)).CombinedOutput()
+
+		if string(out) != "" {
+			for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
+				shared.Debugf("forkmigrate: %s", line)
+			}
+		}
+
+		if migrateErr != nil && !c.IsRunning() {
+			migrateErr = fmt.Errorf(
+				"Error calling 'lxd forkmigrate %s %s %s %s': err='%v' out='%v'",
+				c.name,
+				c.daemon.lxcpath,
+				filepath.Join(c.LogPath(), "lxc.conf"),
+				stateDir,
+				err,
+				string(out))
+		}
+
+	} else {
+		err := c.initLXC()
+		if err != nil {
+			return err
+		}
+
+		script := ""
+		if actionScript {
+			script = filepath.Join(stateDir, "action.sh")
+		}
+
+		// TODO: make this configurable? Ultimately I think we don't
+		// want to do that; what we really want to do is have "modes"
+		// of criu operation where one is "make this succeed" and the
+		// other is "make this fast". Anyway, for now, let's choose a
+		// really big size so it almost always succeeds, even if it is
+		// slow.
+		ghostLimit := uint64(256 * 1024 * 1024)
+
+		opts := lxc.MigrateOptions{
+			Stop:            stop,
+			Directory:       stateDir,
+			Verbose:         true,
+			PreservesInodes: preservesInodes,
+			ActionScript:    script,
+			GhostLimit:      ghostLimit,
+		}
+
+		migrateErr = c.c.Migrate(cmd, opts)
+	}
+
+	collectErr := collectCRIULogFile(c, stateDir, function, prettyCmd)
+	if collectErr != nil {
+		shared.Log.Error("Error collecting checkpoint log file", log.Ctx{"err": collectErr})
+	}
+
+	if migrateErr != nil {
+		log, err2 := getCRIULogErrors(stateDir, prettyCmd)
+		if err2 == nil {
+			migrateErr = fmt.Errorf("%s %s failed\n%s", function, prettyCmd, log)
+		}
+	}
+
+	return migrateErr
 }
 
 func (c *containerLXC) TemplateApply(trigger string) error {
@@ -2878,6 +3129,8 @@ func (c *containerLXC) FilePull(srcpath string, dstpath string) (int, int, os.Fi
 	gid := -1
 	mode := -1
 
+	var errStr string
+
 	// Process forkgetfile response
 	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
 		if line == "" {
@@ -2886,7 +3139,16 @@ func (c *containerLXC) FilePull(srcpath string, dstpath string) (int, int, os.Fi
 
 		// Extract errors
 		if strings.HasPrefix(line, "error: ") {
-			return -1, -1, 0, fmt.Errorf(strings.TrimPrefix(line, "error: "))
+			errStr = strings.TrimPrefix(line, "error: ")
+			continue
+		}
+
+		if strings.HasPrefix(line, "errno: ") {
+			errno := strings.TrimPrefix(line, "errno: ")
+			if errno == "2" {
+				return -1, -1, 0, os.ErrNotExist
+			}
+			return -1, -1, 0, fmt.Errorf(errStr)
 		}
 
 		// Extract the uid
@@ -3060,7 +3322,8 @@ func (c *containerLXC) Exec(command []string, env map[string]string, stdin *os.F
 func (c *containerLXC) diskState() map[string]shared.ContainerStateDisk {
 	disk := map[string]shared.ContainerStateDisk{}
 
-	for name, d := range c.expandedDevices {
+	for _, name := range c.expandedDevices.DeviceNames() {
+		d := c.expandedDevices[name]
 		if d["type"] != "disk" {
 			continue
 		}
@@ -3384,7 +3647,7 @@ func (c *containerLXC) removeMount(mount string) error {
 }
 
 // Unix devices handling
-func (c *containerLXC) createUnixDevice(name string, m shared.Device) (string, error) {
+func (c *containerLXC) createUnixDevice(m shared.Device) (string, error) {
 	var err error
 	var major, minor int
 
@@ -3399,10 +3662,10 @@ func (c *containerLXC) createUnixDevice(name string, m shared.Device) (string, e
 		// If no major and minor are set, use those from the device on the host
 		_, major, minor, err = deviceGetAttributes(srcPath)
 		if err != nil {
-			return "", fmt.Errorf("Failed to get device attributes: %s", err)
+			return "", fmt.Errorf("Failed to get device attributes for %s: %s", m["path"], err)
 		}
 	} else if m["major"] == "" || m["minor"] == "" {
-		return "", fmt.Errorf("Both major and minor must be supplied for devices")
+		return "", fmt.Errorf("Both major and minor must be supplied for device: %s", m["path"])
 	} else {
 		major, err = strconv.Atoi(m["major"])
 		if err != nil {
@@ -3496,7 +3759,7 @@ func (c *containerLXC) insertUnixDevice(name string, m shared.Device) error {
 	}
 
 	// Create the device on the host
-	devPath, err := c.createUnixDevice(name, m)
+	devPath, err := c.createUnixDevice(m)
 	if err != nil {
 		return fmt.Errorf("Failed to setup device: %s", err)
 	}
@@ -3521,7 +3784,7 @@ func (c *containerLXC) insertUnixDevice(name string, m shared.Device) error {
 	return nil
 }
 
-func (c *containerLXC) removeUnixDevice(name string, m shared.Device) error {
+func (c *containerLXC) removeUnixDevice(m shared.Device) error {
 	// Check that the container is running
 	pid := c.InitPID()
 	if pid == -1 {
@@ -3627,10 +3890,18 @@ func (c *containerLXC) createNetworkDevice(name string, m shared.Device) (string
 		}
 
 		if m["nictype"] == "bridged" {
-			err = exec.Command("ip", "link", "set", n1, "master", m["parent"]).Run()
-			if err != nil {
-				deviceRemoveInterface(n2)
-				return "", fmt.Errorf("Failed to add interface to bridge: %s", err)
+			if shared.PathExists(fmt.Sprintf("/sys/class/net/%s/bridge", m["parent"])) {
+				err = exec.Command("ip", "link", "set", n1, "master", m["parent"]).Run()
+				if err != nil {
+					deviceRemoveInterface(n2)
+					return "", fmt.Errorf("Failed to add interface to bridge: %s", err)
+				}
+			} else {
+				err = exec.Command("ovs-vsctl", "add-port", m["parent"], n1).Run()
+				if err != nil {
+					deviceRemoveInterface(n2)
+					return "", fmt.Errorf("Failed to add interface to bridge: %s", err)
+				}
 			}
 		}
 
@@ -3684,7 +3955,8 @@ func (c *containerLXC) fillNetworkDevice(name string, m shared.Device) (shared.D
 		devNames := []string{}
 
 		// Include all static interface names
-		for _, v := range c.expandedDevices {
+		for _, k := range c.expandedDevices.DeviceNames() {
+			v := c.expandedDevices[k]
 			if v["name"] != "" && !shared.StringInSlice(v["name"], devNames) {
 				devNames = append(devNames, v["name"])
 			}
@@ -3819,8 +4091,8 @@ func (c *containerLXC) insertNetworkDevice(name string, m shared.Device) error {
 		return nil
 	}
 
-	if m["hwaddr"] == "" || m["name"] == "" {
-		return fmt.Errorf("wtf? hwaddr=%s name=%s", m["hwaddr"], m["name"])
+	if m["parent"] != "" && !shared.PathExists(fmt.Sprintf("/sys/class/net/%s", m["parent"])) {
+		return fmt.Errorf("Parent device '%s' doesn't exist", m["parent"])
 	}
 
 	// Return empty list if not running
@@ -3908,7 +4180,7 @@ func (c *containerLXC) createDiskDevice(name string, m shared.Device) (string, e
 		if isOptional {
 			return "", nil
 		}
-		return "", fmt.Errorf("Source path doesn't exist")
+		return "", fmt.Errorf("Source path %s doesn't exist for device %s", srcPath, name)
 	}
 
 	// Create the devices directory if missing
@@ -4082,7 +4354,8 @@ func (c *containerLXC) getDiskLimits() (map[string]deviceBlockLimit, error) {
 
 	// Process all the limits
 	blockLimits := map[string][]deviceBlockLimit{}
-	for _, m := range c.expandedDevices {
+	for _, k := range c.expandedDevices.DeviceNames() {
+		m := c.expandedDevices[k]
 		if m["type"] != "disk" {
 			continue
 		}
@@ -4256,7 +4529,8 @@ func (c *containerLXC) getHostInterface(name string) string {
 		}
 	}
 
-	for k, dev := range c.expandedDevices {
+	for _, k := range c.expandedDevices.DeviceNames() {
+		dev := c.expandedDevices[k]
 		if dev["type"] != "nic" {
 			continue
 		}
@@ -4403,6 +4677,9 @@ func (c *containerLXC) Architecture() int {
 
 func (c *containerLXC) CreationDate() time.Time {
 	return c.creationDate
+}
+func (c *containerLXC) LastUsedDate() time.Time {
+	return c.lastUsedDate
 }
 func (c *containerLXC) ExpandedConfig() map[string]string {
 	return c.expandedConfig
