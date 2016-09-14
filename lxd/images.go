@@ -64,12 +64,14 @@ func detectCompression(fname string) ([]string, string, error) {
 		return []string{"-Jxf"}, ".tar.xz", nil
 	case (bytes.Equal(header[1:5], []byte{'7', 'z', 'X', 'Z'}) && header[0] != 0xFD):
 		return []string{"--lzma", "-xf"}, ".tar.lzma", nil
+	case bytes.Equal(header[0:3], []byte{0x5d, 0x00, 0x00}):
+		return []string{"--lzma", "-xf"}, ".tar.lzma", nil
 	case bytes.Equal(header[257:262], []byte{'u', 's', 't', 'a', 'r'}):
 		return []string{"-xf"}, ".tar", nil
 	case bytes.Equal(header[0:4], []byte{'h', 's', 'q', 's'}):
 		return []string{""}, ".squashfs", nil
 	default:
-		return []string{""}, "", fmt.Errorf("Unsupported compression.")
+		return []string{""}, "", fmt.Errorf("Unsupported compression")
 	}
 
 }
@@ -178,11 +180,12 @@ type templateEntry struct {
 }
 
 type imagePostReq struct {
-	Filename   string            `json:"filename"`
-	Public     bool              `json:"public"`
-	Source     map[string]string `json:"source"`
-	Properties map[string]string `json:"properties"`
-	AutoUpdate bool              `json:"auto_update"`
+	Filename             string            `json:"filename"`
+	Public               bool              `json:"public"`
+	Source               map[string]string `json:"source"`
+	Properties           map[string]string `json:"properties"`
+	AutoUpdate           bool              `json:"auto_update"`
+	CompressionAlgorithm string            `json:"compression_algorithm"`
 }
 
 type imageMetadata struct {
@@ -247,7 +250,14 @@ func imgPostContInfo(d *Daemon, r *http.Request, req imagePostReq,
 	tarfile.Close()
 
 	var compressedPath string
-	compress := daemonConfig["images.compression_algorithm"].Get()
+	var compress string
+
+	if req.CompressionAlgorithm != "" {
+		compress = req.CompressionAlgorithm
+	} else {
+		compress = daemonConfig["images.compression_algorithm"].Get()
+	}
+
 	if compress != "none" {
 		compressedPath, err = compressFile(tarfile.Name(), compress)
 		if err != nil {
@@ -1333,6 +1343,12 @@ func aliasPost(d *Daemon, r *http.Request) Response {
 	req := aliasPostReq{}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return BadRequest(err)
+	}
+
+	// Check that the name isn't already in use
+	id, _, _ := dbImageAliasGet(d.db, req.Name, true)
+	if id > 0 {
+		return Conflict
 	}
 
 	id, _, err := dbImageAliasGet(d.db, name, true)

@@ -600,10 +600,12 @@ func cmdInit() error {
 	var networkAddress string // Address
 	var networkPort int64     // Port
 	var trustPassword string  // Trust password
+	var imagesAutoUpdate bool // controls whether we set images.auto_update_interval to 0
 
 	// Detect userns
 	defaultPrivileged = -1
 	runningInUserns = shared.RunningInUserNS()
+	imagesAutoUpdate = true
 
 	// Only root should run this
 	if os.Geteuid() != 0 {
@@ -799,7 +801,12 @@ func cmdInit() error {
 			return fmt.Errorf("Init configuration is only valid with --auto")
 		}
 
-		storageBackend = askChoice("Name of the storage backend to use (dir or zfs) [default=zfs]: ", backendsSupported, "zfs")
+		defaultStorage := "dir"
+		if shared.StringInSlice("zfs", backendsAvailable) {
+			defaultStorage = "zfs"
+		}
+
+		storageBackend = askChoice(fmt.Sprintf("Name of the storage backend to use (dir or zfs) [default=%s]: ", defaultStorage), backendsSupported, defaultStorage)
 
 		if !shared.StringInSlice(storageBackend, backendsSupported) {
 			return fmt.Errorf("The requested backend '%s' isn't supported by lxd init.", storageBackend)
@@ -822,7 +829,23 @@ func cmdInit() error {
 					storageDevice = askString("Path to the existing block device: ", "", deviceExists)
 					storageMode = "device"
 				} else {
-					storageLoopSize = askInt("Size in GB of the new loop device (1GB minimum) [default=10GB]: ", 1, -1, "10")
+					st := syscall.Statfs_t{}
+					err := syscall.Statfs(shared.VarPath(), &st)
+					if err != nil {
+						return fmt.Errorf("couldn't statfs %s: %s", shared.VarPath(), err)
+					}
+
+					/* choose 15 GB < x < 100GB, where x is 20% of the disk size */
+					def := uint64(st.Frsize) * st.Blocks / (1024 * 1024 * 1024) / 5
+					if def > 100 {
+						def = 100
+					}
+					if def < 15 {
+						def = 15
+					}
+
+					q := fmt.Sprintf("Size in GB of the new loop device (1GB minimum) [default=%d]: ", def)
+					storageLoopSize = askInt(q, 1, -1, fmt.Sprintf("%d", def))
 					storageMode = "loop"
 				}
 			} else {
@@ -852,18 +875,26 @@ they otherwise would.
 
 		if askBool("Would you like LXD to be available over the network (yes/no) [default=no]? ", "no") {
 			isIPAddress := func(s string) string {
-				if net.ParseIP(s) == nil {
+				if s != "all" && net.ParseIP(s) == nil {
 					return fmt.Sprintf("'%s' is not an IP address", s)
 				}
 				return ""
 			}
 
-			networkAddress = askString("Address to bind LXD to (not including port) [default=0.0.0.0]: ", "0.0.0.0", isIPAddress)
+			networkAddress = askString("Address to bind LXD to (not including port) [default=all]: ", "all", isIPAddress)
+			if networkAddress == "all" {
+				networkAddress = "::"
+			}
+
 			if net.ParseIP(networkAddress).To4() == nil {
 				networkAddress = fmt.Sprintf("[%s]", networkAddress)
 			}
 			networkPort = askInt("Port to bind LXD to [default=8443]: ", 1, 65535, "8443")
 			trustPassword = askPassword("Trust password for new clients: ")
+		}
+
+		if !askBool("Would you like stale cached images to be updated automatically? (yes/no) [default=yes]? ", "yes") {
+			imagesAutoUpdate = false
 		}
 	}
 
@@ -935,6 +966,24 @@ they otherwise would.
 	} else if defaultPrivileged == 1 {
 		err = c.SetProfileConfigItem("default", "security.privileged", "true")
 		if err != nil {
+		}
+	}
+
+	if imagesAutoUpdate {
+		ss, err := c.ServerStatus()
+		if err != nil {
+			return err
+		}
+		if val, ok := ss.Config["images.auto_update_interval"]; ok && val == "0" {
+			_, err = c.SetServerConfig("images.auto_update_interval", "")
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		_, err = c.SetServerConfig("images.auto_update_interval", "0")
+		if err != nil {
+			return err
 		}
 	}
 

@@ -66,6 +66,10 @@ func run() error {
 		os.Args[1] = "version"
 	}
 
+	if len(os.Args) == 2 && os.Args[1] == "--man" {
+		os.Args[1] = "manpage"
+	}
+
 	if len(os.Args) < 2 {
 		commands["help"].run(nil, nil)
 		os.Exit(1)
@@ -167,6 +171,7 @@ var commands = map[string]command{
 	"init":    &initCmd{},
 	"launch":  &launchCmd{},
 	"list":    &listCmd{},
+	"manpage": &manpageCmd{},
 	"monitor": &monitorCmd{},
 	"move":    &moveCmd{},
 	"pause": &actionCmd{
@@ -206,10 +211,11 @@ var commands = map[string]command{
 var defaultAliases = map[string]string{
 	"shell": "exec @ARGS@ -- login -f root",
 
-	"cp": "copy",
-	"ls": "list",
-	"mv": "move",
-	"rm": "delete",
+	"cp":     "copy",
+	"ls":     "list",
+	"mv":     "move",
+	"rename": "move",
+	"rm":     "delete",
 
 	"image cp": "image copy",
 	"image ls": "image list",

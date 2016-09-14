@@ -110,6 +110,13 @@ test_basic_usage() {
   curl -k -s --cert "${LXD_CONF}/client3.crt" --key "${LXD_CONF}/client3.key" -X GET "https://${LXD_ADDR}/1.0/images" | grep "/1.0/images/" && false
   lxc image delete foo-image
 
+# Test image compression on publish
+  lxc publish bar --alias=foo-image-compressed --compression=bzip2 prop=val1
+  lxc image show foo-image-compressed | grep val1
+  curl -k -s --cert "${LXD_CONF}/client3.crt" --key "${LXD_CONF}/client3.key" -X GET "https://${LXD_ADDR}/1.0/images" | grep "/1.0/images/" && false
+  lxc image delete foo-image-compressed
+
+
   # Test privileged container publish
   lxc profile create priv
   lxc profile set priv security.privileged true
@@ -176,9 +183,11 @@ test_basic_usage() {
   printf "  cp: list\n" >> "${LXD_CONF}/config.yml"
   [ "$(lxc ls)" = "$(lxc cp)" ]
   #   7. User-defined aliases override commands and don't recurse
-  LXC_LIST_DEBUG=$(lxc list --debug 2>&1 | grep -o "Raw.*")
-  printf "  list: list --debug\n" >> "${LXD_CONF}/config.yml"
-  [ "$(lxc list  2>&1 | grep -o 'Raw.*')" = "$LXC_LIST_DEBUG" ]
+  lxc init testimage foo
+  LXC_CONFIG_SHOW=$(lxc config show foo --expanded)
+  printf "  config show: config show --expanded\n" >> "${LXD_CONF}/config.yml"
+  [ "$(lxc config show foo)" = "$LXC_CONFIG_SHOW" ]
+  lxc delete foo
 
   # Restore the config to remove the aliases
   mv "${LXD_CONF}/config.yml.bak" "${LXD_CONF}/config.yml"

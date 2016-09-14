@@ -28,9 +28,55 @@ import (
 	log "gopkg.in/inconshreveable/log15.v2"
 )
 
-// Global variables
-var lxcStoppingContainersLock sync.Mutex
-var lxcStoppingContainers map[int]*sync.WaitGroup = make(map[int]*sync.WaitGroup)
+// Operation locking
+type lxcContainerOperation struct {
+	action   string
+	chanDone chan error
+	err      error
+	id       int
+	timeout  int
+}
+
+func (op *lxcContainerOperation) Create(id int, action string, timeout int) *lxcContainerOperation {
+	op.id = id
+	op.action = action
+	op.timeout = timeout
+	op.chanDone = make(chan error, 0)
+
+	if timeout > 1 {
+		go func(op *lxcContainerOperation) {
+			time.Sleep(time.Second * time.Duration(op.timeout))
+			op.Done(fmt.Errorf("Container %s operation timed out after %d seconds", op.action, op.timeout))
+		}(op)
+	}
+
+	return op
+}
+
+func (op *lxcContainerOperation) Wait() error {
+	<-op.chanDone
+
+	return op.err
+}
+
+func (op *lxcContainerOperation) Done(err error) {
+	lxcContainerOperationsLock.Lock()
+	defer lxcContainerOperationsLock.Unlock()
+
+	// Check if already done
+	runningOp, ok := lxcContainerOperations[op.id]
+	if !ok || runningOp != op {
+		return
+	}
+
+	op.err = err
+	close(op.chanDone)
+
+	delete(lxcContainerOperations, op.id)
+}
+
+var lxcContainerOperationsLock sync.Mutex
+var lxcContainerOperations map[int]*lxcContainerOperation = make(map[int]*lxcContainerOperation)
 
 // Helper functions
 func lxcSetConfigItem(c *lxc.Container, key string, value string) error {
@@ -246,6 +292,51 @@ type containerLXC struct {
 	daemon   *Daemon
 	idmapset *shared.IdmapSet
 	storage  storage
+}
+
+func (c *containerLXC) createOperation(action string, timeout int) (*lxcContainerOperation, error) {
+	op, _ := c.getOperation("")
+	if op != nil {
+		return nil, fmt.Errorf("Container is already running a %s operation", op.action)
+	}
+
+	lxcContainerOperationsLock.Lock()
+	defer lxcContainerOperationsLock.Unlock()
+
+	op = &lxcContainerOperation{}
+	op.Create(c.id, action, timeout)
+	lxcContainerOperations[c.id] = op
+
+	return lxcContainerOperations[c.id], nil
+}
+
+func (c *containerLXC) getOperation(action string) (*lxcContainerOperation, error) {
+	lxcContainerOperationsLock.Lock()
+	defer lxcContainerOperationsLock.Unlock()
+
+	op := lxcContainerOperations[c.id]
+
+	if op == nil {
+		return nil, fmt.Errorf("No running %s container operation", action)
+	}
+
+	if action != "" && op.action != action {
+		return nil, fmt.Errorf("Container is running a %s operation, not a %s operation", op.action, action)
+	}
+
+	return op, nil
+}
+
+func (c *containerLXC) waitOperation() error {
+	op, _ := c.getOperation("")
+	if op != nil {
+		err := op.Wait()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (c *containerLXC) init() error {
@@ -1130,12 +1221,17 @@ func (c *containerLXC) startCommon() (string, error) {
 					}
 				}
 
-				m["major"] = fmt.Sprintf("%d", usb.major)
-				m["minor"] = fmt.Sprintf("%d", usb.minor)
-				m["path"] = usb.path
+				temp := shared.Device{}
+				if err := shared.DeepCopy(&m, &temp); err != nil {
+					return "", err
+				}
+
+				temp["major"] = fmt.Sprintf("%d", usb.major)
+				temp["minor"] = fmt.Sprintf("%d", usb.minor)
+				temp["path"] = usb.path
 
 				/* it's ok to fail, the device might be hot plugged later */
-				_, err := c.createUnixDevice(m)
+				_, err := c.createUnixDevice(temp)
 				if err != nil {
 					shared.Log.Debug("failed to create usb device", log.Ctx{"err": err, "device": k})
 					continue
@@ -1257,15 +1353,15 @@ func (c *containerLXC) startCommon() (string, error) {
 }
 
 func (c *containerLXC) Start(stateful bool) error {
-	// Wait for container tear down to finish
-	lxcStoppingContainersLock.Lock()
-	wgStopping, stopping := lxcStoppingContainers[c.id]
-	lxcStoppingContainersLock.Unlock()
-	if stopping {
-		wgStopping.Wait()
+	// Setup a new operation
+	op, err := c.createOperation("start", 30)
+	if err != nil {
+		return err
 	}
+	defer op.Done(nil)
 
-	if err := setupSharedMounts(); err != nil {
+	err = setupSharedMounts()
+	if err != nil {
 		return fmt.Errorf("Daemon failed to setup shared mounts base: %s.\nDoes security.nesting need to be turned on?", err)
 	}
 
@@ -1436,35 +1532,14 @@ func (c *containerLXC) OnStart() error {
 	return nil
 }
 
-// Container shutdown locking
-func (c *containerLXC) setupStopping() *sync.WaitGroup {
-	// Handle locking
-	lxcStoppingContainersLock.Lock()
-	defer lxcStoppingContainersLock.Unlock()
-
-	// Existing entry
-	wg, stopping := lxcStoppingContainers[c.id]
-	if stopping {
-		return wg
-	}
-
-	// Setup new entry
-	lxcStoppingContainers[c.id] = &sync.WaitGroup{}
-
-	go func(wg *sync.WaitGroup, id int) {
-		wg.Wait()
-
-		lxcStoppingContainersLock.Lock()
-		defer lxcStoppingContainersLock.Unlock()
-
-		delete(lxcStoppingContainers, id)
-	}(lxcStoppingContainers[c.id], c.id)
-
-	return lxcStoppingContainers[c.id]
-}
-
 // Stop functions
 func (c *containerLXC) Stop(stateful bool) error {
+	// Setup a new operation
+	op, err := c.createOperation("stop", 30)
+	if err != nil {
+		return err
+	}
+
 	// Handle stateful stop
 	if stateful {
 		// Cleanup any existing state
@@ -1473,85 +1548,73 @@ func (c *containerLXC) Stop(stateful bool) error {
 
 		err := os.MkdirAll(stateDir, 0700)
 		if err != nil {
+			op.Done(err)
 			return err
 		}
 
 		// Checkpoint
 		err = c.Migrate(lxc.MIGRATE_DUMP, stateDir, "snapshot", true, false)
 		if err != nil {
+			op.Done(err)
 			return err
 		}
 
 		c.stateful = true
 		err = dbContainerSetStateful(c.daemon.db, c.id, true)
 		if err != nil {
+			op.Done(err)
 			return err
 		}
 
+		op.Done(nil)
 		return nil
 	}
 
 	// Load the go-lxc struct
-	err := c.initLXC()
+	err = c.initLXC()
 	if err != nil {
+		op.Done(err)
 		return err
 	}
 
 	// Attempt to freeze the container first, helps massively with fork bombs
 	c.Freeze()
 
-	// Handle locking
-	wg := c.setupStopping()
-
-	// Stop the container
-	wg.Add(1)
 	if err := c.c.Stop(); err != nil {
-		wg.Done()
+		op.Done(err)
 		return err
 	}
 
-	// Mark ourselves as done
-	wg.Done()
-
-	// Wait for any other teardown routines to finish
-	wg.Wait()
-
-	return nil
+	return op.Wait()
 }
 
 func (c *containerLXC) Shutdown(timeout time.Duration) error {
-	// Load the go-lxc struct
-	err := c.initLXC()
+	// Setup a new operation
+	op, err := c.createOperation("shutdown", 30)
 	if err != nil {
 		return err
 	}
 
-	// Handle locking
-	wg := c.setupStopping()
-
-	// Shutdown the container
-	wg.Add(1)
-	if err := c.c.Shutdown(timeout); err != nil {
-		wg.Done()
+	// Load the go-lxc struct
+	err = c.initLXC()
+	if err != nil {
+		op.Done(err)
 		return err
 	}
 
-	// Mark ourselves as done
-	wg.Done()
+	if err := c.c.Shutdown(timeout); err != nil {
+		op.Done(err)
+		return err
+	}
 
-	// Wait for any other teardown routines to finish
-	wg.Wait()
-
-	return nil
+	return op.Wait()
 }
 
 func (c *containerLXC) OnStop(target string) error {
-	// Get locking
-	lxcStoppingContainersLock.Lock()
-	wg, stopping := lxcStoppingContainers[c.id]
-	lxcStoppingContainersLock.Unlock()
-	if wg != nil {
-		wg.Add(1)
+	// Get operation
+	op, _ := c.getOperation("")
+	if op != nil && !shared.StringInSlice(op.action, []string{"stop", "shutdown"}) {
+		return fmt.Errorf("Container is already running a %s operation", op.action)
 	}
 
 	// Make sure we can't call go-lxc functions by mistake
@@ -1560,7 +1623,10 @@ func (c *containerLXC) OnStop(target string) error {
 	// Stop the storage for this container
 	err := c.StorageStop()
 	if err != nil {
-		wg.Done()
+		if op != nil {
+			op.Done(err)
+		}
+
 		return err
 	}
 
@@ -1568,15 +1634,15 @@ func (c *containerLXC) OnStop(target string) error {
 	AAUnloadProfile(c)
 
 	// FIXME: The go routine can go away once we can rely on LXC_TARGET
-	go func(c *containerLXC, target string, wg *sync.WaitGroup) {
+	go func(c *containerLXC, target string, op *lxcContainerOperation) {
 		c.fromHook = false
 
 		// Unlock on return
-		if wg != nil {
-			defer wg.Done()
+		if op != nil {
+			defer op.Done(nil)
 		}
 
-		if target == "unknown" && stopping {
+		if target == "unknown" && op != nil {
 			target = "stop"
 		}
 
@@ -1639,7 +1705,7 @@ func (c *containerLXC) OnStop(target string) error {
 		if c.ephemeral {
 			c.Delete()
 		}
-	}(c, target, wg)
+	}(c, target, op)
 
 	return nil
 }
@@ -1760,6 +1826,7 @@ func (c *containerLXC) RenderState() (*shared.ContainerState, error) {
 
 	if c.IsRunning() {
 		pid := c.InitPID()
+		status.CPU = c.cpuState()
 		status.Disk = c.diskState()
 		status.Memory = c.memoryState()
 		status.Network = c.networkState()
@@ -2187,11 +2254,6 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 		return err
 	}
 
-	err = c.initLXC()
-	if err != nil {
-		return err
-	}
-
 	// Diff the configurations
 	changedConfig := []string{}
 	for key, _ := range oldExpandedConfig {
@@ -2516,13 +2578,9 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 						continue
 					}
 
-					m["major"] = fmt.Sprintf("%d", usb.major)
-					m["minor"] = fmt.Sprintf("%d", usb.minor)
-					m["path"] = usb.path
-
-					err = c.removeUnixDevice(m)
+					err := c.removeUSBDevice(m, usb)
 					if err != nil {
-						shared.Log.Error("failed to remove usb device", log.Ctx{"err": err, "usb": usb, "container": c.Name()})
+						return err
 					}
 				}
 			}
@@ -2530,7 +2588,7 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 
 		for k, m := range addDevices {
 			if shared.StringInSlice(m["type"], []string{"unix-char", "unix-block"}) {
-				err = c.insertUnixDevice(k, m)
+				err = c.insertUnixDevice(m)
 				if err != nil {
 					return err
 				}
@@ -2557,11 +2615,7 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 						continue
 					}
 
-					m["major"] = fmt.Sprintf("%d", usb.major)
-					m["minor"] = fmt.Sprintf("%d", usb.minor)
-					m["path"] = usb.path
-
-					err = c.insertUnixDevice(k, m)
+					err = c.insertUSBDevice(m, usb)
 					if err != nil {
 						shared.Log.Error("failed to insert usb device", log.Ctx{"err": err, "usb": usb, "container": c.Name()})
 					}
@@ -2649,6 +2703,14 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 	}
 
 	if err := txCommit(tx); err != nil {
+		return err
+	}
+
+	// Invalidate the go-lxc cache
+	c.c = nil
+
+	err = c.initLXC()
+	if err != nil {
 		return err
 	}
 
@@ -3102,12 +3164,12 @@ func (c *containerLXC) templateApplyNow(trigger string) error {
 	return nil
 }
 
-func (c *containerLXC) FilePull(srcpath string, dstpath string) (int, int, os.FileMode, error) {
+func (c *containerLXC) FilePull(srcpath string, dstpath string) (int, int, os.FileMode, string, []string, error) {
 	// Setup container storage if needed
 	if !c.IsRunning() {
 		err := c.StorageStart()
 		if err != nil {
-			return -1, -1, 0, err
+			return -1, -1, 0, "", nil, err
 		}
 	}
 
@@ -3125,13 +3187,15 @@ func (c *containerLXC) FilePull(srcpath string, dstpath string) (int, int, os.Fi
 	if !c.IsRunning() {
 		err := c.StorageStop()
 		if err != nil {
-			return -1, -1, 0, err
+			return -1, -1, 0, "", nil, err
 		}
 	}
 
 	uid := -1
 	gid := -1
 	mode := -1
+	type_ := "unknown"
+	var dirEnts []string
 
 	var errStr string
 
@@ -3150,16 +3214,16 @@ func (c *containerLXC) FilePull(srcpath string, dstpath string) (int, int, os.Fi
 		if strings.HasPrefix(line, "errno: ") {
 			errno := strings.TrimPrefix(line, "errno: ")
 			if errno == "2" {
-				return -1, -1, 0, os.ErrNotExist
+				return -1, -1, 0, "", nil, os.ErrNotExist
 			}
-			return -1, -1, 0, fmt.Errorf(errStr)
+			return -1, -1, 0, "", nil, fmt.Errorf(errStr)
 		}
 
 		// Extract the uid
 		if strings.HasPrefix(line, "uid: ") {
 			uid, err = strconv.Atoi(strings.TrimPrefix(line, "uid: "))
 			if err != nil {
-				return -1, -1, 0, err
+				return -1, -1, 0, "", nil, err
 			}
 
 			continue
@@ -3169,7 +3233,7 @@ func (c *containerLXC) FilePull(srcpath string, dstpath string) (int, int, os.Fi
 		if strings.HasPrefix(line, "gid: ") {
 			gid, err = strconv.Atoi(strings.TrimPrefix(line, "gid: "))
 			if err != nil {
-				return -1, -1, 0, err
+				return -1, -1, 0, "", nil, err
 			}
 
 			continue
@@ -3179,9 +3243,21 @@ func (c *containerLXC) FilePull(srcpath string, dstpath string) (int, int, os.Fi
 		if strings.HasPrefix(line, "mode: ") {
 			mode, err = strconv.Atoi(strings.TrimPrefix(line, "mode: "))
 			if err != nil {
-				return -1, -1, 0, err
+				return -1, -1, 0, "", nil, err
 			}
 
+			continue
+		}
+
+		if strings.HasPrefix(line, "type: ") {
+			type_ = strings.TrimPrefix(line, "type: ")
+			continue
+		}
+
+		if strings.HasPrefix(line, "entry: ") {
+			ent := strings.TrimPrefix(line, "entry: ")
+			ent = strings.Replace(ent, "\x00", "\n", -1)
+			dirEnts = append(dirEnts, ent)
 			continue
 		}
 
@@ -3189,7 +3265,7 @@ func (c *containerLXC) FilePull(srcpath string, dstpath string) (int, int, os.Fi
 	}
 
 	if err != nil {
-		return -1, -1, 0, fmt.Errorf(
+		return -1, -1, 0, "", nil, fmt.Errorf(
 			"Error calling 'lxd forkgetfile %s %d %s': err='%v'",
 			dstpath,
 			c.InitPID(),
@@ -3200,14 +3276,14 @@ func (c *containerLXC) FilePull(srcpath string, dstpath string) (int, int, os.Fi
 	// Unmap uid and gid if needed
 	idmapset, err := c.LastIdmapSet()
 	if err != nil {
-		return -1, -1, 0, err
+		return -1, -1, 0, "", nil, err
 	}
 
 	if idmapset != nil {
 		uid, gid = idmapset.ShiftFromNs(uid, gid)
 	}
 
-	return uid, gid, os.FileMode(mode), nil
+	return uid, gid, os.FileMode(mode), type_, dirEnts, nil
 }
 
 func (c *containerLXC) FilePush(srcpath string, dstpath string, uid int, gid int, mode int) error {
@@ -3321,6 +3397,25 @@ func (c *containerLXC) Exec(command []string, env map[string]string, stdin *os.F
 	}
 
 	return 0, nil
+}
+
+func (c *containerLXC) cpuState() shared.ContainerStateCPU {
+	cpu := shared.ContainerStateCPU{}
+
+	if !cgCpuacctController {
+		return cpu
+	}
+
+	// CPU usage in seconds
+	value, err := c.CGroupGet("cpuacct.usage")
+	valueInt, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		valueInt = -1
+	}
+
+	cpu.Usage = valueInt
+
+	return cpu
 }
 
 func (c *containerLXC) diskState() map[string]shared.ContainerStateDisk {
@@ -3522,7 +3617,12 @@ func (c *containerLXC) tarStoreFile(linkmap map[uint64]string, offset int, tw *t
 		}
 	}
 
-	// TODO: handle xattrs
+	// Handle xattrs.
+	hdr.Xattrs, err = shared.GetAllXattr(path)
+	if err != nil {
+		return err
+	}
+
 	if err := tw.WriteHeader(hdr); err != nil {
 		return fmt.Errorf("error writing header: %s", err)
 	}
@@ -3782,7 +3882,7 @@ func (c *containerLXC) createUnixDevice(m shared.Device) (string, error) {
 	return devPath, nil
 }
 
-func (c *containerLXC) insertUnixDevice(name string, m shared.Device) error {
+func (c *containerLXC) insertUnixDevice(m shared.Device) error {
 	// Check that the container is running
 	if !c.IsRunning() {
 		return fmt.Errorf("Can't insert device into stopped container")
@@ -3814,6 +3914,19 @@ func (c *containerLXC) insertUnixDevice(name string, m shared.Device) error {
 	}
 
 	return nil
+}
+
+func (c *containerLXC) insertUSBDevice(m shared.Device, usb usbDevice) error {
+	temp := shared.Device{}
+	if err := shared.DeepCopy(&m, &temp); err != nil {
+		return err
+	}
+
+	temp["major"] = fmt.Sprintf("%d", usb.major)
+	temp["minor"] = fmt.Sprintf("%d", usb.minor)
+	temp["path"] = usb.path
+
+	return c.insertUnixDevice(temp)
 }
 
 func (c *containerLXC) removeUnixDevice(m shared.Device) error {
@@ -3867,6 +3980,36 @@ func (c *containerLXC) removeUnixDevice(m shared.Device) error {
 		return err
 	}
 
+	return nil
+}
+
+func (c *containerLXC) removeUSBDevice(m shared.Device, usb usbDevice) error {
+	pid := c.InitPID()
+	if pid == -1 {
+		return fmt.Errorf("Can't remove device from stopped container")
+	}
+
+	temp := shared.Device{}
+	if err := shared.DeepCopy(&m, &temp); err != nil {
+		return err
+	}
+
+	temp["major"] = fmt.Sprintf("%d", usb.major)
+	temp["minor"] = fmt.Sprintf("%d", usb.minor)
+	temp["path"] = usb.path
+
+	err := c.removeUnixDevice(temp)
+	if err != nil {
+		shared.Log.Error("failed to remove usb device", log.Ctx{"err": err, "usb": usb, "container": c.Name()})
+		return err
+	}
+
+	/* ok to fail here, there may be other usb
+	 * devices on this bus still left in the
+	 * container
+	 */
+	dir := fmt.Sprintf("/proc/%d/root/%s", pid, filepath.Dir(usb.path))
+	os.Remove(dir)
 	return nil
 }
 
