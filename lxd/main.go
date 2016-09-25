@@ -337,7 +337,7 @@ func cmdDaemon() error {
 		go memProfiler(*argMemProfile)
 	}
 
-	neededPrograms := []string{"setfacl", "rsync", "tar", "unsquashfs", "xz"}
+	neededPrograms := []string{"dnsmasq", "setfacl", "rsync", "tar", "unsquashfs", "xz"}
 	for _, p := range neededPrograms {
 		_, err := exec.LookPath(p)
 		if err != nil {
@@ -374,8 +374,7 @@ func cmdDaemon() error {
 		signal.Notify(ch, syscall.SIGPWR)
 		sig := <-ch
 
-		shared.Log.Info(
-			fmt.Sprintf("Received '%s signal', shutting down containers.", sig))
+		shared.LogInfof("Received '%s signal', shutting down containers.", sig)
 
 		containersShutdown(d)
 
@@ -386,8 +385,7 @@ func cmdDaemon() error {
 	go func() {
 		<-d.shutdownChan
 
-		shared.Log.Info(
-			fmt.Sprintf("Asked to shutdown by API, shutting down containers."))
+		shared.LogInfof("Asked to shutdown by API, shutting down containers.")
 
 		containersShutdown(d)
 
@@ -402,7 +400,7 @@ func cmdDaemon() error {
 		signal.Notify(ch, syscall.SIGTERM)
 		sig := <-ch
 
-		shared.Log.Info(fmt.Sprintf("Received '%s signal', exiting.", sig))
+		shared.LogInfof("Received '%s signal', exiting.", sig)
 		ret = d.Stop()
 		wg.Done()
 	}()
@@ -496,7 +494,7 @@ func cmdActivateIfNeeded() error {
 	// Look for network socket
 	value := daemonConfig["core.https_address"].Get()
 	if value != "" {
-		shared.Debugf("Daemon has core.https_address set, activating...")
+		shared.LogDebugf("Daemon has core.https_address set, activating...")
 		_, err := lxd.NewClient(&lxd.DefaultConfig, "local")
 		return err
 	}
@@ -523,19 +521,19 @@ func cmdActivateIfNeeded() error {
 		autoStart := config["boot.autostart"]
 
 		if c.IsRunning() {
-			shared.Debugf("Daemon has running containers, activating...")
+			shared.LogDebugf("Daemon has running containers, activating...")
 			_, err := lxd.NewClient(&lxd.DefaultConfig, "local")
 			return err
 		}
 
 		if lastState == "RUNNING" || lastState == "Running" || shared.IsTrue(autoStart) {
-			shared.Debugf("Daemon has auto-started containers, activating...")
+			shared.LogDebugf("Daemon has auto-started containers, activating...")
 			_, err := lxd.NewClient(&lxd.DefaultConfig, "local")
 			return err
 		}
 	}
 
-	shared.Debugf("No need to start the daemon now.")
+	shared.LogDebugf("No need to start the daemon now.")
 	return nil
 }
 
@@ -601,6 +599,9 @@ func cmdInit() error {
 	var networkPort int64     // Port
 	var trustPassword string  // Trust password
 	var imagesAutoUpdate bool // controls whether we set images.auto_update_interval to 0
+	var bridgeName string     // Bridge name
+	var bridgeIPv4 string     // IPv4 address
+	var bridgeIPv6 string     // IPv6 address
 
 	// Detect userns
 	defaultPrivileged = -1
@@ -675,7 +676,7 @@ func cmdInit() error {
 		}
 	}
 
-	askString := func(question string, default_ string, validate func(string) string) string {
+	askString := func(question string, default_ string, validate func(string) error) string {
 		for {
 			fmt.Printf(question)
 			input, _ := reader.ReadString('\n')
@@ -685,7 +686,7 @@ func cmdInit() error {
 			}
 			if validate != nil {
 				result := validate(input)
-				if result != "" {
+				if result != nil {
 					fmt.Printf("Invalid input: %s\n\n", result)
 					continue
 				}
@@ -820,11 +821,11 @@ func cmdInit() error {
 			if askBool("Create a new ZFS pool (yes/no) [default=yes]? ", "yes") {
 				storagePool = askString("Name of the new ZFS pool [default=lxd]: ", "lxd", nil)
 				if askBool("Would you like to use an existing block device (yes/no) [default=no]? ", "no") {
-					deviceExists := func(path string) string {
+					deviceExists := func(path string) error {
 						if !shared.IsBlockdevPath(path) {
-							return fmt.Sprintf("'%s' is not a block device", path)
+							return fmt.Errorf("'%s' is not a block device", path)
 						}
-						return ""
+						return nil
 					}
 					storageDevice = askString("Path to the existing block device: ", "", deviceExists)
 					storageMode = "device"
@@ -874,11 +875,11 @@ they otherwise would.
 		}
 
 		if askBool("Would you like LXD to be available over the network (yes/no) [default=no]? ", "no") {
-			isIPAddress := func(s string) string {
+			isIPAddress := func(s string) error {
 				if s != "all" && net.ParseIP(s) == nil {
-					return fmt.Sprintf("'%s' is not an IP address", s)
+					return fmt.Errorf("'%s' is not an IP address", s)
 				}
-				return ""
+				return nil
 			}
 
 			networkAddress = askString("Address to bind LXD to (not including port) [default=all]: ", "all", isIPAddress)
@@ -895,6 +896,23 @@ they otherwise would.
 
 		if !askBool("Would you like stale cached images to be updated automatically? (yes/no) [default=yes]? ", "yes") {
 			imagesAutoUpdate = false
+		}
+
+		if askBool("Would you like to create a new network bridge (yes/no) [default=yes]? ", "yes") {
+			bridgeName = askString("What should the new bridge be called [default=lxdbr0]? ", "lxdbr0", networkValidName)
+			bridgeIPv4 = askString("What IPv4 subnet should be used (CIDR notation, “auto” or “none”) [default=auto]? ", "auto", func(value string) error {
+				if shared.StringInSlice(value, []string{"auto", "none"}) {
+					return nil
+				}
+				return networkValidAddressCIDRV4(value)
+			})
+
+			bridgeIPv6 = askString("What IPv4 subnet should be used (CIDR notation, “auto” or “none”) [default=auto]? ", "auto", func(value string) error {
+				if shared.StringInSlice(value, []string{"auto", "none"}) {
+					return nil
+				}
+				return networkValidAddressCIDRV6(value)
+			})
 		}
 	}
 
@@ -945,7 +963,7 @@ they otherwise would.
 			output, err := exec.Command(
 				"zpool",
 				"create", storagePool, storageDevice,
-				"-f", "-m", "none").CombinedOutput()
+				"-f", "-m", "none", "-O", "compression=on").CombinedOutput()
 			if err != nil {
 				return fmt.Errorf("Failed to create the ZFS pool: %s", output)
 			}
@@ -998,6 +1016,17 @@ they otherwise would.
 			if err != nil {
 				return err
 			}
+		}
+	}
+
+	if bridgeName != "" {
+		bridgeConfig := map[string]string{}
+		bridgeConfig["ipv4.address"] = bridgeIPv4
+		bridgeConfig["ipv6.address"] = bridgeIPv6
+
+		err = c.NetworkCreate(bridgeName, bridgeConfig)
+		if err != nil {
+			return err
 		}
 	}
 

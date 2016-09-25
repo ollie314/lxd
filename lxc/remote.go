@@ -24,7 +24,6 @@ import (
 )
 
 type remoteCmd struct {
-	httpAddr   string
 	acceptCert bool
 	password   string
 	public     bool
@@ -295,7 +294,7 @@ func (c *remoteCmd) addServer(config *lxd.Config, server string, addr string, ac
 
 func (c *remoteCmd) removeCertificate(config *lxd.Config, remote string) {
 	certf := config.ServerCertPath(remote)
-	shared.Debugf("Trying to remove %s", certf)
+	shared.LogDebugf("Trying to remove %s", certf)
 
 	os.Remove(certf)
 }

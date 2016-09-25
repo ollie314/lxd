@@ -20,7 +20,7 @@ import (
 func storageLVMCheckVolumeGroup(vgName string) error {
 	output, err := exec.Command("vgdisplay", "-s", vgName).CombinedOutput()
 	if err != nil {
-		shared.Log.Debug("vgdisplay failed to find vg", log.Ctx{"output": string(output)})
+		shared.LogDebug("vgdisplay failed to find vg", log.Ctx{"output": string(output)})
 		return fmt.Errorf("LVM volume group '%s' not found", vgName)
 	}
 
@@ -322,7 +322,8 @@ func (s *storageLvm) ContainerCreateFromImage(
 		}
 	}
 
-	err = tryMount(lvpath, destPath, fstype, 0, "discard")
+	mountOptions := daemonConfig["storage.lvm_mount_options"].Get()
+	err = tryMount(lvpath, destPath, fstype, 0, mountOptions)
 	if err != nil {
 		s.ContainerDelete(container)
 		return fmt.Errorf("Error mounting snapshot LV: %v", err)
@@ -430,7 +431,8 @@ func (s *storageLvm) ContainerStart(container container) error {
 	lvpath := fmt.Sprintf("/dev/%s/%s", s.vgName, lvName)
 	fstype := daemonConfig["storage.lvm_fstype"].Get()
 
-	err := tryMount(lvpath, container.Path(), fstype, 0, "discard")
+	mountOptions := daemonConfig["storage.lvm_mount_options"].Get()
+	err := tryMount(lvpath, container.Path(), fstype, 0, mountOptions)
 	if err != nil {
 		return fmt.Errorf(
 			"Error mounting snapshot LV path='%s': %v",
@@ -557,7 +559,7 @@ func (s *storageLvm) createSnapshotContainer(
 
 	srcName := containerNameToLVName(sourceContainer.Name())
 	destName := containerNameToLVName(snapshotContainer.Name())
-	shared.Log.Debug(
+	shared.LogDebug(
 		"Creating snapshot",
 		log.Ctx{"srcName": srcName, "destName": destName})
 
@@ -649,7 +651,7 @@ func (s *storageLvm) ContainerSnapshotStart(container container) error {
 	srcName := containerNameToLVName(container.Name())
 	destName := containerNameToLVName(container.Name() + "/rw")
 
-	shared.Log.Debug(
+	shared.LogDebug(
 		"Creating snapshot",
 		log.Ctx{"srcName": srcName, "destName": destName})
 
@@ -675,7 +677,8 @@ func (s *storageLvm) ContainerSnapshotStart(container container) error {
 		}
 	}
 
-	err = tryMount(lvpath, container.Path(), fstype, 0, "discard")
+	mountOptions := daemonConfig["storage.lvm_mount_options"].Get()
+	err = tryMount(lvpath, container.Path(), fstype, 0, mountOptions)
 	if err != nil {
 		return fmt.Errorf(
 			"Error mounting snapshot LV path='%s': %v",
@@ -730,9 +733,10 @@ func (s *storageLvm) ImageCreate(fingerprint string) error {
 	}()
 
 	fstype := daemonConfig["storage.lvm_fstype"].Get()
-	err = tryMount(lvpath, tempLVMountPoint, fstype, 0, "discard")
+	mountOptions := daemonConfig["storage.lvm_mount_options"].Get()
+	err = tryMount(lvpath, tempLVMountPoint, fstype, 0, mountOptions)
 	if err != nil {
-		shared.Logf("Error mounting image LV for unpacking: %v", err)
+		shared.LogInfof("Error mounting image LV for unpacking: %v", err)
 		return fmt.Errorf("Error mounting image LV: %v", err)
 	}
 
@@ -972,6 +976,6 @@ func (s *storageLvm) MigrationSource(container container) (MigrationStorageSourc
 	return rsyncMigrationSource(container)
 }
 
-func (s *storageLvm) MigrationSink(live bool, container container, snapshots []container, conn *websocket.Conn) error {
-	return rsyncMigrationSink(live, container, snapshots, conn)
+func (s *storageLvm) MigrationSink(live bool, container container, snapshots []*Snapshot, conn *websocket.Conn, srcIdmap *shared.IdmapSet) error {
+	return rsyncMigrationSink(live, container, snapshots, conn, srcIdmap)
 }

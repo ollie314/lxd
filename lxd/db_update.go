@@ -67,6 +67,7 @@ var dbUpdates = []dbUpdate{
 	dbUpdate{version: 31, run: dbUpdateFromV30},
 	dbUpdate{version: 32, run: dbUpdateFromV31},
 	dbUpdate{version: 33, run: dbUpdateFromV32},
+	dbUpdate{version: 34, run: dbUpdateFromV33},
 }
 
 type dbUpdate struct {
@@ -77,7 +78,7 @@ type dbUpdate struct {
 func (u *dbUpdate) apply(currentVersion int, d *Daemon) error {
 	// Get the current schema version
 
-	shared.Debugf("Updating DB schema from %d to %d", currentVersion, u.version)
+	shared.LogDebugf("Updating DB schema from %d to %d", currentVersion, u.version)
 
 	err := u.run(currentVersion, u.version, d)
 	if err != nil {
@@ -101,8 +102,8 @@ func dbUpdatesApplyAll(d *Daemon) error {
 			continue
 		}
 
-		if !backup {
-			shared.Log.Info("Updating the LXD database schema. Backup made as \"lxd.db.bak\"")
+		if !d.MockMode && !backup {
+			shared.LogInfof("Updating the LXD database schema. Backup made as \"lxd.db.bak\"")
 			err := shared.FileCopy(shared.VarPath("lxd.db"), shared.VarPath("lxd.db.bak"))
 			if err != nil {
 				return err
@@ -123,6 +124,25 @@ func dbUpdatesApplyAll(d *Daemon) error {
 }
 
 // Schema updates begin here
+func dbUpdateFromV33(currentVersion int, version int, d *Daemon) error {
+	stmt := `
+CREATE TABLE IF NOT EXISTS networks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    UNIQUE (name)
+);
+CREATE TABLE IF NOT EXISTS networks_config (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    network_id INTEGER NOT NULL,
+    key VARCHAR(255) NOT NULL,
+    value TEXT,
+    UNIQUE (network_id, key),
+    FOREIGN KEY (network_id) REFERENCES networks (id) ON DELETE CASCADE
+);`
+	_, err := d.db.Exec(stmt)
+	return err
+}
+
 func dbUpdateFromV32(currentVersion int, version int, d *Daemon) error {
 	_, err := d.db.Exec("ALTER TABLE containers ADD COLUMN last_use_date DATETIME;")
 	return err
@@ -315,7 +335,7 @@ func dbUpdateFromV18(currentVersion int, version int, d *Daemon) error {
 		// Deal with completely broken values
 		_, err = shared.ParseByteSizeString(value)
 		if err != nil {
-			shared.Debugf("Invalid container memory limit, id=%d value=%s, removing.", id, value)
+			shared.LogDebugf("Invalid container memory limit, id=%d value=%s, removing.", id, value)
 			_, err = d.db.Exec("DELETE FROM containers_config WHERE id=?;", id)
 			if err != nil {
 				return err
@@ -352,7 +372,7 @@ func dbUpdateFromV18(currentVersion int, version int, d *Daemon) error {
 		// Deal with completely broken values
 		_, err = shared.ParseByteSizeString(value)
 		if err != nil {
-			shared.Debugf("Invalid profile memory limit, id=%d value=%s, removing.", id, value)
+			shared.LogDebugf("Invalid profile memory limit, id=%d value=%s, removing.", id, value)
 			_, err = d.db.Exec("DELETE FROM profiles_config WHERE id=?;", id)
 			if err != nil {
 				return err
@@ -418,11 +438,11 @@ func dbUpdateFromV15(currentVersion int, version int, d *Daemon) error {
 		newLVName = strings.Replace(newLVName, shared.SnapshotDelimiter, "-", -1)
 
 		if cName == newLVName {
-			shared.Log.Debug("No need to rename, skipping", log.Ctx{"cName": cName, "newLVName": newLVName})
+			shared.LogDebug("No need to rename, skipping", log.Ctx{"cName": cName, "newLVName": newLVName})
 			continue
 		}
 
-		shared.Log.Debug("About to rename cName in lv upgrade", log.Ctx{"lvLinkPath": lvLinkPath, "cName": cName, "newLVName": newLVName})
+		shared.LogDebug("About to rename cName in lv upgrade", log.Ctx{"lvLinkPath": lvLinkPath, "cName": cName, "newLVName": newLVName})
 
 		output, err := exec.Command("lvrename", vgName, cName, newLVName).CombinedOutput()
 		if err != nil {
@@ -508,7 +528,7 @@ func dbUpdateFromV11(currentVersion int, version int, d *Daemon) error {
 		oldPath := shared.VarPath("containers", snappieces[0], "snapshots", snappieces[1])
 		newPath := shared.VarPath("snapshots", snappieces[0], snappieces[1])
 		if shared.PathExists(oldPath) && !shared.PathExists(newPath) {
-			shared.Log.Info(
+			shared.LogInfo(
 				"Moving snapshot",
 				log.Ctx{
 					"snapshot": cName,
@@ -521,7 +541,7 @@ func dbUpdateFromV11(currentVersion int, version int, d *Daemon) error {
 			// snapshots/<container>/<snap0>
 			output, err := storageRsyncCopy(oldPath, newPath)
 			if err != nil {
-				shared.Log.Error(
+				shared.LogError(
 					"Failed rsync snapshot",
 					log.Ctx{
 						"snapshot": cName,
@@ -533,7 +553,7 @@ func dbUpdateFromV11(currentVersion int, version int, d *Daemon) error {
 
 			// Remove containers/<container>/snapshots/<snap0>
 			if err := os.RemoveAll(oldPath); err != nil {
-				shared.Log.Error(
+				shared.LogError(
 					"Failed to remove the old snapshot path",
 					log.Ctx{
 						"snapshot": cName,
@@ -576,7 +596,7 @@ func dbUpdateFromV10(currentVersion int, version int, d *Daemon) error {
 			return err
 		}
 
-		shared.Debugf("Restarting all the containers following directory rename")
+		shared.LogDebugf("Restarting all the containers following directory rename")
 		containersShutdown(d)
 		containersRestart(d)
 	}
@@ -853,12 +873,7 @@ CREATE TABLE IF NOT EXISTS config (
 
 func dbUpdateFromV3(currentVersion int, version int, d *Daemon) error {
 	// Attempt to create a default profile (but don't fail if already there)
-	stmt := `INSERT INTO profiles (name) VALUES ("default");
-INSERT INTO profiles_devices (profile_id, name, type) SELECT id, "eth0", "nic" FROM profiles WHERE profiles.name="default";
-INSERT INTO profiles_devices_config (profile_device_id, key, value) SELECT profiles_devices.id, "nictype", "bridged" FROM profiles_devices LEFT JOIN profiles ON profiles.id=profiles_devices.profile_id WHERE profiles.name == "default";
-INSERT INTO profiles_devices_config (profile_device_id, key, value) SELECT profiles_devices.id, 'name', "eth0" FROM profiles_devices LEFT JOIN profiles ON profiles.id=profiles_devices.profile_id WHERE profiles.name == "default";
-INSERT INTO profiles_devices_config (profile_device_id, key, value) SELECT profiles_devices.id, "parent", "lxdbr0" FROM profiles_devices LEFT JOIN profiles ON profiles.id=profiles_devices.profile_id WHERE profiles.name == "default";`
-	d.db.Exec(stmt)
+	d.db.Exec("INSERT INTO profiles (name) VALUES (\"default\");")
 
 	return nil
 }

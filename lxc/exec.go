@@ -45,7 +45,7 @@ func (c *execCmd) usage() string {
 	return i18n.G(
 		`Execute the specified command in a container.
 
-lxc exec [remote:]container [--mode=auto|interactive|non-interactive] [--env EDITOR=/usr/bin/vim]... <command>
+lxc exec [remote:]container [--mode=auto|interactive|non-interactive] [--env EDITOR=/usr/bin/vim]... [--] <command line>
 
 Mode defaults to non-interactive, interactive mode is selected if both stdin AND stdout are terminals (stderr is ignored).`)
 }
@@ -61,7 +61,7 @@ func (c *execCmd) sendTermSize(control *websocket.Conn) error {
 		return err
 	}
 
-	shared.Debugf("Window size is now: %dx%d", width, height)
+	shared.LogDebugf("Window size is now: %dx%d", width, height)
 
 	w, err := control.NextWriter(websocket.TextMessage)
 	if err != nil {

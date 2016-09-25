@@ -291,7 +291,7 @@ func createFromMigration(d *Daemon, req *containerPostReq) Response {
 		err = sink()
 		if err != nil {
 			c.StorageStop()
-			shared.Log.Error("Error during migration sink", "err", err)
+			shared.LogError("Error during migration sink", log.Ctx{"err": err})
 			c.Delete()
 			return fmt.Errorf("Error transferring container data: %s", err)
 		}
@@ -336,7 +336,7 @@ func createFromCopy(d *Daemon, req *containerPostReq) Response {
 
 	for key, value := range sourceConfig {
 		if len(key) > 8 && key[0:8] == "volatile" && key[9:] != "base_image" {
-			shared.Log.Debug("Skipping volatile key from copy source",
+			shared.LogDebug("Skipping volatile key from copy source",
 				log.Ctx{"key": key})
 			continue
 		}
@@ -386,7 +386,7 @@ func createFromCopy(d *Daemon, req *containerPostReq) Response {
 }
 
 func containersPost(d *Daemon, r *http.Request) Response {
-	shared.Debugf("Responding to container create")
+	shared.LogDebugf("Responding to container create")
 
 	req := containerPostReq{}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -411,7 +411,7 @@ func containersPost(d *Daemon, r *http.Request) Response {
 				return InternalError(fmt.Errorf("couldn't generate a new unique name after 100 tries"))
 			}
 		}
-		shared.Debugf("No name provided, creating %s", req.Name)
+		shared.LogDebugf("No name provided, creating %s", req.Name)
 	}
 
 	if req.Devices == nil {
