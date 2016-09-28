@@ -388,7 +388,12 @@ func (c *containerLXC) initLXC() error {
 	}
 
 	// Base config
-	err = lxcSetConfigItem(cc, "lxc.cap.drop", "mac_admin mac_override sys_time sys_module sys_rawio")
+	toDrop := "sys_time sys_module sys_rawio"
+	if !aaStacking || c.IsPrivileged() {
+		toDrop = toDrop + " mac_admin mac_override"
+	}
+
+	err = lxcSetConfigItem(cc, "lxc.cap.drop", toDrop)
 	if err != nil {
 		return err
 	}
@@ -587,7 +592,20 @@ func (c *containerLXC) initLXC() error {
 			}
 		} else {
 			// If not currently confined, use the container's profile
-			err := lxcSetConfigItem(cc, "lxc.aa_profile", AAProfileFull(c))
+			profile := AAProfileFull(c)
+
+			/* In the nesting case, we want to enable the inside
+			 * LXD to load its profile. Unprivileged containers can
+			 * load profiles, but privileged containers cannot, so
+			 * let's not use a namespace so they can fall back to
+			 * the old way of nesting, i.e. using the parent's
+			 * profile.
+			 */
+			if aaStacking && (!c.IsNesting() || !c.IsPrivileged()) {
+				profile = fmt.Sprintf("%s//&:%s:", profile, AANamespace(c))
+			}
+
+			err := lxcSetConfigItem(cc, "lxc.aa_profile", profile)
 			if err != nil {
 				return err
 			}
@@ -873,8 +891,16 @@ func (c *containerLXC) initLXC() error {
 			}
 
 			// Host Virtual NIC name
+			vethName := ""
 			if m["host_name"] != "" {
-				err = lxcSetConfigItem(cc, "lxc.network.veth.pair", m["host_name"])
+				vethName = m["host_name"]
+			} else if shared.IsTrue(m["security.mac_filtering"]) {
+				// We need a known device name for MAC filtering
+				vethName = deviceNextVeth()
+			}
+
+			if vethName != "" {
+				err = lxcSetConfigItem(cc, "lxc.network.veth.pair", vethName)
 				if err != nil {
 					return err
 				}
@@ -1177,6 +1203,7 @@ func (c *containerLXC) startCommon() (string, error) {
 	// Cleanup any existing leftover devices
 	c.removeUnixDevices()
 	c.removeDiskDevices()
+	c.removeNetworkFilters()
 
 	var usbs []usbDevice
 
@@ -1260,6 +1287,44 @@ func (c *containerLXC) startCommon() (string, error) {
 			// Disk device
 			if m["path"] != "/" {
 				_, err := c.createDiskDevice(k, m)
+				if err != nil {
+					return "", err
+				}
+			}
+		} else if m["type"] == "nic" {
+			if m["nictype"] == "bridged" && shared.IsTrue(m["security.mac_filtering"]) {
+				m, err = c.fillNetworkDevice(k, m)
+				if err != nil {
+					return "", err
+				}
+
+				// Read device name from config
+				vethName := ""
+				for i := 0; i < len(c.c.ConfigItem("lxc.network")); i++ {
+					val := c.c.ConfigItem(fmt.Sprintf("lxc.network.%d.hwaddr", i))
+					if len(val) == 0 || val[0] != m["hwaddr"] {
+						continue
+					}
+
+					val = c.c.ConfigItem(fmt.Sprintf("lxc.network.%d.link", i))
+					if len(val) == 0 || val[0] != m["parent"] {
+						continue
+					}
+
+					val = c.c.ConfigItem(fmt.Sprintf("lxc.network.%d.veth.pair", i))
+					if len(val) == 0 {
+						continue
+					}
+
+					vethName = val[0]
+					break
+				}
+
+				if vethName == "" {
+					return "", fmt.Errorf("Failed to find device name for mac_filtering")
+				}
+
+				err = c.createNetworkFilter(vethName, m["parent"], m["hwaddr"])
 				if err != nil {
 					return "", err
 				}
@@ -1702,7 +1767,9 @@ func (c *containerLXC) OnStop(target string) error {
 	}
 
 	// Unload the apparmor profile
-	AAUnloadProfile(c)
+	if err := AADestroy(c); err != nil {
+		shared.LogError("failed to destroy apparmor namespace", log.Ctx{"container": c.Name(), "err": err})
+	}
 
 	// FIXME: The go routine can go away once we can rely on LXC_TARGET
 	go func(c *containerLXC, target string, op *lxcContainerOperation) {
@@ -1744,6 +1811,12 @@ func (c *containerLXC) OnStop(target string) error {
 		err = c.removeDiskDevices()
 		if err != nil {
 			shared.LogError("Unable to remove disk devices", log.Ctx{"err": err})
+		}
+
+		// Clean all network filters
+		err = c.removeNetworkFilters()
+		if err != nil {
+			shared.LogError("Unable to remove network filters", log.Ctx{"err": err})
 		}
 
 		// Reboot the container
@@ -2055,6 +2128,7 @@ func (c *containerLXC) cleanup() {
 	// Unmount any leftovers
 	c.removeUnixDevices()
 	c.removeDiskDevices()
+	c.removeNetworkFilters()
 
 	// Remove the security profiles
 	AADeleteProfile(c)
@@ -3045,7 +3119,7 @@ func getCRIULogErrors(imagesDir string, method string) (string, error) {
 	ret := []string{}
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.Contains(line, "Error") {
+		if strings.Contains(line, "Error") || strings.Contains(line, "Warn") {
 			ret = append(ret, scanner.Text())
 		}
 	}
@@ -4303,6 +4377,14 @@ func (c *containerLXC) createNetworkDevice(name string, m shared.Device) (string
 		return "", fmt.Errorf("Failed to bring up the interface: %s", err)
 	}
 
+	// Set the filter
+	if m["nictype"] == "bridged" && shared.IsTrue(m["security.mac_filtering"]) {
+		err = c.createNetworkFilter(dev, m["parent"], m["hwaddr"])
+		if err != nil {
+			return "", err
+		}
+	}
+
 	return dev, nil
 }
 
@@ -4441,6 +4523,70 @@ func (c *containerLXC) fillNetworkDevice(name string, m shared.Device) (shared.D
 	return newDevice, nil
 }
 
+func (c *containerLXC) createNetworkFilter(name string, bridge string, hwaddr string) error {
+	err := shared.RunCommand("ebtables", "-A", "FORWARD", "-s", "!", hwaddr, "-i", name, "-o", bridge, "-j", "DROP")
+	if err != nil {
+		return err
+	}
+
+	err = shared.RunCommand("ebtables", "-A", "INPUT", "-s", "!", hwaddr, "-i", name, "-j", "DROP")
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *containerLXC) removeNetworkFilter(hwaddr string, bridge string) error {
+	out, err := exec.Command("ebtables", "-L", "--Lmac2", "--Lx").Output()
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		fields := strings.Fields(line)
+
+		if len(fields) == 12 {
+			match := []string{"ebtables", "-t", "filter", "-A", "INPUT", "-s", "!", hwaddr, "-i", fields[9], "-j", "DROP"}
+			if reflect.DeepEqual(fields, match) {
+				fields[3] = "-D"
+				err = shared.RunCommand(fields[0], fields[1:]...)
+				if err != nil {
+					return err
+				}
+			}
+		} else if len(fields) == 14 {
+			match := []string{"ebtables", "-t", "filter", "-A", "FORWARD", "-s", "!", hwaddr, "-i", fields[9], "-o", bridge, "-j", "DROP"}
+			if reflect.DeepEqual(fields, match) {
+				fields[3] = "-D"
+				err = shared.RunCommand(fields[0], fields[1:]...)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (c *containerLXC) removeNetworkFilters() error {
+	for k, m := range c.expandedDevices {
+		m, err := c.fillNetworkDevice(k, m)
+		if err != nil {
+			return err
+		}
+
+		if m["type"] != "nic" || m["nictype"] != "bridged" {
+			continue
+		}
+
+		err = c.removeNetworkFilter(m["hwaddr"], m["parent"])
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (c *containerLXC) insertNetworkDevice(name string, m shared.Device) error {
 	// Load the go-lxc struct
 	err := c.initLXC()
@@ -4519,6 +4665,14 @@ func (c *containerLXC) removeNetworkDevice(name string, m shared.Device) error {
 	// If a veth, destroy it
 	if m["nictype"] != "physical" {
 		deviceRemoveInterface(hostName)
+	}
+
+	// Remove any filter
+	if m["nictype"] == "bridged" {
+		err = c.removeNetworkFilter(m["hwaddr"], m["parent"])
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
