@@ -149,9 +149,15 @@ func (c *copyCmd) copyContainer(config *lxd.Config, sourceResource string, destR
 	}
 
 	sourceProfs := shared.NewStringSet(status.Profiles)
-	destProfs, err := dest.ListProfiles()
+	destProfs := []string{}
+
+	profiles, err := dest.ListProfiles()
 	if err != nil {
 		return err
+	}
+
+	for _, profile := range profiles {
+		destProfs = append(destProfs, profile.Name)
 	}
 
 	if !sourceProfs.IsSubset(shared.NewStringSet(destProfs)) {
@@ -204,11 +210,14 @@ func (c *copyCmd) copyContainer(config *lxd.Config, sourceResource string, destR
 		var migration *lxd.Response
 
 		sourceWSUrl := "https://" + addr + sourceWSResponse.Operation
-		migration, err = dest.MigrateFrom(destName, sourceWSUrl, source.Certificate, secrets, status.Architecture, status.Config, status.Devices, status.Profiles, baseImage, ephemeral == 1)
+		migration, err = dest.MigrateFrom(destName, sourceWSUrl, source.Certificate, secrets, status.Architecture, status.Config, status.Devices, status.Profiles, baseImage, ephemeral == 1, false, source, sourceWSResponse.Operation)
 		if err != nil {
 			continue
 		}
 
+		// If push mode is implemented then MigrateFrom will return a
+		// non-waitable operation. So this needs to be conditionalized
+		// on pull mode.
 		if err = dest.WaitForSuccess(migration.Operation); err != nil {
 			return err
 		}

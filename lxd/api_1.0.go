@@ -70,6 +70,8 @@ func api10Get(d *Daemon, r *http.Request) Response {
 			"storage_zfs_use_refquota",
 			"storage_lvm_mount_options",
 			"network",
+			"profile_usedby",
+			"container_push",
 		},
 
 		"api_status":  "stable",
