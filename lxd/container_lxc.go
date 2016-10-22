@@ -1111,9 +1111,9 @@ func (c *containerLXC) startCommon() (string, error) {
 	if kernelModules != "" {
 		for _, module := range strings.Split(kernelModules, ",") {
 			module = strings.TrimPrefix(module, " ")
-			out, err := exec.Command("modprobe", module).CombinedOutput()
+			err := loadModule(module)
 			if err != nil {
-				return "", fmt.Errorf("Failed to load kernel module '%s': %s", module, out)
+				return "", fmt.Errorf("Failed to load kernel module '%s': %s", module, err)
 			}
 		}
 	}
@@ -1753,6 +1753,12 @@ func (c *containerLXC) Shutdown(timeout time.Duration) error {
 }
 
 func (c *containerLXC) OnStop(target string) error {
+	// Validate target
+	if !shared.StringInSlice(target, []string{"stop", "reboot"}) {
+		shared.LogError("Container sent invalid target to OnStop", log.Ctx{"container": c.Name(), "target": target})
+		return fmt.Errorf("Invalid stop target: %s", target)
+	}
+
 	// Get operation
 	op, _ := c.getOperation("")
 	if op != nil && !shared.StringInSlice(op.action, []string{"stop", "shutdown"}) {
@@ -1772,79 +1778,58 @@ func (c *containerLXC) OnStop(target string) error {
 		return err
 	}
 
-	// Unload the apparmor profile
-	if err := AADestroy(c); err != nil {
-		shared.LogError("failed to destroy apparmor namespace", log.Ctx{"container": c.Name(), "err": err})
+	// Log user actions
+	if op == nil {
+		ctxMap := log.Ctx{"name": c.name,
+			"action":    target,
+			"created":   c.creationDate,
+			"ephemeral": c.ephemeral,
+			"used":      c.lastUsedDate,
+			"stateful":  false}
+
+		shared.LogInfo(fmt.Sprintf("Container initiated %s", target), ctxMap)
 	}
 
-	// FIXME: The go routine can go away once we can rely on LXC_TARGET
 	go func(c *containerLXC, target string, op *lxcContainerOperation) {
 		c.fromHook = false
+		err = nil
 
 		// Unlock on return
 		if op != nil {
-			defer op.Done(nil)
+			defer op.Done(err)
 		}
 
-		if target == "unknown" && op != nil {
-			target = "stop"
-		}
+		// Wait for other post-stop actions to be done
+		c.IsRunning()
 
-		if target == "unknown" {
-			time.Sleep(5 * time.Second)
-
-			newContainer, err := containerLoadByName(c.daemon, c.Name())
-			if err != nil {
-				return
-			}
-
-			if newContainer.Id() != c.id {
-				return
-			}
-
-			if newContainer.IsRunning() {
-				return
-			}
+		// Unload the apparmor profile
+		err = AADestroy(c)
+		if err != nil {
+			shared.LogError("Failed to destroy apparmor namespace", log.Ctx{"container": c.Name(), "err": err})
 		}
 
 		// Clean all the unix devices
 		err = c.removeUnixDevices()
 		if err != nil {
-			shared.LogError("Unable to remove unix devices", log.Ctx{"err": err})
+			shared.LogError("Unable to remove unix devices", log.Ctx{"container": c.Name(), "err": err})
 		}
 
 		// Clean all the disk devices
 		err = c.removeDiskDevices()
 		if err != nil {
-			shared.LogError("Unable to remove disk devices", log.Ctx{"err": err})
+			shared.LogError("Unable to remove disk devices", log.Ctx{"container": c.Name(), "err": err})
 		}
 
 		// Clean all network filters
 		err = c.removeNetworkFilters()
 		if err != nil {
-			shared.LogError("Unable to remove network filters", log.Ctx{"err": err})
+			shared.LogError("Unable to remove network filters", log.Ctx{"container": c.Name(), "err": err})
 		}
 
 		// Reboot the container
 		if target == "reboot" {
-
-			/* This part is a hack to workaround a LXC bug where a
-			   failure from a post-stop script doesn't prevent the container to restart. */
-			ephemeral := c.ephemeral
-			args := containerArgs{
-				Architecture: c.Architecture(),
-				Config:       c.LocalConfig(),
-				Devices:      c.LocalDevices(),
-				Ephemeral:    false,
-				Profiles:     c.Profiles(),
-			}
-			c.Update(args, false)
-			c.Stop(false)
-			args.Ephemeral = ephemeral
-			c.Update(args, true)
-
 			// Start the container again
-			c.Start(false)
+			err = c.Start(false)
 			return
 		}
 
@@ -1854,12 +1839,12 @@ func (c *containerLXC) OnStop(target string) error {
 		// Record current state
 		err = dbContainerSetState(c.daemon.db, c.id, "STOPPED")
 		if err != nil {
-			return
+			shared.LogError("Failed to set container state", log.Ctx{"container": c.Name(), "err": err})
 		}
 
 		// Destroy ephemeral containers
 		if c.ephemeral {
-			c.Delete()
+			err = c.Delete()
 		}
 	}(c, target, op)
 
@@ -2587,9 +2572,9 @@ func (c *containerLXC) Update(args containerArgs, userRequested bool) error {
 			} else if key == "linux.kernel_modules" && value != "" {
 				for _, module := range strings.Split(value, ",") {
 					module = strings.TrimPrefix(module, " ")
-					out, err := exec.Command("modprobe", module).CombinedOutput()
+					err := loadModule(module)
 					if err != nil {
-						return fmt.Errorf("Failed to load kernel module '%s': %s", module, out)
+						return fmt.Errorf("Failed to load kernel module '%s': %s", module, err)
 					}
 				}
 			} else if key == "limits.disk.priority" {
@@ -3635,14 +3620,24 @@ func (c *containerLXC) FilePush(srcpath string, dstpath string, uid int, gid int
 	return nil
 }
 
-func (c *containerLXC) Exec(command []string, env map[string]string, stdin *os.File, stdout *os.File, stderr *os.File) (int, error) {
+func (c *containerLXC) prepareExec(waitOnPid bool, command []string, env map[string]string, stdin *os.File, stdout *os.File, stderr *os.File) ([]string, *exec.Cmd) {
 	envSlice := []string{}
 
 	for k, v := range env {
 		envSlice = append(envSlice, fmt.Sprintf("%s=%s", k, v))
 	}
 
-	args := []string{execPath, "forkexec", c.name, c.daemon.lxcpath, filepath.Join(c.LogPath(), "lxc.conf")}
+	// Setting "wait"/"nowait" as the second argument in cmd.Args allows us
+	// to tell execContainer() that it should call an appropriate go-lxc
+	// wrapper for c->attach() that executes the command we requested in the
+	// container and, depending on whether we passed "wait" or "nowait" does
+	// wait or not wait for it to exit.
+	var args []string
+	if waitOnPid {
+		args = []string{execPath, "forkexec", "wait", c.name, c.daemon.lxcpath, filepath.Join(c.LogPath(), "lxc.conf")}
+	} else {
+		args = []string{execPath, "forkexec", "nowait", c.name, c.daemon.lxcpath, filepath.Join(c.LogPath(), "lxc.conf")}
+	}
 
 	args = append(args, "--")
 	args = append(args, "env")
@@ -3660,24 +3655,34 @@ func (c *containerLXC) Exec(command []string, env map[string]string, stdin *os.F
 	cmd.Stderr = stderr
 
 	shared.LogInfo("Executing command", log.Ctx{"environment": envSlice, "args": args})
+	return envSlice, &cmd
+}
 
+func (c *containerLXC) Exec(command []string, env map[string]string, stdin *os.File, stdout *os.File, stderr *os.File) (int, error) {
+	envSlice, cmd := c.prepareExec(true, command, env, stdin, stdout, stderr)
 	err := cmd.Run()
 	if err != nil {
 		exitErr, ok := err.(*exec.ExitError)
 		if ok {
 			status, ok := exitErr.Sys().(syscall.WaitStatus)
 			if ok {
-				shared.LogInfo("Executed command", log.Ctx{"environment": envSlice, "args": args, "exit_status": status.ExitStatus()})
+				shared.LogInfo("Executed command", log.Ctx{"environment": envSlice, "args": cmd.Args, "exit_status": status.ExitStatus()})
 				return status.ExitStatus(), nil
 			}
 		}
 
-		shared.LogInfo("Failed executing command", log.Ctx{"environment": envSlice, "args": args, "err": err})
+		shared.LogInfo("Failed executing command", log.Ctx{"environment": envSlice, "args": cmd.Args, "err": err})
 		return -1, err
 	}
 
-	shared.LogInfo("Executed command", log.Ctx{"environment": envSlice, "args": args})
+	shared.LogInfo("Executed command", log.Ctx{"environment": envSlice, "args": cmd.Args})
 	return 0, nil
+}
+
+func (c *containerLXC) ExecNoWait(command []string, env map[string]string, stdin *os.File, stdout *os.File, stderr *os.File, pidPipe *os.File) (*exec.Cmd, error) {
+	_, cmd := c.prepareExec(false, command, env, stdin, stdout, stderr)
+	cmd.ExtraFiles = []*os.File{pidPipe}
+	return cmd, nil
 }
 
 func (c *containerLXC) cpuState() shared.ContainerStateCPU {

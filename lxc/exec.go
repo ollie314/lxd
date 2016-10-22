@@ -84,6 +84,28 @@ func (c *execCmd) sendTermSize(control *websocket.Conn) error {
 	return err
 }
 
+func (c *execCmd) forwardSignal(control *websocket.Conn, sig syscall.Signal) error {
+	shared.LogDebugf("Forwarding signal: %s", sig)
+
+	w, err := control.NextWriter(websocket.TextMessage)
+	if err != nil {
+		return err
+	}
+
+	msg := shared.ContainerExecControl{}
+	msg.Command = "signal"
+	msg.Signal = sig
+
+	buf, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(buf)
+
+	w.Close()
+	return err
+}
+
 func (c *execCmd) run(config *lxd.Config, args []string) error {
 	if len(args) < 2 {
 		return errArgs
@@ -96,7 +118,7 @@ func (c *execCmd) run(config *lxd.Config, args []string) error {
 	}
 
 	env := map[string]string{"HOME": "/root", "USER": "root"}
-	if myTerm, ok := os.LookupEnv("TERM"); ok {
+	if myTerm, ok := c.getTERM(); ok {
 		env["TERM"] = myTerm
 	}
 
